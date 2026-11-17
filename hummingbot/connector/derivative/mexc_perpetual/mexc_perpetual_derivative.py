@@ -44,6 +44,14 @@ class UncertainOrderCreate(Exception):
     """The exchange did not prove that this client id is absent. Keep the order in flight."""
 
 
+class MexcResponseError(IOError):
+    """A MEXC JSON body whose code field is not success. The code is the parsed field, not the message text."""
+
+    def __init__(self, code: Optional[int], message: str):
+        super().__init__(f"Error: {code} - {message}")
+        self.code = code
+
+
 class MexcPerpetualOrderTracker(ClientOrderTracker):
     """
     Wait for deal messages on a full fill, then synthesize any quantity the order
@@ -96,6 +104,8 @@ class MexcPerpetualDerivative(PerpetualDerivativePyBase):
         self._max_fill_base: Dict[str, Decimal] = {}
         self._max_fill_quote: Dict[str, Decimal] = {}
         self._seen_live_client_ids = set()
+        self._submitted_client_ids = set()
+        self._acked_client_ids = set()
         super().__init__(balance_asset_limit, rate_limits_share_pct)
 
     @property
@@ -190,9 +200,7 @@ class MexcPerpetualDerivative(PerpetualDerivativePyBase):
         return any(token in text for token in ("timestamp", "request time", "request-time", "recv-window", "recv_window"))
 
     def _is_order_not_found_during_status_update_error(self, status_update_exception: Exception) -> bool:
-        if isinstance(status_update_exception, ValueError) and "not found" in str(status_update_exception).lower():
-            return True
-        return self._exception_contains_code(status_update_exception, CONSTANTS.ORDER_NOT_FOUND_ERROR_CODES)
+        return self._response_error_code(status_update_exception) in CONSTANTS.ORDER_NOT_FOUND_ERROR_CODES
 
     def _is_maintenance_error(self, exception: Exception) -> bool:
         return self._exception_contains_code(exception, CONSTANTS.MAINTENANCE_ERROR_CODES)
@@ -213,7 +221,15 @@ class MexcPerpetualDerivative(PerpetualDerivativePyBase):
         await super()._handle_update_error_for_active_order(order, error)
 
     def _is_order_not_found_during_cancelation_error(self, cancelation_exception: Exception) -> bool:
-        return self._exception_contains_code(cancelation_exception, CONSTANTS.ORDER_NOT_FOUND_ERROR_CODES)
+        return self._response_error_code(cancelation_exception) in CONSTANTS.ORDER_NOT_FOUND_ERROR_CODES
+
+    @staticmethod
+    def _response_error_code(exception: Exception) -> Optional[int]:
+        code = getattr(exception, "code", None)
+        try:
+            return int(code) if code is not None else None
+        except (TypeError, ValueError):
+            return None
 
     @staticmethod
     def _exception_contains_code(exception: Exception, codes: set) -> bool:
@@ -235,11 +251,13 @@ class MexcPerpetualDerivative(PerpetualDerivativePyBase):
                 numeric_code = None
             if numeric_code in CONSTANTS.MAINTENANCE_ERROR_CODES:
                 message = f"Futures API is under maintenance ({message})"
-            raise IOError(f"Error: {code} - {message}")
+            raise MexcResponseError(numeric_code, message)
         return response
 
     async def _api_request(self, *args, **kwargs) -> Dict[str, Any]:
         response = await super()._api_request(*args, **kwargs)
+        if kwargs.get("return_err"):
+            return response
         return self.ensure_successful_response(response)
 
     def _create_web_assistants_factory(self) -> WebAssistantsFactory:
@@ -328,13 +346,24 @@ class MexcPerpetualDerivative(PerpetualDerivativePyBase):
         for item in results:
             if not isinstance(item, dict):
                 continue
-            self._remember_reported_deal(tracked_order, item)
             error_code = int(item.get("errorCode") or 0)
             if error_code == CONSTANTS.ORDER_CANNOT_CANCEL_ERROR_CODE:
                 await self._reconcile_uncancelable_order(tracked_order)
                 return False
             if error_code != 0:
-                raise IOError(f"Error: {error_code} - {item.get('errorMsg', '')}")
+                self.record_order_observation(
+                    tracked_order.client_order_id,
+                    tracked_order.trading_pair,
+                    payload=item,
+                    apply_state=False,
+                )
+                raise MexcResponseError(error_code, str(item.get("errorMsg", "")))
+            self.record_order_observation(
+                tracked_order.client_order_id,
+                tracked_order.trading_pair,
+                payload=item,
+                apply_state=False,
+            )
         accounted = await self._account_for_cancel_fills(tracked_order)
         return accounted
 
@@ -359,6 +388,7 @@ class MexcPerpetualDerivative(PerpetualDerivativePyBase):
             client_order_id=order_id,
             **kwargs,
         )
+        self.record_order_observation(order_id, trading_pair, submitted=True, apply_state=False)
         if not self._position_mode_confirmed:
             raise IOError("Refusing to trade until the account position mode has been read.")
         if order_id in self._cancel_requests:
@@ -383,7 +413,16 @@ class MexcPerpetualDerivative(PerpetualDerivativePyBase):
             if recovered is not None:
                 return recovered
             raise
-        return str(response["data"]["orderId"]), self.current_timestamp
+        exchange_order_id = str(response["data"]["orderId"])
+        self.record_order_observation(
+            order_id,
+            trading_pair,
+            payload=response.get("data") if isinstance(response.get("data"), dict) else None,
+            exchange_order_id=exchange_order_id,
+            acked=True,
+            apply_state=False,
+        )
+        return exchange_order_id, self.current_timestamp
 
     async def _build_order_payload(
         self,
@@ -818,10 +857,6 @@ class MexcPerpetualDerivative(PerpetualDerivativePyBase):
 
     def _settle_cancel(self, order_id: str, order: Optional[InFlightOrder]) -> str:
         self._cancel_requests.discard(order_id)
-        if order is not None and order.current_state == OrderState.FAILED:
-            self._confirmed_absent.add(order_id)
-        elif order is None:
-            self._confirmed_absent.add(order_id)
         return order_id
 
     async def _execute_cancel(self, trading_pair: str, order_id: str):
@@ -850,7 +885,7 @@ class MexcPerpetualDerivative(PerpetualDerivativePyBase):
     async def _place_order_and_process_update(self, order: InFlightOrder, **kwargs) -> str:
         kwargs = dict(kwargs)
         kwargs.pop("position_action", None)
-        exchange_order_id, update_timestamp = await self._place_order(
+        exchange_order_id, _update_timestamp = await self._place_order(
             order_id=order.client_order_id,
             trading_pair=order.trading_pair,
             amount=order.amount,
@@ -865,14 +900,13 @@ class MexcPerpetualDerivative(PerpetualDerivativePyBase):
                 order.update_exchange_order_id(str(exchange_order_id))
             await self._execute_order_cancel(order)
             return str(exchange_order_id)
-        self._order_tracker.process_order_update(
-            OrderUpdate(
-                client_order_id=order.client_order_id,
-                exchange_order_id=str(exchange_order_id),
-                trading_pair=order.trading_pair,
-                update_timestamp=update_timestamp,
-                new_state=OrderState.OPEN,
-            )
+        self.record_order_observation(
+            order.client_order_id,
+            order.trading_pair,
+            exchange_order_id=str(exchange_order_id),
+            new_state=OrderState.OPEN,
+            acked=True,
+            submitted=True,
         )
         return str(exchange_order_id)
 
@@ -935,7 +969,13 @@ class MexcPerpetualDerivative(PerpetualDerivativePyBase):
                 exc,
             )
             return False
-        self._remember_reported_deal(order, order_data)
+        self.record_order_observation(
+            order.client_order_id,
+            order.trading_pair,
+            payload=order_data,
+            apply_state=False,
+            materialize_fill=True,
+        )
         await self._apply_deal_details(order)
         self.synthesize_reported_fill(order)
         return True
@@ -951,20 +991,17 @@ class MexcPerpetualDerivative(PerpetualDerivativePyBase):
                 last_error = exc
                 await self._sleep(0.02)
                 continue
-            self._remember_reported_deal(order, order_data)
+            state = self._order_state_from_payload(order_data)
+            self.record_order_observation(
+                order.client_order_id,
+                order.trading_pair,
+                payload=order_data,
+                new_state=state if state in (OrderState.FILLED, OrderState.CANCELED, OrderState.FAILED) else None,
+                apply_state=state in (OrderState.FILLED, OrderState.CANCELED, OrderState.FAILED),
+                materialize_fill=True,
+            )
             await self._apply_deal_details(order)
             self.synthesize_reported_fill(order)
-            state = self._order_state_from_payload(order_data)
-            if state in (OrderState.FILLED, OrderState.CANCELED, OrderState.FAILED):
-                self._order_tracker.process_order_update(
-                    OrderUpdate(
-                        trading_pair=order.trading_pair,
-                        update_timestamp=self.current_timestamp,
-                        new_state=state,
-                        client_order_id=order.client_order_id,
-                        exchange_order_id=str(order_data.get("orderId") or order.exchange_order_id or ""),
-                    )
-                )
             return
         self.logger().warning(
             "Cancel error 2041 for %s and the order could not be read after retries: %s",
@@ -1157,7 +1194,12 @@ class MexcPerpetualDerivative(PerpetualDerivativePyBase):
     async def _request_order_status(self, tracked_order: InFlightOrder) -> OrderUpdate:
         try:
             order_data = await self._request_order_status_data(tracked_order)
-            self._remember_reported_deal(tracked_order, order_data)
+            self.record_order_observation(
+                tracked_order.client_order_id,
+                tracked_order.trading_pair,
+                payload=order_data,
+                apply_state=False,
+            )
             if self._order_state_from_payload(order_data) == OrderState.CANCELED:
                 await self._apply_deal_details(tracked_order)
                 self.synthesize_reported_fill(tracked_order)
@@ -1200,6 +1242,100 @@ class MexcPerpetualDerivative(PerpetualDerivativePyBase):
             raise ValueError(f"Order {exchange_order_id} not found")
         return data
 
+    def record_order_observation(
+        self,
+        client_order_id: str,
+        trading_pair: Optional[str] = None,
+        payload: Optional[Dict[str, Any]] = None,
+        *,
+        exchange_order_id: Optional[str] = None,
+        new_state: Optional[OrderState] = None,
+        submitted: bool = False,
+        acked: bool = False,
+        trade_fill: Optional[Dict[str, Any]] = None,
+        apply_state: bool = True,
+        materialize_fill: bool = False,
+    ) -> None:
+        """
+        The only writer of order memory: submission, acknowledgement, seen-live, and counted fill.
+        Every websocket, REST, create, cancel, and lookup path records through here before a
+        later absence decision.
+        """
+        if not client_order_id:
+            return
+        if submitted:
+            self._submitted_client_ids.add(client_order_id)
+        if acked or exchange_order_id not in (None, ""):
+            self._acked_client_ids.add(client_order_id)
+            self._seen_live_client_ids.add(client_order_id)
+        order = self._find_order(client_order_id)
+        pair = trading_pair or (order.trading_pair if order is not None else None)
+        if isinstance(payload, dict) and pair is not None:
+            if payload.get("orderId") not in (None, "") and exchange_order_id in (None, ""):
+                exchange_order_id = str(payload.get("orderId"))
+                self._acked_client_ids.add(client_order_id)
+                self._seen_live_client_ids.add(client_order_id)
+            self._remember_counted_fill(client_order_id, pair, [payload])
+        if trade_fill is not None and order is not None:
+            try:
+                base = Decimal(str(trade_fill["vol"])) * self.get_contract_size(order.trading_pair)
+                price = Decimal(str(trade_fill["price"]))
+            except Exception:
+                base, price = s_decimal_0, s_decimal_0
+            self._remember_counted_fill(client_order_id, order.trading_pair, [{
+                "dealVol": str(base / self.get_contract_size(order.trading_pair)) if base else "0",
+                "dealAvgPrice": str(price),
+                "state": CONSTANTS.ORDER_STATE_FILLED,
+            }])
+            if trade_fill.get("orderId") not in (None, ""):
+                self._acked_client_ids.add(client_order_id)
+                self._seen_live_client_ids.add(client_order_id)
+            self._drop_synthetic_fill(order)
+            self._order_tracker.process_trade_update(self._parse_trade_update(trade_fill, order))
+            self._apply_counted_fill(order, client_order_id)
+        elif materialize_fill and order is not None:
+            self._apply_counted_fill(order, client_order_id)
+        if order is not None and exchange_order_id not in (None, "") and order.exchange_order_id in (None, ""):
+            order.update_exchange_order_id(str(exchange_order_id))
+        if not apply_state or order is None:
+            return
+        state = new_state
+        if state is None and isinstance(payload, dict) and payload.get("state") not in (None, ""):
+            state = self._order_state_from_payload(payload)
+        if state is None:
+            return
+        self._order_tracker.process_order_update(
+            OrderUpdate(
+                trading_pair=order.trading_pair,
+                update_timestamp=self.current_timestamp,
+                new_state=state,
+                client_order_id=order.client_order_id,
+                exchange_order_id=str(exchange_order_id or order.exchange_order_id or ""),
+            )
+        )
+
+    def _absence_is_allowed(self, client_order_id: str) -> bool:
+        if client_order_id in self._acked_client_ids or client_order_id in self._seen_live_client_ids:
+            return False
+        if self._max_fill_base.get(client_order_id, s_decimal_0) > s_decimal_0:
+            return False
+        order = self._find_order(client_order_id)
+        if order is None:
+            return True
+        if order.exchange_order_id not in (None, ""):
+            return False
+        return order.current_state not in (OrderState.OPEN, OrderState.PARTIALLY_FILLED, OrderState.FILLED)
+
+    def _apply_counted_fill(self, order: InFlightOrder, client_order_id: str):
+        counted = self._max_fill_base.get(client_order_id, s_decimal_0)
+        if counted <= s_decimal_0:
+            return
+        reported = getattr(order, "reported_deal_base", None)
+        if reported is None or counted > Decimal(str(reported)):
+            order.reported_deal_base = counted
+            order.reported_deal_price = self._max_fill_quote.get(client_order_id, s_decimal_0) / counted
+        self.synthesize_reported_fill(order)
+
     def counted_fill(self, client_order_id: str) -> Tuple[Decimal, Decimal]:
         return (
             self._max_fill_base.get(client_order_id, s_decimal_0),
@@ -1215,7 +1351,12 @@ class MexcPerpetualDerivative(PerpetualDerivativePyBase):
         A raised error, including HTTP 500, is unknown. Digits in the URL are not a code.
         """
         try:
-            response = await self._api_get(path_url=path, is_auth_required=True, limit_id=limit_id)
+            response = await self._api_get(
+                path_url=path,
+                is_auth_required=True,
+                limit_id=limit_id,
+                return_err=True,
+            )
         except Exception as exc:
             self.logger().warning("Order lookup failed: %s", exc)
             return "failed", None
@@ -1234,12 +1375,12 @@ class MexcPerpetualDerivative(PerpetualDerivativePyBase):
             except (TypeError, ValueError):
                 return "failed", None
         if numeric in CONSTANTS.ORDER_NOT_FOUND_ERROR_CODES:
-            return "absent", None
+            return "not_found", None
         if response.get("success") is False or numeric != 0:
             return "failed", None
         data = response.get("data")
         if not isinstance(data, dict) or not data:
-            return "absent", None
+            return "empty", None
         return "ok", data
 
     def _remember_counted_fill(self, client_order_id: str, trading_pair: str, payloads: List[Dict[str, Any]]):
@@ -1251,7 +1392,7 @@ class MexcPerpetualDerivative(PerpetualDerivativePyBase):
             previous_quote = self._max_fill_quote.get(client_order_id, s_decimal_0)
             if base > previous:
                 self._max_fill_base[client_order_id] = base
-                self._max_fill_quote[client_order_id] = quote
+                self._max_fill_quote[client_order_id] = max(previous_quote, quote)
             elif base == previous and quote > previous_quote:
                 self._max_fill_quote[client_order_id] = quote
             if self._payload_was_seen_live(payload):
@@ -1271,7 +1412,6 @@ class MexcPerpetualDerivative(PerpetualDerivativePyBase):
         if reported is None or counted > Decimal(str(reported)):
             order.reported_deal_base = counted
             order.reported_deal_price = self._max_fill_quote.get(client_order_id, s_decimal_0) / counted
-        self.synthesize_reported_fill(order)
 
     def _payload_fill(self, trading_pair: str, payload: Dict[str, Any]) -> Tuple[Decimal, Decimal]:
         if payload.get("dealVol") in (None, ""):
@@ -1327,15 +1467,21 @@ class MexcPerpetualDerivative(PerpetualDerivativePyBase):
             kinds.append(order_kind)
             if order_kind == "ok" and order_data:
                 payloads.append(order_data)
-        self._remember_counted_fill(client_order_id, trading_pair, payloads)
+        for payload in payloads:
+            self.record_order_observation(
+                client_order_id,
+                trading_pair,
+                payload=payload,
+                apply_state=False,
+                materialize_fill=True,
+            )
         if any(kind == "failed" for kind in kinds):
             return None
         if self._payloads_conflict(client_data, order_data):
             self.logger().warning("Order %s lookups conflict. Leaving the state unknown.", client_order_id)
             return None
         if not payloads:
-            seen = self.order_was_seen_live(client_order_id) or self.counted_fill(client_order_id)[0] > s_decimal_0
-            if kinds and all(kind == "absent" for kind in kinds) and not seen:
+            if kinds and all(kind == "not_found" for kind in kinds) and self._absence_is_allowed(client_order_id):
                 self._cancel_requests.discard(client_order_id)
                 self._confirmed_absent.add(client_order_id)
                 return CONSTANTS.CONFIRMED_ABSENT
@@ -1522,26 +1668,29 @@ class MexcPerpetualDerivative(PerpetualDerivativePyBase):
     def _process_order_event_message(self, order_msg: Dict[str, Any]):
         client_order_id = str(order_msg.get("externalOid") or "")
         tracked_order = self._order_tracker.all_updatable_orders.get(client_order_id)
-        if tracked_order is None:
+        if tracked_order is None or not client_order_id:
             return
-        self._remember_reported_deal(tracked_order, order_msg)
-        order_update = OrderUpdate(
-            trading_pair=tracked_order.trading_pair,
-            update_timestamp=self.current_timestamp,
-            new_state=self._order_state_from_payload(order_msg),
-            client_order_id=client_order_id,
-            exchange_order_id=str(order_msg.get("orderId") or tracked_order.exchange_order_id or ""),
+        self.record_order_observation(
+            client_order_id,
+            tracked_order.trading_pair,
+            payload=order_msg,
+            exchange_order_id=str(order_msg.get("orderId") or ""),
+            acked=order_msg.get("orderId") not in (None, ""),
         )
-        self._order_tracker.process_order_update(order_update)
 
     def _process_trade_event_message(self, trade_msg: Dict[str, Any]):
         client_order_id = str(trade_msg.get("externalOid") or "")
         tracked_order = self._order_tracker.all_fillable_orders.get(client_order_id)
-        if tracked_order is None:
+        if tracked_order is None or not client_order_id:
             return
-        self._drop_synthetic_fill(tracked_order)
-        self._order_tracker.process_trade_update(self._parse_trade_update(trade_msg, tracked_order))
-        self.synthesize_reported_fill(tracked_order)
+        self.record_order_observation(
+            client_order_id,
+            tracked_order.trading_pair,
+            trade_fill=trade_msg,
+            exchange_order_id=str(trade_msg.get("orderId") or ""),
+            acked=trade_msg.get("orderId") not in (None, ""),
+            apply_state=False,
+        )
 
     async def _process_account_position_event(self, position_msg: Any):
         entries = position_msg if isinstance(position_msg, list) else [position_msg]

@@ -1032,8 +1032,9 @@ class RangeIcebergExecutorTests(IsolatedAsyncioWrapperTestCase):
         executor._unconfirmed_cancels.add("buy-1")
         executor.pause()
         self._run(executor.resume())
-        self.assertFalse(executor.get_custom_info()["paused"])
-        self.assertFalse(executor.get_custom_info()["unknown_order_halt"])
+        self.assertTrue(executor.get_custom_info()["paused"])
+        self.assertTrue(executor.get_custom_info()["unknown_order_halt"])
+        self.assertEqual(2, len(self.buy_ids))
 
         read["kind"] = "http500"
         executor._unknown_order_ids.add("buy-1")
@@ -1125,6 +1126,72 @@ class RangeIcebergExecutorTests(IsolatedAsyncioWrapperTestCase):
         self.assertIn("buy-1", info["status_reason"])
         self.assertEqual(OrderState.OPEN, order.current_state)
         self.assertEqual(Decimal("0"), order.executed_amount_base)
+
+    def test_websocket_open_then_empty_lookup_does_not_buy_again(self):
+        import json
+
+        from aioresponses import aioresponses
+        from bidict import bidict
+
+        from hummingbot.connector.derivative.mexc_perpetual import mexc_perpetual_constants as CONSTANTS
+        from hummingbot.connector.derivative.mexc_perpetual.mexc_perpetual_derivative import (
+            MexcPerpetualDerivative,
+        )
+        from hummingbot.connector.derivative.mexc_perpetual.mexc_perpetual_web_utils import private_rest_url
+        from hummingbot.core.event.events import MarketOrderFailureEvent
+
+        self._book(Decimal("0.07815"), Decimal("0.07816"))
+        executor = self._up_to(total_amount=Decimal("1000"), slice_amount=Decimal("1000"))
+        executor._cancel_resolve_after_attempts = 1
+        self._run(executor.control_task())
+        exchange = MexcPerpetualDerivative(
+            mexc_perpetual_api_key="key",
+            mexc_perpetual_api_secret="secret",
+            trading_pairs=["AIOT-USDT"],
+            trading_required=True,
+        )
+        exchange._set_trading_pair_symbol_map(bidict({"AIOT_USDT": "AIOT-USDT"}))
+        exchange._set_current_timestamp(self.now)
+        exchange._contract_sizes["AIOT-USDT"] = Decimal("10")
+        exchange.start_tracking_order(
+            order_id="buy-1",
+            exchange_order_id="ex-1",
+            trading_pair="AIOT-USDT",
+            trade_type=TradeType.BUY,
+            price=Decimal("0.07816"),
+            amount=Decimal("1000"),
+            order_type=OrderType.LIMIT,
+            position_action=PositionAction.OPEN,
+        )
+        exchange._process_order_event_message({
+            "orderId": "ex-1",
+            "externalOid": "buy-1",
+            "state": 2,
+            "dealVol": 0,
+            "price": "0.07816",
+            "vol": "100",
+        })
+        client_url = private_rest_url(
+            CONSTANTS.ORDER_BY_EXTERNAL_PATH.format(symbol="AIOT_USDT", external_oid="buy-1")
+        )
+        order_url = private_rest_url(CONSTANTS.ORDER_GET_PATH.format(order_id="ex-1"))
+        body = json.dumps({"success": True, "code": 0, "data": None})
+        self.connector.is_cancel_confirmed = lambda order_id: False
+        self.connector.resolve_unknown_order = exchange.resolve_unknown_order
+        self.connector.counted_fill = exchange.counted_fill
+        self.connector.order_was_seen_live = exchange.order_was_seen_live
+        executor.process_order_failed_event(
+            0,
+            None,
+            MarketOrderFailureEvent(self.now, "buy-1", OrderType.LIMIT),
+        )
+        with aioresponses() as mocked:
+            mocked.get(client_url, body=body, repeat=True)
+            mocked.get(order_url, body=body, repeat=True)
+            self._run(executor.control_task())
+        self.assertEqual(1, len(self.buy_ids))
+        self.assertTrue(executor.get_custom_info()["paused"] or executor.get_custom_info()["unknown_order_halt"])
+        self.assertLessEqual(sum(amount for _oid, amount, _price, _otype, _action in self.buy_ids), Decimal("1000"))
 
     def test_conflicting_fill_is_kept_and_a_later_2040_does_not_buy_again(self):
         from hummingbot.core.event.events import MarketOrderFailureEvent

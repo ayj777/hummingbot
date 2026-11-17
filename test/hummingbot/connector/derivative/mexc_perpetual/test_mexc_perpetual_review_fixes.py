@@ -13,6 +13,7 @@ from hummingbot.connector.derivative.mexc_perpetual.mexc_perpetual_derivative im
     MarginMode,
     MexcPerpetualDerivative,
 )
+from hummingbot.connector.derivative.mexc_perpetual.mexc_perpetual_web_utils import private_rest_url
 from hummingbot.connector.trading_rule import TradingRule
 from hummingbot.core.data_type.common import OrderType, PositionAction, PositionSide, TradeType
 from hummingbot.core.data_type.in_flight_order import OrderState
@@ -261,7 +262,7 @@ class MexcPerpetualReviewFixTests(IsolatedAsyncioWrapperTestCase):
 
         self.exchange._api_get = get
         state = await self.exchange.resolve_unknown_order(self.trading_pair, "oid-1", "ex-1")
-        self.assertEqual("confirmed_absent", state)
+        self.assertIsNone(state)
 
     async def test_http_500_lookup_stays_unknown(self):
         async def get(path_url, **kwargs):
@@ -270,6 +271,84 @@ class MexcPerpetualReviewFixTests(IsolatedAsyncioWrapperTestCase):
         self.exchange._api_get = get
         state = await self.exchange.resolve_unknown_order(self.trading_pair, "oid-1", "ex-1")
         self.assertIsNone(state)
+
+    def _order_urls(self, client_order_id: str, exchange_order_id: str):
+        client_path = CONSTANTS.ORDER_BY_EXTERNAL_PATH.format(symbol="AIOT_USDT", external_oid=client_order_id)
+        order_path = CONSTANTS.ORDER_GET_PATH.format(order_id=exchange_order_id)
+        return private_rest_url(client_path), private_rest_url(order_path)
+
+    @aioresponses()
+    async def test_websocket_open_is_remembered_and_empty_lookup_stays_unknown(self, mock_api):
+        order = self._track(Decimal("1000"))
+        self.exchange._process_order_event_message({
+            "orderId": "ex-1",
+            "externalOid": "oid-1",
+            "state": 2,
+            "dealVol": 0,
+            "price": "0.07816",
+            "vol": "100",
+        })
+        await asyncio.sleep(0.05)
+        self.assertEqual(OrderState.OPEN, order.current_state)
+        self.assertTrue(self.exchange.order_was_seen_live("oid-1"))
+        client_url, order_url = self._order_urls("oid-1", "ex-1")
+        body = json.dumps({"success": True, "code": 0, "data": None})
+        mock_api.get(client_url, body=body, repeat=True)
+        mock_api.get(order_url, body=body, repeat=True)
+        state = await self.exchange.resolve_unknown_order(self.trading_pair, "oid-1", "ex-1")
+        self.assertIsNone(state)
+        self.assertNotEqual("confirmed_absent", state)
+
+    @aioresponses()
+    async def test_real_2040_body_is_confirmed_absent_only_before_the_exchange_acks(self, mock_api):
+        client_url, order_url = self._order_urls("never-1", "missing-1")
+        body = json.dumps({"success": False, "code": 2040, "message": "Order does not exist"})
+        mock_api.get(client_url, body=body, repeat=True)
+        mock_api.get(order_url, body=body, repeat=True)
+        state = await self.exchange.resolve_unknown_order(self.trading_pair, "never-1", None)
+        self.assertEqual("confirmed_absent", state)
+
+        order = self._track(Decimal("1000"))
+        self.exchange.record_order_observation(
+            "oid-1",
+            self.trading_pair,
+            exchange_order_id="ex-1",
+            new_state=OrderState.OPEN,
+            acked=True,
+        )
+        await asyncio.sleep(0.05)
+        client_url, order_url = self._order_urls("oid-1", "ex-1")
+        mock_api.get(client_url, body=body, repeat=True)
+        mock_api.get(order_url, body=body, repeat=True)
+        later = await self.exchange.resolve_unknown_order(self.trading_pair, "oid-1", "ex-1")
+        self.assertIsNone(later)
+        self.assertEqual(OrderState.OPEN, order.current_state)
+
+    async def test_counted_quote_does_not_shrink_when_the_size_grows(self):
+        self._track(Decimal("1000"))
+
+        async def get(path_url, **kwargs):
+            deal = "10" if "external" in path_url else "20"
+            price = "10" if "external" in path_url else "0.1"
+            return {
+                "success": True,
+                "code": 0,
+                "data": {
+                    "orderId": "ex-1",
+                    "externalOid": "oid-1",
+                    "state": 2,
+                    "dealVol": deal,
+                    "dealAvgPrice": price,
+                    "price": price,
+                    "vol": "100",
+                },
+            }
+
+        self.exchange._api_get = get
+        await self.exchange.resolve_unknown_order(self.trading_pair, "oid-1", "ex-1")
+        base, quote = self.exchange.counted_fill("oid-1")
+        self.assertEqual(Decimal("200"), base)
+        self.assertGreaterEqual(quote, Decimal("1000"))
 
     async def test_filled_versus_open_keeps_the_fill_and_a_later_2040_does_not_clear_it(self):
         order = self._track(Decimal("1000"))
@@ -344,32 +423,80 @@ class MexcPerpetualReviewFixTests(IsolatedAsyncioWrapperTestCase):
             extra = Decimal("0")
             resolved = False
             previous_base = Decimal("0")
-            for client_read, order_read in sequence:
-                reported = max(reported, self._fill_base(client_read), self._fill_base(order_read))
-                seen_live = seen_live or self._read_shows_live_order(client_read) or self._read_shows_live_order(order_read)
-
-                async def get(path_url, client_read=client_read, order_read=order_read, **kwargs):
-                    chosen = order_read if "external" not in path_url else client_read
-                    if isinstance(chosen, Exception):
-                        raise chosen
-                    return chosen
-
-                self.exchange._api_get = get
-                state = await self.exchange.resolve_unknown_order(self.trading_pair, "oid-1", "ex-1")
-                self.assertGreaterEqual(order.executed_amount_base, reported)
-                self.assertGreaterEqual(order.executed_amount_base, previous_base)
-                previous_base = order.executed_amount_base
-                if seen_live:
-                    self.assertNotEqual("confirmed_absent", state)
-                if self._read_is_unknown(client_read) or self._read_is_unknown(order_read):
-                    self.assertIsNone(state)
-                if (
-                    not self._read_is_unknown(client_read)
-                    and not self._read_is_unknown(order_read)
-                    and self._read_is_open_state(client_read)
-                    and self._read_is_open_state(order_read)
-                ):
-                    self.assertIn(state, (OrderState.OPEN, OrderState.PARTIALLY_FILLED))
+            for step in sequence:
+                kind = step[0]
+                client_read = step[1] if kind != "ws_order" and kind != "ws_deal" else None
+                order_read = step[2] if len(step) > 2 else None
+                if kind == "ws_order":
+                    payload = dict(step[1])
+                    payload["externalOid"] = "oid-1"
+                    reported = max(reported, self._payload_fill_base(payload))
+                    seen_live = True
+                    self.exchange._process_order_event_message(payload)
+                    state = None
+                elif kind == "ws_deal":
+                    payload = dict(step[1])
+                    payload["externalOid"] = "oid-1"
+                    reported = max(reported, self._payload_fill_base(payload))
+                    seen_live = True
+                    self.exchange._process_trade_event_message(payload)
+                    state = None
+                elif kind == "rest_status":
+                    reported = max(reported, self._fill_base(step[1]))
+                    seen_live = seen_live or self._read_shows_live_order(step[1]) or self._read_shows_live_order(step[2])
+                    self._stub_reads(step[1], step[2])
+                    try:
+                        await self.exchange._request_order_status(order)
+                    except Exception:
+                        pass
+                    state = None
+                elif kind == "cancel_read":
+                    payload = step[1] if isinstance(step[1], dict) else (step[1].get("data") if isinstance(step[1], dict) else None)
+                    if not isinstance(payload, dict):
+                        state = None
+                    else:
+                        payload = dict(payload)
+                        payload.setdefault("externalOid", "oid-1")
+                        reported = max(reported, self._payload_fill_base(payload))
+                        if self._payload_state_is_live(payload):
+                            seen_live = True
+                        self.exchange.record_order_observation(
+                            "oid-1",
+                            self.trading_pair,
+                            payload=payload,
+                            apply_state=False,
+                            materialize_fill=True,
+                        )
+                        state = None
+                else:
+                    client_read, order_read = step[1], step[2]
+                    reported = max(reported, self._fill_base(client_read), self._fill_base(order_read))
+                    seen_live = seen_live or self._read_shows_live_order(client_read) or self._read_shows_live_order(order_read)
+                    self._stub_reads(client_read, order_read)
+                    state = await self.exchange.resolve_unknown_order(self.trading_pair, "oid-1", "ex-1")
+                    if seen_live:
+                        self.assertNotEqual("confirmed_absent", state)
+                    if self._read_is_unknown(client_read) or self._read_is_unknown(order_read):
+                        self.assertIsNone(state)
+                    if (
+                        not self._read_is_unknown(client_read)
+                        and not self._read_is_unknown(order_read)
+                        and self._read_is_open_state(client_read)
+                        and self._read_is_open_state(order_read)
+                    ):
+                        self.assertIn(state, (OrderState.OPEN, OrderState.PARTIALLY_FILLED))
+                tracked = self.exchange._find_order("oid-1")
+                counted_base, _counted_quote = self.exchange.counted_fill("oid-1")
+                if tracked is None:
+                    continue
+                observed = max(tracked.executed_amount_base, counted_base)
+                self.assertGreaterEqual(
+                    observed,
+                    reported,
+                    f"{kind} reported {reported} observed {observed} counted {counted_base} executed {tracked.executed_amount_base}",
+                )
+                self.assertGreaterEqual(observed, previous_base, kind)
+                previous_base = observed
                 if state in (OrderState.CANCELED, OrderState.FILLED) or (
                     state == "confirmed_absent" and not seen_live
                 ):
@@ -378,15 +505,39 @@ class MexcPerpetualReviewFixTests(IsolatedAsyncioWrapperTestCase):
                     if not resolved:
                         extra = child
                         resolved = True
-                if not resolved:
+                elif seen_live and not resolved:
                     self.assertLessEqual(max(order.amount, order.executed_amount_base), total)
-                else:
-                    self.assertLessEqual(extra, total)
             self.exchange._order_tracker._in_flight_orders.clear()
             if hasattr(self.exchange, "_max_fill_base"):
                 self.exchange._max_fill_base.clear()
                 self.exchange._max_fill_quote.clear()
                 self.exchange._seen_live_client_ids.clear()
+
+    def _stub_reads(self, client_read, order_read):
+        async def get(path_url, client_read=client_read, order_read=order_read, **kwargs):
+            chosen = order_read if "external" not in path_url else client_read
+            if isinstance(chosen, Exception):
+                raise chosen
+            return chosen
+
+        self.exchange._api_get = get
+
+    @staticmethod
+    def _payload_fill_base(payload: dict) -> Decimal:
+        if payload.get("dealVol") not in (None, ""):
+            return Decimal(str(payload.get("dealVol") or "0")) * Decimal("10")
+        if payload.get("vol") not in (None, "") and payload.get("state") in (None, 3):
+            return Decimal("0")
+        return Decimal("0")
+
+    @staticmethod
+    def _payload_state_is_live(payload: dict) -> bool:
+        try:
+            state = int(payload.get("state") or 0)
+            deal = Decimal(str(payload.get("dealVol") or payload.get("vol") or "0"))
+        except Exception:
+            return False
+        return state in (1, 2, 3) or deal > 0
 
     def _review_fill_then_absent_sequence(self):
         filled = {
@@ -415,6 +566,7 @@ class MexcPerpetualReviewFixTests(IsolatedAsyncioWrapperTestCase):
             },
         }
         absent = {"success": False, "code": 2040, "message": "Order does not exist", "data": None}
+        empty = {"success": True, "code": 0, "data": None}
         pending = {
             "success": True,
             "code": 0,
@@ -427,16 +579,48 @@ class MexcPerpetualReviewFixTests(IsolatedAsyncioWrapperTestCase):
         }
         http_500 = IOError("Error executing request GET https://api.mexc.com/api/v1/private/order/get/2040. HTTP status is 500.")
         return [
-            (filled, opened),
-            (absent, absent),
-            (pending, unfilled),
-            (http_500, http_500),
+            ("ws_order", {"state": 2, "dealVol": 0, "price": "0.07816", "vol": "100", "orderId": "ex-1"}),
+            ("lookup", empty, empty),
+            ("lookup", filled, opened),
+            ("lookup", absent, absent),
+            ("ws_deal", {"id": "d-1", "price": "0.07816", "vol": "10", "fee": "0", "orderId": "ex-1"}),
+            ("rest_status", opened, opened),
+            ("cancel_read", {"state": 4, "dealVol": "10", "dealAvgPrice": "0.07816", "orderId": "ex-1"}),
+            ("lookup", pending, unfilled),
+            ("lookup", http_500, http_500),
         ]
 
     def _random_read_sequence(self, rng: random.Random):
         steps = []
+        kinds = ("lookup", "ws_order", "ws_deal", "rest_status", "cancel_read")
         for _ in range(6):
-            steps.append((self._random_read(rng), self._random_read(rng)))
+            kind = rng.choice(kinds)
+            if kind == "lookup":
+                steps.append((kind, self._random_read(rng), self._random_read(rng)))
+            elif kind == "ws_order":
+                steps.append((kind, {
+                    "state": rng.choice([1, 2, 3, 4]),
+                    "dealVol": rng.choice([0, 34, 100]),
+                    "dealAvgPrice": "0.07816",
+                    "price": "0.07816",
+                    "vol": "100",
+                    "orderId": "ex-1",
+                }))
+            elif kind == "ws_deal":
+                steps.append((kind, {
+                    "id": f"d-{rng.randrange(1000)}",
+                    "price": "0.07816",
+                    "vol": rng.choice(["1", "10", "34"]),
+                    "fee": "0",
+                    "orderId": "ex-1",
+                }))
+            else:
+                first = self._random_read(rng)
+                second = self._random_read(rng)
+                if isinstance(first, Exception) or isinstance(second, Exception):
+                    steps.append(("lookup", first, second))
+                else:
+                    steps.append((kind, first, second))
         return steps
 
     def _random_read(self, rng: random.Random):

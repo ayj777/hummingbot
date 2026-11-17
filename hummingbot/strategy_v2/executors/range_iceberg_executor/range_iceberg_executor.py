@@ -855,7 +855,14 @@ class RangeIcebergExecutor(ExecutorBase):
             return True
         if self._counted_fill_base.get(order_id, Decimal("0")) > 0:
             return True
-        return self._known_fill_size(order_id)
+        if self._known_fill_size(order_id):
+            return True
+        order = self._order_for(order_id)
+        if order is None:
+            return False
+        if order.exchange_order_id not in (None, ""):
+            return True
+        return order.current_state in (OrderState.OPEN, OrderState.PARTIALLY_FILLED, OrderState.FILLED)
 
     def _absorb_counted_fills(self):
         connector = self.connectors[self.config.connector_name]
