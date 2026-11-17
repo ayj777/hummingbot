@@ -106,9 +106,16 @@ class RangeIcebergExecutor(ExecutorBase):
         self._unknown_order_ids: Set[str] = set()
         self._unknown_order_error = ""
         self._resolved_terminal: Set[str] = set()
-        self._lookup_done: Set[str] = set()
+        self._lookup_started: Set[str] = set()
+        self._open_lookup_count: dict = {}
+        self._open_lookup_started: dict = {}
+        self._next_open_lookup_at: dict = {}
         self._cancel_resolve_after_attempts = 5
         self._cancel_resolve_after_seconds = 30.0
+        self._open_lookup_cap = 3
+        self._open_lookup_max_seconds = 120.0
+        self._open_lookup_backoff_seconds = 10.0
+        self._open_lookup_backoff_cap_seconds = 40.0
 
     def _make_schedule(self) -> Optional[SliceSchedule]:
         resolved = self.config.resolved_schedule()
@@ -210,7 +217,16 @@ class RangeIcebergExecutor(ExecutorBase):
             self._pause_started = self._strategy.current_timestamp
             self._paused = True
 
-    def resume(self):
+    async def resume(self):
+        if self._unknown_order_ids:
+            await self._resolve_halted_orders()
+            if self._unknown_order_ids:
+                self._describe_unknown_orders(
+                    "Resume looked the orders up again and they are still open or unknown."
+                )
+                self.pause()
+                return
+            self._unknown_order_error = ""
         if self._paused:
             self._paused_seconds += self._strategy.current_timestamp - (self._pause_started or self._strategy.current_timestamp)
             self._pause_started = None
@@ -674,7 +690,7 @@ class RangeIcebergExecutor(ExecutorBase):
         return slot.is_working or self._holds_unaccounted_fill(slot)
 
     def _replacement_blocked(self) -> bool:
-        return bool(self._unconfirmed_cancels) or bool(self._unknown_order_ids)
+        return bool(self._unconfirmed_cancels) or bool(self._unknown_order_ids) or bool(self._open_lookup_count)
 
     def _real_callable(self, owner, name):
         value = getattr(owner, name, None)
@@ -731,40 +747,84 @@ class RangeIcebergExecutor(ExecutorBase):
 
     async def _escalate_unresolved_cancel(self, order_id: str) -> bool:
         """
-        Keep canceling until the retry count or the time limit, then look the order up once.
-        True means this tick already settled the lookup, so the caller should not send another cancel.
+        Keep canceling until the retry count or the time limit, then look the order up.
+        An open result is looked up again on a backoff. True means this tick settled the
+        lookup, so the caller should not send another cancel.
         """
-        if order_id in self._lookup_done:
-            return False
         now = self._strategy.current_timestamp
-        self._cancel_attempt_count[order_id] = self._cancel_attempt_count.get(order_id, 0) + 1
-        self._cancel_attempt_started.setdefault(order_id, now)
-        attempts = self._cancel_attempt_count[order_id]
-        elapsed = now - self._cancel_attempt_started[order_id]
-        if attempts < self._cancel_resolve_after_attempts and elapsed < self._cancel_resolve_after_seconds:
-            return False
-        self._lookup_done.add(order_id)
-        connector = self.connectors[self.config.connector_name]
-        resolve = self._real_callable(connector, "resolve_unknown_order")
-        exchange_order_id = self._exchange_order_id_for(order_id)
-        state = None
-        if resolve is not None:
-            try:
-                state = await resolve(self.config.trading_pair, order_id, exchange_order_id)
-            except Exception:
-                self.logger().exception("Could not resolve order %s.", order_id)
-                state = None
+        if order_id not in self._lookup_started:
+            self._cancel_attempt_count[order_id] = self._cancel_attempt_count.get(order_id, 0) + 1
+            self._cancel_attempt_started.setdefault(order_id, now)
+            attempts = self._cancel_attempt_count[order_id]
+            elapsed = now - self._cancel_attempt_started[order_id]
+            if attempts < self._cancel_resolve_after_attempts and elapsed < self._cancel_resolve_after_seconds:
+                return False
+        else:
+            started = self._open_lookup_started.get(order_id, now)
+            timed_out = now - started >= self._open_lookup_max_seconds
+            due = now >= self._next_open_lookup_at.get(order_id, now)
+            if not due and not timed_out:
+                return False
+        self._lookup_started.add(order_id)
+        state = await self._lookup_order_state(order_id)
         self._refresh_tracked_orders()
         if state is None:
-            self._halt_for_unknown_order(order_id)
+            self._halt_for_unknown_order(order_id, "The order could not be read.")
             return True
         if state in (OrderState.FILLED, OrderState.CANCELED, OrderState.FAILED):
             if state == OrderState.FILLED and not self._known_fill_size(order_id):
-                self._halt_for_unknown_order(order_id)
+                self._halt_for_unknown_order(
+                    order_id,
+                    "The exchange says the order is filled but no size was recorded.",
+                )
                 return True
             self._resolved_terminal.add(order_id)
+            self._clear_open_retry(order_id)
             return True
+        self._open_lookup_count[order_id] = self._open_lookup_count.get(order_id, 0) + 1
+        self._open_lookup_started.setdefault(order_id, now)
+        count = self._open_lookup_count[order_id]
+        age = now - self._open_lookup_started[order_id]
+        if count >= self._open_lookup_cap or age >= self._open_lookup_max_seconds:
+            self._halt_for_unknown_order(order_id, "The order is still open after repeated lookups.")
+            return True
+        delay = min(
+            self._open_lookup_backoff_seconds * (2 ** (count - 1)),
+            self._open_lookup_backoff_cap_seconds,
+        )
+        self._next_open_lookup_at[order_id] = now + delay
         return False
+
+    async def _lookup_order_state(self, order_id: str):
+        connector = self.connectors[self.config.connector_name]
+        resolve = self._real_callable(connector, "resolve_unknown_order")
+        if resolve is None:
+            return None
+        try:
+            return await resolve(self.config.trading_pair, order_id, self._exchange_order_id_for(order_id))
+        except Exception:
+            self.logger().exception("Could not resolve order %s.", order_id)
+            return None
+
+    async def _resolve_halted_orders(self):
+        for order_id in list(self._unknown_order_ids):
+            state = await self._lookup_order_state(order_id)
+            self._refresh_tracked_orders()
+            if not self._lookup_clears_halt(order_id, state):
+                continue
+            self._unknown_order_ids.discard(order_id)
+            self._resolved_terminal.add(order_id)
+            self._clear_open_retry(order_id)
+
+    def _lookup_clears_halt(self, order_id: str, state) -> bool:
+        if state == OrderState.FILLED:
+            return self._known_fill_size(order_id)
+        return state in (OrderState.CANCELED, OrderState.FAILED)
+
+    def _clear_open_retry(self, order_id: str):
+        self._open_lookup_count.pop(order_id, None)
+        self._open_lookup_started.pop(order_id, None)
+        self._next_open_lookup_at.pop(order_id, None)
 
     def _known_fill_size(self, order_id: str) -> bool:
         order = self._order_for(order_id)
@@ -789,14 +849,29 @@ class RangeIcebergExecutor(ExecutorBase):
             return None
         return str(order.exchange_order_id)
 
-    def _halt_for_unknown_order(self, order_id: str):
+    def _halt_for_unknown_order(self, order_id: str, because: str):
         self._unknown_order_ids.add(order_id)
-        self._unknown_order_error = (
-            f"Order {order_id} is still unresolved after cancel retries. "
-            "Paused so it is not bought again while its state is unknown."
-        )
+        self._next_open_lookup_at.pop(order_id, None)
+        self._describe_unknown_orders(because)
         self.logger().error(self._unknown_order_error)
         self.pause()
+
+    def _describe_unknown_orders(self, because: str):
+        ids = ", ".join(sorted(self._unknown_order_ids))
+        self._unknown_order_error = (
+            f"unknown_order_halt: {ids}. {because} "
+            "Paused so it is not bought again while its state is open or unknown."
+        )
+
+    def _status_reason(self) -> str:
+        if self._unknown_order_ids:
+            return "unknown_order_halt: " + ", ".join(sorted(self._unknown_order_ids))
+        if self._open_lookup_count:
+            return "open_order_retry: " + ", ".join(sorted(self._open_lookup_count))
+        return ""
+
+    def to_format_status(self):
+        return self._status_reason()
 
     async def _ensure_account_settings(self) -> bool:
         if self._account_settings_ready:
@@ -921,7 +996,11 @@ class RangeIcebergExecutor(ExecutorBase):
             "side": self.config.side.name,
             "mode": self.config.mode.value,
             "paused": self._paused,
+            "unknown_order_halt": bool(self._unknown_order_ids),
+            "unknown_order_ids": sorted(self._unknown_order_ids),
             "unknown_order_error": self._unknown_order_error,
+            "status_reason": self._status_reason(),
+            "state": self._status_reason() or "RUNNING",
             "filled_base": str(self.filled_base),
             "filled_quote": str(self.filled_amount_quote),
             "total_base": str(self.total_base),
