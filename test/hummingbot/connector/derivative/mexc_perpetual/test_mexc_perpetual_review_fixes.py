@@ -1,6 +1,9 @@
 import asyncio
+import hashlib
+import hmac
 import json
 import random
+import re
 from decimal import Decimal
 from test.isolated_asyncio_wrapper_test_case import IsolatedAsyncioWrapperTestCase
 from unittest.mock import AsyncMock
@@ -16,7 +19,7 @@ from hummingbot.connector.derivative.mexc_perpetual.mexc_perpetual_derivative im
 )
 from hummingbot.connector.derivative.mexc_perpetual.mexc_perpetual_web_utils import private_rest_url
 from hummingbot.connector.trading_rule import TradingRule
-from hummingbot.core.data_type.common import OrderType, PositionAction, PositionSide, TradeType
+from hummingbot.core.data_type.common import OrderType, PositionAction, PositionMode, PositionSide, TradeType
 from hummingbot.core.data_type.in_flight_order import OrderState
 
 
@@ -829,6 +832,7 @@ class MexcPerpetualReviewFixTests(IsolatedAsyncioWrapperTestCase):
 
     async def test_create_timeout_keeps_the_same_client_id_in_flight(self):
         self.exchange._position_mode_confirmed = True
+        self.exchange._margin_mode_explicit = True
         self.exchange._contract_sizes[self.trading_pair] = Decimal("10")
 
         async def post(*args, **kwargs):
@@ -852,6 +856,7 @@ class MexcPerpetualReviewFixTests(IsolatedAsyncioWrapperTestCase):
 
     async def test_orders_are_refused_until_position_mode_is_read(self):
         self.exchange._contract_sizes[self.trading_pair] = Decimal("10")
+        self.exchange._margin_mode_explicit = True
         sent = []
 
         async def post(*args, **kwargs):
@@ -937,9 +942,152 @@ class MexcPerpetualReviewFixTests(IsolatedAsyncioWrapperTestCase):
         await asyncio.sleep(0.2)
         self.assertEqual(Decimal("100"), order.executed_amount_base)
         self.assertEqual(OrderState.FILLED, order.current_state)
+        self.assertTrue(self.exchange.is_cancel_confirmed("oid-1"))
+
+    async def test_cancel_2041_already_cancelled_is_done(self):
+        order = self._track(Decimal("100"))
+        captured = []
+
+        async def post(*args, **kwargs):
+            captured.append(kwargs.get("data"))
+            return {
+                "success": True,
+                "code": 0,
+                "data": [{"orderId": "877759993012810880", "errorCode": 2041, "errorMsg": "already cancelled"}],
+            }
+
+        async def get(path_url, **kwargs):
+            return {
+                "success": True,
+                "code": 0,
+                "data": {
+                    "orderId": "877759993012810880",
+                    "externalOid": "oid-1",
+                    "state": 4,
+                    "dealVol": "0",
+                    "dealAvgPrice": "0",
+                    "price": "0.07816",
+                    "vol": "10",
+                },
+            }
+
+        order.update_exchange_order_id("877759993012810880")
+        self.exchange._api_post = post
+        self.exchange._api_get = get
+        result = await self.exchange._place_cancel("oid-1", order)
+        await asyncio.sleep(0.2)
+        self.assertFalse(result)
+        self.assertEqual(["877759993012810880"], captured[0])
+        self.assertEqual(OrderState.CANCELED, order.current_state)
+        self.assertTrue(self.exchange.is_cancel_confirmed("oid-1"))
+
+    async def test_cancel_item_error_fails_and_leaves_the_order_open(self):
+        order = self._track(Decimal("100"))
+        order.update_exchange_order_id("877759993012810880")
+
+        async def post(*args, **kwargs):
+            return {
+                "success": True,
+                "code": 0,
+                "data": [{"orderId": "877759993012810880", "errorCode": 600, "errorMsg": "Parameter error"}],
+            }
+
+        self.exchange._api_post = post
+        with self.assertRaises(MexcResponseError) as caught:
+            await self.exchange._place_cancel("oid-1", order)
+        self.assertEqual(600, caught.exception.code)
+        self.assertNotEqual(OrderState.CANCELED, order.current_state)
+        self.assertFalse(self.exchange.is_cancel_confirmed("oid-1"))
+
+    def _raw_post(self, mock_api, path: str) -> tuple:
+        pattern = re.compile(f"^{re.escape(private_rest_url(path))}.*")
+        calls = []
+        for key, value in mock_api.requests.items():
+            if pattern.search(str(key[1])):
+                calls.extend(value)
+        self.assertTrue(calls)
+        call = calls[0]
+        return call.kwargs["data"], call.kwargs["headers"]
+
+    @aioresponses()
+    async def test_cancel_wire_body_is_a_signed_json_array(self, mock_api):
+        order = self._track(Decimal("100"))
+        order.update_exchange_order_id("877759993012810880")
+        mock_api.get(
+            re.compile(r".*/api/v1/contract/ping.*"),
+            body=json.dumps({"success": True, "code": 0, "data": 1700000000000}),
+            repeat=True,
+        )
+        mock_api.post(
+            re.compile(r".*/api/v1/private/order/cancel.*"),
+            body=json.dumps({
+                "success": True,
+                "code": 0,
+                "data": [{"orderId": "877759993012810880", "errorCode": 600, "errorMsg": "Parameter error"}],
+            }),
+        )
+        with self.assertRaises(MexcResponseError) as caught:
+            await self.exchange._place_cancel("oid-1", order)
+        self.assertEqual(600, caught.exception.code)
+        raw, headers = self._raw_post(mock_api, CONSTANTS.CANCEL_ORDER_PATH)
+        self.assertEqual('["877759993012810880"]', raw)
+        self.assertIsInstance(json.loads(raw), list)
+        signed = f"key{headers['Request-Time']}{raw}"
+        signature = hmac.new(b"secret", signed.encode("utf-8"), hashlib.sha256).hexdigest()
+        self.assertEqual(signature, headers["Signature"])
+        self.assertNotEqual(OrderState.CANCELED, order.current_state)
+
+    @aioresponses()
+    async def test_cancel_with_external_wire_body_is_a_signed_array_of_objects(self, mock_api):
+        order = self._track(Decimal("100"))
+        order.exchange_order_id = None
+        mock_api.get(
+            re.compile(r".*/api/v1/contract/ping.*"),
+            body=json.dumps({"success": True, "code": 0, "data": 1700000000000}),
+            repeat=True,
+        )
+        mock_api.post(
+            re.compile(r".*/api/v1/private/order/cancel_with_external.*"),
+            body=json.dumps({
+                "success": True,
+                "code": 0,
+                "data": [{"orderId": None, "errorCode": 0, "errorMsg": "success"}],
+            }),
+        )
+        client_path = CONSTANTS.ORDER_BY_EXTERNAL_PATH.format(symbol="AIOT_USDT", external_oid="oid-1")
+        mock_api.get(
+            re.compile(f"^{re.escape(private_rest_url(client_path))}.*"),
+            body=json.dumps({
+                "success": True,
+                "code": 0,
+                "data": {
+                    "orderId": "1",
+                    "externalOid": "oid-1",
+                    "state": 4,
+                    "dealVol": "0",
+                    "dealAvgPrice": "0",
+                    "price": "0.07816",
+                    "vol": "10",
+                },
+            }),
+        )
+        mock_api.get(
+            re.compile(r".*/api/v1/private/order/deal_details/.*"),
+            body=json.dumps({"success": True, "code": 0, "data": []}),
+            repeat=True,
+        )
+        await self.exchange._place_cancel("oid-1", order)
+        raw, headers = self._raw_post(mock_api, CONSTANTS.CANCEL_BY_EXTERNAL_PATH)
+        expected = json.dumps([{"symbol": "AIOT_USDT", "externalOid": "oid-1"}])
+        self.assertEqual(expected, raw)
+        self.assertIsInstance(json.loads(raw), list)
+        signed = f"key{headers['Request-Time']}{raw}"
+        signature = hmac.new(b"secret", signed.encode("utf-8"), hashlib.sha256).hexdigest()
+        self.assertEqual(signature, headers["Signature"])
 
     async def test_stop_cancels_an_order_that_is_still_being_created(self):
         self.exchange._position_mode_confirmed = True
+        self.exchange._margin_mode_explicit = True
         self.exchange._contract_sizes[self.trading_pair] = Decimal("10")
         release = asyncio.Event()
         started = asyncio.Event()
@@ -1064,7 +1212,9 @@ class MexcPerpetualReviewFixTests(IsolatedAsyncioWrapperTestCase):
         self.assertEqual(CONSTANTS.OPEN_TYPE_ISOLATED, payload["openType"])
 
     async def test_leverage_change_sends_position_id_when_a_position_exists(self):
-        self.exchange._position_ids[(self.trading_pair, PositionSide.LONG)] = 42
+        self.exchange._position_mode_confirmed = True
+        await self._hold_hedge_position(PositionSide.LONG, 1, CONSTANTS.OPEN_TYPE_CROSS, 42, hold_vol="10")
+        self.exchange._perpetual_trading.set_position_mode(PositionMode.ONEWAY)
         await self.exchange.set_margin_mode(MarginMode.ISOLATED)
         captured = []
 
@@ -1073,11 +1223,11 @@ class MexcPerpetualReviewFixTests(IsolatedAsyncioWrapperTestCase):
             return {"success": True, "code": 0}
 
         self.exchange._api_post = post
-        success, _message = await self.exchange._set_trading_pair_leverage(self.trading_pair, 2)
-        self.assertTrue(success)
+        success, message = await self.exchange._set_trading_pair_leverage(self.trading_pair, 2)
+        self.assertTrue(success, message)
         self.assertEqual(42, captured[0]["positionId"])
         self.assertEqual(2, captured[0]["leverage"])
-        self.assertEqual(CONSTANTS.OPEN_TYPE_ISOLATED, captured[0]["openType"])
+        self.assertNotIn("openType", captured[0])
 
     async def test_confirm_leverage_and_margin_returns_false_when_the_exchange_rejects_it(self):
         self.exchange._position_mode_confirmed = True
@@ -1089,6 +1239,438 @@ class MexcPerpetualReviewFixTests(IsolatedAsyncioWrapperTestCase):
         confirmed = await self.exchange.confirm_leverage_and_margin(self.trading_pair, 2, MarginMode.ISOLATED)
         self.assertFalse(confirmed)
         self.assertNotEqual(2, self.exchange.get_leverage(self.trading_pair))
+
+    async def _hold_hedge_position(self, side: PositionSide, leverage: int, open_type: int, position_id: int, hold_vol: str = "60770"):
+        self.exchange._perpetual_trading.set_position_mode(PositionMode.HEDGE)
+        self.exchange._contract_sizes[self.trading_pair] = Decimal("1")
+        parsed = await self.exchange._parse_position({
+            "symbol": "AIOT_USDT",
+            "positionType": 1 if side is PositionSide.LONG else 2,
+            "openType": open_type,
+            "state": 1,
+            "holdVol": hold_vol,
+            "holdAvgPrice": "0.08",
+            "leverage": leverage,
+            "positionId": position_id,
+            "unRealizedPnl": "0",
+        })
+        pos_key, position = parsed
+        self.exchange._perpetual_trading.set_position(pos_key, position)
+        return position
+
+    async def test_set_leverage_omits_open_type_when_no_margin_mode_was_requested(self):
+        self.exchange._position_mode_confirmed = True
+        await self._hold_hedge_position(PositionSide.LONG, 1, CONSTANTS.OPEN_TYPE_CROSS, 42, hold_vol="10")
+        self.exchange._perpetual_trading.set_position_mode(PositionMode.ONEWAY)
+        await self.exchange.set_margin_mode(MarginMode.ISOLATED)
+        captured = []
+
+        async def post(path_url, data=None, **kwargs):
+            captured.append(data)
+            return {"success": True, "code": 0}
+
+        self.exchange._api_post = post
+        await self.exchange._execute_set_leverage(self.trading_pair, 4)
+        self.assertEqual(1, len(captured))
+        self.assertNotIn("openType", captured[0])
+        self.assertEqual(4, captured[0]["leverage"])
+        self.assertEqual(42, captured[0]["positionId"])
+        self.assertEqual(4, self.exchange.get_leverage(self.trading_pair))
+
+    async def test_set_leverage_refuses_when_the_position_is_not_loaded(self):
+        self.exchange._position_mode_confirmed = True
+        captured = []
+
+        async def post(path_url, data=None, **kwargs):
+            captured.append(data)
+            return {"success": True, "code": 0}
+
+        self.exchange._api_post = post
+        confirmed = await self.exchange.confirm_leverage_and_margin(self.trading_pair, 2, None)
+        self.assertFalse(confirmed)
+        self.assertEqual([], captured)
+        self.assertNotEqual(2, self.exchange.get_leverage(self.trading_pair))
+        reason = self.exchange.leverage_confirmation_error()
+        self.assertIn("AIOT-USDT LONG", reason)
+        self.assertIn("open position is loaded", reason)
+        self.assertIn("Refusing to trade", reason)
+
+    async def test_hedge_leverage_read_skips_a_matching_long_and_does_not_change_the_short(self):
+        self.exchange._position_mode_confirmed = True
+        await self._hold_hedge_position(PositionSide.LONG, 2, CONSTANTS.OPEN_TYPE_ISOLATED, 101)
+        await self._hold_hedge_position(PositionSide.SHORT, 5, CONSTANTS.OPEN_TYPE_CROSS, 202, hold_vol="10")
+        captured = []
+
+        async def post(path_url, data=None, **kwargs):
+            captured.append(data)
+            return {"success": True, "code": 0}
+
+        self.exchange._api_post = post
+        confirmed = await self.exchange.confirm_leverage_and_margin(
+            self.trading_pair,
+            2,
+            None,
+            position_side=PositionSide.LONG,
+        )
+        self.assertTrue(confirmed)
+        self.assertEqual([], captured)
+        self.assertEqual(2, self.exchange.get_leverage(self.trading_pair))
+
+        confirmed = await self.exchange.confirm_leverage_and_margin(
+            self.trading_pair,
+            3,
+            None,
+            position_side=PositionSide.LONG,
+        )
+        self.assertTrue(confirmed)
+        self.assertEqual(1, len(captured))
+        self.assertEqual(101, captured[0]["positionId"])
+        self.assertEqual(3, captured[0]["leverage"])
+        self.assertNotIn("openType", captured[0])
+        self.assertNotIn(202, captured[0].values())
+        captured.clear()
+        await self.exchange._execute_set_leverage(self.trading_pair, 6, PositionSide.SHORT)
+        self.assertEqual([202], [item.get("positionId") for item in captured])
+        self.assertNotIn("openType", captured[0])
+        self.assertEqual(6, captured[0]["leverage"])
+
+    async def test_hedge_set_leverage_for_an_empty_long_does_not_send_the_short(self):
+        self.exchange._position_mode_confirmed = True
+        self.exchange._perpetual_trading.set_position_mode(PositionMode.HEDGE)
+        captured = []
+
+        async def post(path_url, data=None, **kwargs):
+            captured.append(data)
+            return {"success": True, "code": 0}
+
+        self.exchange._api_post = post
+        success, message = await self.exchange._set_trading_pair_leverage(
+            self.trading_pair,
+            2,
+            margin_mode=None,
+            position_side=PositionSide.LONG,
+        )
+        self.assertFalse(success)
+        self.assertIn("LONG", message)
+        self.assertIn("open position is loaded", message)
+        self.assertEqual([], captured)
+
+        success, message = await self.exchange._set_trading_pair_leverage(
+            self.trading_pair,
+            2,
+            margin_mode=None,
+            position_side=None,
+        )
+        self.assertFalse(success)
+        self.assertIn("position side", message)
+        self.assertEqual([], captured)
+
+    async def test_hedge_margin_switch_rejection_halts_without_touching_the_other_side(self):
+        self.exchange._position_mode_confirmed = True
+        self.exchange._margin_mode = MarginMode.CROSS
+        await self._hold_hedge_position(PositionSide.LONG, 2, CONSTANTS.OPEN_TYPE_CROSS, 101)
+        await self._hold_hedge_position(PositionSide.SHORT, 5, CONSTANTS.OPEN_TYPE_ISOLATED, 202, hold_vol="10")
+        captured = []
+
+        async def post(path_url, data=None, **kwargs):
+            captured.append(data)
+            raise IOError("Error: 2027 - There is only one cross or isolated in the same direction")
+
+        self.exchange._api_post = post
+        confirmed = await self.exchange.confirm_leverage_and_margin(
+            self.trading_pair,
+            2,
+            MarginMode.ISOLATED,
+            position_side=PositionSide.LONG,
+        )
+        self.assertFalse(confirmed)
+        self.assertEqual(1, len(captured))
+        self.assertEqual(101, captured[0]["positionId"])
+        self.assertEqual(CONSTANTS.OPEN_TYPE_ISOLATED, captured[0]["openType"])
+        self.assertNotIn(202, [item.get("positionId") for item in captured])
+        reason = self.exchange.leverage_confirmation_error()
+        self.assertIn("AIOT-USDT LONG", reason)
+        self.assertIn("CROSS", reason)
+        self.assertIn("ISOLATED", reason)
+        self.assertIn("Refusing to trade", reason)
+        self.assertEqual(MarginMode.CROSS, self.exchange._margin_mode)
+        self.assertFalse(self.exchange._margin_mode_explicit)
+
+    async def test_hedge_child_orders_use_the_side_for_that_position(self):
+        self.exchange._position_mode_confirmed = True
+        self.exchange._perpetual_trading.set_position_mode(PositionMode.HEDGE)
+        self.exchange._contract_sizes[self.trading_pair] = Decimal("10")
+        await self._hold_hedge_position(PositionSide.LONG, 2, CONSTANTS.OPEN_TYPE_CROSS, 101, hold_vol="6077")
+        await self._hold_hedge_position(PositionSide.SHORT, 5, CONSTANTS.OPEN_TYPE_ISOLATED, 202, hold_vol="10")
+        captured = []
+
+        async def post(path_url, data=None, **kwargs):
+            captured.append(data)
+            return {"success": True, "code": 0, "data": {"orderId": str(len(captured)), "ts": 1}}
+
+        self.exchange._api_post = post
+
+        async def place(trade_type, position_action):
+            await self.exchange._place_order(
+                order_id=f"client-{len(captured) + 1}",
+                trading_pair=self.trading_pair,
+                amount=Decimal("100"),
+                trade_type=trade_type,
+                order_type=OrderType.LIMIT,
+                price=Decimal("0.08"),
+                position_action=position_action,
+            )
+
+        await place(TradeType.BUY, PositionAction.OPEN)
+        await place(TradeType.SELL, PositionAction.OPEN)
+        await place(TradeType.SELL, PositionAction.CLOSE)
+        await place(TradeType.BUY, PositionAction.CLOSE)
+        open_long, open_short, close_long, close_short = captured
+        self.assertEqual(2, open_long["leverage"])
+        self.assertEqual(5, open_short["leverage"])
+        self.assertEqual(2, close_long["leverage"])
+        self.assertEqual(5, close_short["leverage"])
+        self.assertEqual(CONSTANTS.SIDE_OPEN_LONG, open_long["side"])
+        self.assertEqual(CONSTANTS.POSITION_MODE_HEDGE, open_long["positionMode"])
+        self.assertEqual(CONSTANTS.OPEN_TYPE_CROSS, open_long["openType"])
+        self.assertNotIn("reduceOnly", open_long)
+        self.assertNotIn("positionId", open_long)
+        self.assertEqual(CONSTANTS.SIDE_OPEN_SHORT, open_short["side"])
+        self.assertEqual(CONSTANTS.POSITION_MODE_HEDGE, open_short["positionMode"])
+        self.assertEqual(CONSTANTS.OPEN_TYPE_ISOLATED, open_short["openType"])
+        self.assertEqual(CONSTANTS.SIDE_CLOSE_LONG, close_long["side"])
+        self.assertEqual(101, close_long["positionId"])
+        self.assertEqual(CONSTANTS.POSITION_MODE_HEDGE, close_long["positionMode"])
+        self.assertNotIn("reduceOnly", close_long)
+        self.assertEqual(CONSTANTS.OPEN_TYPE_CROSS, close_long["openType"])
+        self.assertEqual(CONSTANTS.SIDE_CLOSE_SHORT, close_short["side"])
+        self.assertEqual(202, close_short["positionId"])
+        self.assertEqual(CONSTANTS.POSITION_MODE_HEDGE, close_short["positionMode"])
+        self.assertNotIn("reduceOnly", close_short)
+        self.assertEqual(CONSTANTS.OPEN_TYPE_ISOLATED, close_short["openType"])
+
+    async def test_order_is_refused_until_that_side_open_type_is_read(self):
+        self.exchange._position_mode_confirmed = True
+        self.exchange._perpetual_trading.set_position_mode(PositionMode.HEDGE)
+        self.exchange._contract_sizes[self.trading_pair] = Decimal("10")
+        captured = []
+
+        async def post(path_url, data=None, **kwargs):
+            captured.append(data)
+            return {"success": True, "code": 0, "data": {"orderId": "1", "ts": 1}}
+
+        self.exchange._api_post = post
+        with self.assertRaises(IOError) as raised:
+            await self.exchange._place_order(
+                order_id="client-1",
+                trading_pair=self.trading_pair,
+                amount=Decimal("100"),
+                trade_type=TradeType.BUY,
+                order_type=OrderType.LIMIT,
+                price=Decimal("0.08"),
+                position_action=PositionAction.OPEN,
+            )
+        self.assertIn("openType", str(raised.exception))
+        self.assertIn("LONG", str(raised.exception))
+        self.assertEqual([], captured)
+        self.exchange._position_margin_modes[(self.trading_pair, PositionSide.LONG)] = MarginMode.CROSS
+        await self.exchange._place_order(
+            order_id="client-2",
+            trading_pair=self.trading_pair,
+            amount=Decimal("100"),
+            trade_type=TradeType.BUY,
+            order_type=OrderType.LIMIT,
+            price=Decimal("0.08"),
+            position_action=PositionAction.OPEN,
+        )
+        self.assertEqual(CONSTANTS.OPEN_TYPE_CROSS, captured[0]["openType"])
+        self.assertNotEqual(CONSTANTS.OPEN_TYPE_ISOLATED, captured[0]["openType"])
+
+    async def test_hedge_leverage_without_a_side_changes_neither_side(self):
+        self.exchange._position_mode_confirmed = True
+        await self._hold_hedge_position(PositionSide.LONG, 2, CONSTANTS.OPEN_TYPE_ISOLATED, 101)
+        await self._hold_hedge_position(PositionSide.SHORT, 5, CONSTANTS.OPEN_TYPE_CROSS, 202, hold_vol="10")
+        captured = []
+
+        async def post(path_url, data=None, **kwargs):
+            captured.append(data)
+            return {"success": True, "code": 0}
+
+        self.exchange._api_post = post
+        confirmed = await self.exchange.confirm_leverage_and_margin(self.trading_pair, 3, None)
+        self.assertFalse(confirmed)
+        self.assertEqual([], captured)
+        self.assertIn("position side", self.exchange.leverage_confirmation_error())
+
+    async def test_side_less_leverage_raises_until_hedge_mode_is_read(self):
+        await self._hold_hedge_position(PositionSide.LONG, 2, CONSTANTS.OPEN_TYPE_ISOLATED, 101)
+        await self._hold_hedge_position(PositionSide.SHORT, 5, CONSTANTS.OPEN_TYPE_CROSS, 202, hold_vol="10")
+        # The read has not succeeded. The connector still defaults to one-way.
+        self.exchange._perpetual_trading.set_position_mode(PositionMode.ONEWAY)
+        self.exchange._position_mode_confirmed = False
+        captured = []
+
+        async def post(path_url, data=None, **kwargs):
+            captured.append(data)
+            return {"success": True, "code": 0}
+
+        self.exchange._api_post = post
+        with self.assertRaises(IOError) as unread:
+            await self.exchange._execute_set_leverage(self.trading_pair, 9)
+        self.assertIn("position mode", str(unread.exception))
+        self.assertEqual([], captured)
+        self.assertNotEqual(9, self.exchange.get_leverage(self.trading_pair))
+
+        self.exchange._position_mode_confirmed = True
+        self.exchange._perpetual_trading.set_position_mode(PositionMode.HEDGE)
+        with self.assertRaises(IOError) as side_less:
+            await self.exchange._execute_set_leverage(self.trading_pair, 9)
+        self.assertIn("position side", str(side_less.exception))
+        self.assertEqual([], captured)
+        self.assertNotEqual(9, self.exchange.get_leverage(self.trading_pair))
+
+        await self.exchange._execute_set_leverage(self.trading_pair, 2, PositionSide.LONG)
+        self.assertEqual([], captured)
+        self.assertEqual(2, self.exchange.get_leverage(self.trading_pair))
+
+    async def test_explicit_margin_on_an_empty_hedge_side_sends_only_that_side(self):
+        self.exchange._position_mode_confirmed = True
+        self.exchange._perpetual_trading.set_position_mode(PositionMode.HEDGE)
+        captured = []
+
+        async def post(path_url, data=None, **kwargs):
+            captured.append(data)
+            return {"success": True, "code": 0}
+
+        self.exchange._api_post = post
+        success, message = await self.exchange._set_trading_pair_leverage(
+            self.trading_pair,
+            2,
+            margin_mode=MarginMode.ISOLATED,
+            position_side=PositionSide.LONG,
+        )
+        self.assertTrue(success, message)
+        self.assertEqual(1, len(captured))
+        self.assertEqual(CONSTANTS.POSITION_TYPE_LONG, captured[0]["positionType"])
+        self.assertEqual(CONSTANTS.OPEN_TYPE_ISOLATED, captured[0]["openType"])
+        self.assertNotEqual(CONSTANTS.POSITION_TYPE_SHORT, captured[0].get("positionType"))
+
+    async def test_hedge_close_without_a_position_id_is_refused(self):
+        self.exchange._position_mode_confirmed = True
+        self.exchange._perpetual_trading.set_position_mode(PositionMode.HEDGE)
+        self.exchange._contract_sizes[self.trading_pair] = Decimal("10")
+        self.exchange._position_margin_modes[(self.trading_pair, PositionSide.LONG)] = MarginMode.CROSS
+        captured = []
+
+        async def post(path_url, data=None, **kwargs):
+            captured.append(data)
+            return {"success": True, "code": 0, "data": {"orderId": "1", "ts": 1}}
+
+        self.exchange._api_post = post
+        with self.assertRaises(IOError) as raised:
+            await self.exchange._place_order(
+                order_id="client-1",
+                trading_pair=self.trading_pair,
+                amount=Decimal("100"),
+                trade_type=TradeType.SELL,
+                order_type=OrderType.LIMIT,
+                price=Decimal("0.09"),
+                position_action=PositionAction.CLOSE,
+            )
+        self.assertIn("positionId", str(raised.exception))
+        self.assertIn("LONG", str(raised.exception))
+        self.assertEqual([], captured)
+        with self.assertRaises(IOError):
+            await self.exchange.place_plan_order(
+                trading_pair=self.trading_pair,
+                amount=Decimal("100"),
+                trade_type=TradeType.SELL,
+                trigger_price=Decimal("0.09"),
+                trigger_type=CONSTANTS.TRIGGER_TYPE_GTE,
+                price=Decimal("0.09"),
+                position_action=PositionAction.CLOSE,
+            )
+        self.assertEqual([], captured)
+
+    async def test_one_way_close_uses_buy_or_sell_side_and_reduce_only(self):
+        self.exchange._position_mode_confirmed = True
+        self.exchange._margin_mode_explicit = True
+        self.exchange._perpetual_trading.set_position_mode(PositionMode.ONEWAY)
+        self.exchange._contract_sizes[self.trading_pair] = Decimal("10")
+        captured = []
+
+        async def post(path_url, data=None, **kwargs):
+            captured.append(data)
+            return {"success": True, "code": 0, "data": {"orderId": str(len(captured)), "ts": 1}}
+
+        self.exchange._api_post = post
+        await self.exchange._place_order(
+            order_id="client-sell",
+            trading_pair=self.trading_pair,
+            amount=Decimal("100"),
+            trade_type=TradeType.SELL,
+            order_type=OrderType.LIMIT,
+            price=Decimal("0.09"),
+            position_action=PositionAction.CLOSE,
+        )
+        await self.exchange._place_order(
+            order_id="client-buy",
+            trading_pair=self.trading_pair,
+            amount=Decimal("100"),
+            trade_type=TradeType.BUY,
+            order_type=OrderType.LIMIT,
+            price=Decimal("0.09"),
+            position_action=PositionAction.CLOSE,
+        )
+        sell_close, buy_close = captured
+        self.assertEqual(CONSTANTS.SIDE_OPEN_SHORT, sell_close["side"])
+        self.assertTrue(sell_close["reduceOnly"])
+        self.assertEqual(CONSTANTS.POSITION_MODE_ONEWAY, sell_close["positionMode"])
+        self.assertEqual(CONSTANTS.SIDE_OPEN_LONG, buy_close["side"])
+        self.assertTrue(buy_close["reduceOnly"])
+        self.assertEqual(CONSTANTS.POSITION_MODE_ONEWAY, buy_close["positionMode"])
+
+    async def test_hedge_exposure_reads_one_side_of_the_pair(self):
+        self.exchange._perpetual_trading.set_position_mode(PositionMode.HEDGE)
+        self.exchange._contract_sizes[self.trading_pair] = Decimal("10")
+
+        async def get(path_url, params=None, **kwargs):
+            if path_url == CONSTANTS.OPEN_POSITIONS_PATH:
+                return {
+                    "success": True,
+                    "code": 0,
+                    "data": [
+                        {"symbol": "AIOT_USDT", "positionType": 1, "holdVol": 34, "leverage": 2},
+                        {"symbol": "AIOT_USDT", "positionType": 2, "holdVol": 8, "leverage": 5},
+                        {"symbol": "BTC_USDT", "positionType": 1, "holdVol": 5, "leverage": 2},
+                    ],
+                }
+            return {
+                "success": True,
+                "code": 0,
+                "data": [
+                    {"symbol": "AIOT_USDT", "side": 1, "vol": 10, "dealVol": 0},
+                    {"symbol": "AIOT_USDT", "side": 2, "vol": 7, "dealVol": 0},
+                    {"symbol": "AIOT_USDT", "side": 3, "vol": 4, "dealVol": 0},
+                    {"symbol": "AIOT_USDT", "side": 4, "vol": 5, "dealVol": 0},
+                ],
+            }
+
+        self.exchange._api_get = get
+        long_position, long_open = await self.exchange.ground_truth_exposure(
+            self.trading_pair,
+            TradeType.SELL,
+            position_side=PositionSide.LONG,
+        )
+        short_position, short_open = await self.exchange.ground_truth_exposure(
+            self.trading_pair,
+            TradeType.BUY,
+            position_side=PositionSide.SHORT,
+        )
+        self.assertEqual(Decimal("340"), long_position)
+        self.assertEqual(Decimal("150"), long_open)
+        self.assertEqual(Decimal("80"), short_position)
+        self.assertEqual(Decimal("110"), short_open)
 
     async def test_plan_and_stop_cancels_use_the_documented_array_body(self):
         captured = {}
@@ -1142,6 +1724,7 @@ class MexcPerpetualReviewFixTests(IsolatedAsyncioWrapperTestCase):
 
     async def test_close_order_sends_position_id(self):
         self.exchange._position_mode_confirmed = True
+        self.exchange._margin_mode_explicit = True
         self.exchange._contract_sizes[self.trading_pair] = Decimal("10")
         self.exchange._position_ids[(self.trading_pair, PositionSide.LONG)] = 99
         captured = {}
@@ -1161,7 +1744,8 @@ class MexcPerpetualReviewFixTests(IsolatedAsyncioWrapperTestCase):
             position_action=PositionAction.CLOSE,
         )
         self.assertEqual(99, captured["data"]["positionId"])
-        self.assertEqual(CONSTANTS.SIDE_CLOSE_LONG, captured["data"]["side"])
+        self.assertEqual(CONSTANTS.SIDE_OPEN_SHORT, captured["data"]["side"])
+        self.assertTrue(captured["data"]["reduceOnly"])
 
     async def test_mixed_contract_page_counts_only_this_symbol(self):
         self.exchange._contract_sizes[self.trading_pair] = Decimal("10")

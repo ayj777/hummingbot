@@ -1,5 +1,6 @@
 import hashlib
 import hmac
+import json
 from typing import Any, Dict, Mapping, Optional
 from urllib.parse import quote, urlencode
 
@@ -64,7 +65,17 @@ class MexcPerpetualAuth(AuthBase):
         if request.method in (RESTMethod.GET, RESTMethod.DELETE):
             param_string = self.param_string_for_query(request.params)
         else:
-            param_string = request.data if isinstance(request.data, str) else ""
+            # POST and PUT sign the body that is sent. A list is the cancel
+            # payload (a JSON array of order ids). Serialize it once here so the
+            # signature and the body are the same text. A string is already that
+            # text, from RESTAssistant, and must not be dumped again.
+            if isinstance(request.data, str):
+                param_string = request.data
+            elif request.data is None:
+                param_string = ""
+            else:
+                param_string = json.dumps(request.data)
+                request.data = param_string
         signature = self._sign(timestamp, param_string)
         headers = dict(request.headers or {})
         headers.update(self.rest_headers(timestamp, signature))

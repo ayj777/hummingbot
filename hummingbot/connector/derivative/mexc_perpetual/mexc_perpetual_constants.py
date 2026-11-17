@@ -23,6 +23,9 @@ ORDER_NOT_FOUND_ERROR_CODES = {2040}
 CONFIRMED_ABSENT = "confirmed_absent"
 # The order can no longer be canceled. That is what a fill looks like on the cancel endpoint.
 ORDER_CANNOT_CANCEL_ERROR_CODE = 2041
+# 2026: leverage modification is not supported for cross.
+# 2027: only one cross or isolated position is allowed in the same direction.
+MARGIN_MODE_SWITCH_ERROR_CODES = {2026, 2027}
 
 # Order side: 1 open long, 2 close short, 3 open short, 4 close long.
 SIDE_OPEN_LONG = 1

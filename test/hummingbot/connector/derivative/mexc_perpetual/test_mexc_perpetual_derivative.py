@@ -1,4 +1,6 @@
 import asyncio
+import hashlib
+import hmac
 import json
 import re
 from decimal import Decimal
@@ -14,10 +16,11 @@ from hummingbot.connector.derivative.mexc_perpetual.mexc_perpetual_derivative im
     MarginMode,
     MexcPerpetualDerivative,
 )
+from hummingbot.connector.derivative.position import Position
 from hummingbot.connector.test_support.perpetual_derivative_test import AbstractPerpetualDerivativeTests
 from hummingbot.connector.trading_rule import TradingRule
 from hummingbot.connector.utils import combine_to_hb_trading_pair
-from hummingbot.core.data_type.common import OrderType, PositionAction, PositionMode, TradeType
+from hummingbot.core.data_type.common import OrderType, PositionAction, PositionMode, PositionSide, TradeType
 from hummingbot.core.data_type.funding_info import FundingInfo
 from hummingbot.core.data_type.in_flight_order import InFlightOrder, OrderState
 from hummingbot.core.data_type.trade_fee import AddedToCostTradeFee, TokenAmount, TradeFeeBase
@@ -289,6 +292,8 @@ class MexcPerpetualDerivativeTests(AbstractPerpetualDerivativeTests.PerpetualDer
         exchange._perpetual_trading._funding_info[self.trading_pair] = funding_info
         exchange._contract_sizes[self.trading_pair] = Decimal("10")
         exchange._position_mode_confirmed = True
+        # This fixture declares isolated margin. An unread openType is refused.
+        exchange._margin_mode_explicit = True
         return exchange
 
     def validate_auth_credentials_present(self, request_call: RequestCall):
@@ -313,8 +318,14 @@ class MexcPerpetualDerivativeTests(AbstractPerpetualDerivativeTests.PerpetualDer
             self.assertEqual(order.price, Decimal(request_data["price"]))
 
     def validate_order_cancelation_request(self, order: InFlightOrder, request_call: RequestCall):
-        request_data = json.loads(request_call.kwargs["data"])
-        self.assertEqual([int(order.exchange_order_id)], request_data["orderIds"])
+        raw = request_call.kwargs["data"]
+        expected = json.dumps([str(order.exchange_order_id)])
+        self.assertEqual(expected, raw)
+        self.assertIsInstance(json.loads(raw), list)
+        timestamp = request_call.kwargs["headers"]["Request-Time"]
+        signed = f"{self.api_key}{timestamp}{raw}"
+        signature = hmac.new(self.api_secret.encode("utf-8"), signed.encode("utf-8"), hashlib.sha256).hexdigest()
+        self.assertEqual(signature, request_call.kwargs["headers"]["Signature"])
 
     def validate_order_status_request(self, order: InFlightOrder, request_call: RequestCall):
         self.assertFalse(request_call.kwargs.get("params"))
@@ -639,12 +650,26 @@ class MexcPerpetualDerivativeTests(AbstractPerpetualDerivativeTests.PerpetualDer
         )
         return url, f"Error: 7001 - {message}"
 
+    def _hold_loaded_long(self):
+        # A leverage change with no margin mode is refused until this side is loaded.
+        position = Position(
+            trading_pair=self.trading_pair,
+            position_side=PositionSide.LONG,
+            unrealized_pnl=Decimal("0"),
+            entry_price=Decimal("1"),
+            amount=Decimal("1"),
+            leverage=Decimal("1"),
+        )
+        self.exchange._perpetual_trading.set_position(self.trading_pair, position)
+        self.exchange._position_ids[(self.trading_pair, PositionSide.LONG)] = 7
+
     def configure_failed_set_leverage(
         self,
         leverage: int,
         mock_api: aioresponses,
         callback: Optional[Callable] = lambda *args, **kwargs: None,
     ) -> Tuple[str, str]:
+        self._hold_loaded_long()
         message = "Leverage multiplier must be within the upper limit"
         url = self._mock_response(
             mock_api,
@@ -661,6 +686,7 @@ class MexcPerpetualDerivativeTests(AbstractPerpetualDerivativeTests.PerpetualDer
         mock_api: aioresponses,
         callback: Optional[Callable] = lambda *args, **kwargs: None,
     ):
+        self._hold_loaded_long()
         self._mock_response(
             mock_api,
             self._url_regex(CONSTANTS.CHANGE_LEVERAGE_PATH),

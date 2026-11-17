@@ -61,6 +61,36 @@ class MexcPerpetualAuthTests(TestCase):
         self.assertEqual(body, request.data)
         self.assertEqual(self._signature(timestamp, body), request.headers["Signature"])
 
+    def test_post_signature_signs_a_json_array_body_exactly(self):
+        body = '["877759993012810880"]'
+        request = RESTRequest(
+            method=RESTMethod.POST,
+            url="https://api.mexc.com/api/v1/private/order/cancel",
+            data=body,
+            is_auth_required=True,
+            headers={},
+        )
+        self.async_run_with_timeout(self.auth.rest_authenticate(request))
+
+        timestamp = "1657186536762"
+        self.assertEqual(body, request.data)
+        self.assertEqual(self._signature(timestamp, body), request.headers["Signature"])
+
+    def test_post_signature_serializes_a_list_body_before_signing(self):
+        request = RESTRequest(
+            method=RESTMethod.POST,
+            url="https://api.mexc.com/api/v1/private/order/cancel",
+            data=["877759993012810880"],
+            is_auth_required=True,
+            headers={},
+        )
+        self.async_run_with_timeout(self.auth.rest_authenticate(request))
+
+        body = '["877759993012810880"]'
+        timestamp = "1657186536762"
+        self.assertEqual(body, request.data)
+        self.assertEqual(self._signature(timestamp, body), request.headers["Signature"])
+
     def test_ws_login_signs_api_key_plus_timestamp(self):
         payload = self.auth.get_ws_login_payload()
         timestamp = "1657186536762"
