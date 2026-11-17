@@ -92,6 +92,10 @@ class MexcPerpetualDerivative(PerpetualDerivativePyBase):
         self._confirmed_absent = set()
         self._creates_in_flight = set()
         self._creates_finished = set()
+        # Highest fill ever reported for a client id, recorded before any state decision.
+        self._max_fill_base: Dict[str, Decimal] = {}
+        self._max_fill_quote: Dict[str, Decimal] = {}
+        self._seen_live_client_ids = set()
         super().__init__(balance_asset_limit, rate_limits_share_pct)
 
     @property
@@ -1196,16 +1200,109 @@ class MexcPerpetualDerivative(PerpetualDerivativePyBase):
             raise ValueError(f"Order {exchange_order_id} not found")
         return data
 
-    async def _classify_order_read(self, request) -> Tuple[str, Optional[Dict[str, Any]]]:
+    def counted_fill(self, client_order_id: str) -> Tuple[Decimal, Decimal]:
+        return (
+            self._max_fill_base.get(client_order_id, s_decimal_0),
+            self._max_fill_quote.get(client_order_id, s_decimal_0),
+        )
+
+    def order_was_seen_live(self, client_order_id: str) -> bool:
+        return client_order_id in self._seen_live_client_ids
+
+    async def _read_order_response(self, path: str, limit_id: str) -> Tuple[str, Optional[Dict[str, Any]]]:
+        """
+        Classify one order read from the response body's code field.
+        A raised error, including HTTP 500, is unknown. Digits in the URL are not a code.
+        """
         try:
-            data = await request()
+            response = await self._api_get(path_url=path, is_auth_required=True, limit_id=limit_id)
         except Exception as exc:
-            if self._is_order_not_found_during_status_update_error(exc):
-                self.logger().info("Order lookup confirmed the order is absent: %s", exc)
-                return "absent", None
             self.logger().warning("Order lookup failed: %s", exc)
             return "failed", None
+        return self._classify_order_response(response)
+
+    @staticmethod
+    def _classify_order_response(response: Any) -> Tuple[str, Optional[Dict[str, Any]]]:
+        if not isinstance(response, dict):
+            return "failed", None
+        code = response.get("code")
+        if code in (None, ""):
+            numeric = 0
+        else:
+            try:
+                numeric = int(code)
+            except (TypeError, ValueError):
+                return "failed", None
+        if numeric in CONSTANTS.ORDER_NOT_FOUND_ERROR_CODES:
+            return "absent", None
+        if response.get("success") is False or numeric != 0:
+            return "failed", None
+        data = response.get("data")
+        if not isinstance(data, dict) or not data:
+            return "absent", None
         return "ok", data
+
+    def _remember_counted_fill(self, client_order_id: str, trading_pair: str, payloads: List[Dict[str, Any]]):
+        for payload in payloads:
+            if not isinstance(payload, dict):
+                continue
+            base, quote = self._payload_fill(trading_pair, payload)
+            previous = self._max_fill_base.get(client_order_id, s_decimal_0)
+            previous_quote = self._max_fill_quote.get(client_order_id, s_decimal_0)
+            if base > previous:
+                self._max_fill_base[client_order_id] = base
+                self._max_fill_quote[client_order_id] = quote
+            elif base == previous and quote > previous_quote:
+                self._max_fill_quote[client_order_id] = quote
+            if self._payload_was_seen_live(payload):
+                self._seen_live_client_ids.add(client_order_id)
+        counted = self._max_fill_base.get(client_order_id, s_decimal_0)
+        order = self._find_order(client_order_id)
+        if order is None:
+            for payload in payloads:
+                external = payload.get("externalOid") if isinstance(payload, dict) else None
+                if external:
+                    order = self._find_order(str(external))
+                    if order is not None:
+                        break
+        if order is None or counted <= s_decimal_0:
+            return
+        reported = getattr(order, "reported_deal_base", None)
+        if reported is None or counted > Decimal(str(reported)):
+            order.reported_deal_base = counted
+            order.reported_deal_price = self._max_fill_quote.get(client_order_id, s_decimal_0) / counted
+        self.synthesize_reported_fill(order)
+
+    def _payload_fill(self, trading_pair: str, payload: Dict[str, Any]) -> Tuple[Decimal, Decimal]:
+        if payload.get("dealVol") in (None, ""):
+            return s_decimal_0, s_decimal_0
+        try:
+            base = Decimal(str(payload.get("dealVol") or "0")) * self.get_contract_size(trading_pair)
+        except Exception:
+            return s_decimal_0, s_decimal_0
+        price_raw = payload.get("dealAvgPrice")
+        if price_raw in (None, "", 0, "0", "0.0"):
+            price_raw = payload.get("price") or "0"
+        try:
+            price = Decimal(str(price_raw or "0"))
+        except Exception:
+            price = s_decimal_0
+        if price < s_decimal_0:
+            price = s_decimal_0
+        return base, base * price
+
+    @staticmethod
+    def _payload_was_seen_live(payload: Dict[str, Any]) -> bool:
+        try:
+            state = int(payload.get("state") or 0)
+            deal = Decimal(str(payload.get("dealVol") or "0"))
+        except Exception:
+            return False
+        return state in (
+            CONSTANTS.ORDER_STATE_PENDING,
+            CONSTANTS.ORDER_STATE_OPEN,
+            CONSTANTS.ORDER_STATE_FILLED,
+        ) or deal > s_decimal_0
 
     async def resolve_unknown_order(
         self,
@@ -1215,30 +1312,30 @@ class MexcPerpetualDerivative(PerpetualDerivativePyBase):
     ):
         """
         Look the order up by client id and by exchange order id.
-        A conflict, or a read that fails, stays unknown (None). confirmed_absent means
-        every read that was attempted reported the order does not exist.
+        Fills are recorded before the state is chosen. A conflict or a failed read stays
+        unknown. confirmed_absent is only for an order no read has ever shown as live.
         """
-        client_kind, client_data = await self._classify_order_read(
-            lambda: self._request_order_by_client_id(trading_pair, client_order_id)
-        )
+        symbol = await self.exchange_symbol_associated_to_pair(trading_pair)
+        client_path = CONSTANTS.ORDER_BY_EXTERNAL_PATH.format(symbol=symbol, external_oid=client_order_id)
+        client_kind, client_data = await self._read_order_response(client_path, CONSTANTS.ORDER_BY_EXTERNAL_LIMIT_ID)
         kinds = [client_kind]
         payloads = [client_data] if client_kind == "ok" and client_data else []
         order_data = None
         if exchange_order_id:
-            order_kind, order_data = await self._classify_order_read(
-                lambda: self._request_order_by_exchange_id(str(exchange_order_id))
-            )
+            order_path = CONSTANTS.ORDER_GET_PATH.format(order_id=exchange_order_id)
+            order_kind, order_data = await self._read_order_response(order_path, CONSTANTS.ORDER_GET_LIMIT_ID)
             kinds.append(order_kind)
             if order_kind == "ok" and order_data:
                 payloads.append(order_data)
-        if payloads and self._payloads_conflict(client_data, order_data):
-            self.logger().warning(
-                "Order %s lookups conflict. Leaving the state unknown.",
-                client_order_id,
-            )
+        self._remember_counted_fill(client_order_id, trading_pair, payloads)
+        if any(kind == "failed" for kind in kinds):
+            return None
+        if self._payloads_conflict(client_data, order_data):
+            self.logger().warning("Order %s lookups conflict. Leaving the state unknown.", client_order_id)
             return None
         if not payloads:
-            if kinds and all(kind == "absent" for kind in kinds):
+            seen = self.order_was_seen_live(client_order_id) or self.counted_fill(client_order_id)[0] > s_decimal_0
+            if kinds and all(kind == "absent" for kind in kinds) and not seen:
                 self._cancel_requests.discard(client_order_id)
                 self._confirmed_absent.add(client_order_id)
                 return CONSTANTS.CONFIRMED_ABSENT
@@ -1253,9 +1350,6 @@ class MexcPerpetualDerivative(PerpetualDerivativePyBase):
         if order is not None:
             if order.exchange_order_id in (None, "") and data.get("orderId"):
                 order.update_exchange_order_id(str(data["orderId"]))
-            self._remember_reported_deal(order, data)
-            await self._apply_deal_details(order)
-            self.synthesize_reported_fill(order)
             self._order_tracker.process_order_update(
                 OrderUpdate(
                     trading_pair=order.trading_pair,
@@ -1598,19 +1692,27 @@ class MexcPerpetualDerivative(PerpetualDerivativePyBase):
         )
 
     @staticmethod
-    def _payload_is_live(payload: Dict[str, Any]) -> bool:
+    def _payload_bucket(payload: Dict[str, Any]) -> str:
         state = int(payload.get("state") or 0)
-        return state not in (
-            CONSTANTS.ORDER_STATE_FILLED,
-            CONSTANTS.ORDER_STATE_CANCELED,
-            CONSTANTS.ORDER_STATE_INVALID,
-        )
+        if state in (CONSTANTS.ORDER_STATE_PENDING, CONSTANTS.ORDER_STATE_OPEN):
+            return "live"
+        if state == CONSTANTS.ORDER_STATE_FILLED:
+            return "filled"
+        if state == CONSTANTS.ORDER_STATE_CANCELED:
+            return "canceled"
+        if state == CONSTANTS.ORDER_STATE_INVALID:
+            return "invalid"
+        return "other"
+
+    @staticmethod
+    def _payload_is_live(payload: Dict[str, Any]) -> bool:
+        return MexcPerpetualDerivative._payload_bucket(payload) == "live"
 
     @classmethod
     def _payloads_conflict(cls, left: Optional[Dict[str, Any]], right: Optional[Dict[str, Any]]) -> bool:
         if not left or not right:
             return False
-        return int(left.get("state") or 0) != int(right.get("state") or 0)
+        return cls._payload_bucket(left) != cls._payload_bucket(right)
 
     @classmethod
     def _reads_allow_terminal(cls, payloads: List[Dict[str, Any]], kinds: List[str], chosen: Dict[str, Any]) -> bool:
@@ -1642,7 +1744,7 @@ class MexcPerpetualDerivative(PerpetualDerivativePyBase):
             return right
         if not right:
             return left
-        if int(left.get("state") or 0) != int(right.get("state") or 0):
+        if MexcPerpetualDerivative._payload_bucket(left) != MexcPerpetualDerivative._payload_bucket(right):
             return None
         left_deal = Decimal(str(left.get("dealVol") or "0"))
         right_deal = Decimal(str(right.get("dealVol") or "0"))

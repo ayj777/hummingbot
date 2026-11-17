@@ -101,6 +101,11 @@ class RangeIcebergExecutor(ExecutorBase):
         self._submitted_order_ids: List[str] = []
         self._accounted_fill_base = Decimal("0")
         self._accounted_fill_quote = Decimal("0")
+        self._accounted_fill_by_order: dict = {}
+        self._accounted_quote_by_order: dict = {}
+        self._counted_fill_base: dict = {}
+        self._counted_fill_quote: dict = {}
+        self._seen_live_order_ids: Set[str] = set()
         self._cancel_attempt_count: dict = {}
         self._cancel_attempt_started: dict = {}
         self._unknown_order_ids: Set[str] = set()
@@ -729,19 +734,22 @@ class RangeIcebergExecutor(ExecutorBase):
         slot = self._slot_for(order_id)
         if slot is None or slot.tracked is None:
             return
+        base, quote = self._best_fill(order_id)
         order = self._order_for(order_id)
         if order is not None:
-            base = Decimal(str(order.executed_amount_base or 0))
-            quote = Decimal(str(order.executed_amount_quote or 0))
             reported = getattr(order, "reported_deal_base", None)
             if reported is not None and Decimal(str(reported)) > base:
                 extra = Decimal(str(reported)) - base
                 price = getattr(order, "reported_deal_price", None) or order.price or Decimal("0")
                 base = Decimal(str(reported))
                 quote += Decimal(str(price or 0)) * extra
-            if base > 0:
-                self._accounted_fill_base += base
-                self._accounted_fill_quote += quote
+        if base > self._accounted_fill_by_order.get(order_id, Decimal("0")):
+            self._accounted_fill_by_order[order_id] = base
+            self._accounted_quote_by_order[order_id] = quote
+        elif quote > self._accounted_quote_by_order.get(order_id, Decimal("0")):
+            self._accounted_quote_by_order[order_id] = quote
+        self._accounted_fill_base = sum(self._accounted_fill_by_order.values(), Decimal("0"))
+        self._accounted_fill_quote = sum(self._accounted_quote_by_order.values(), Decimal("0"))
         slot.tracked = None
         slot.cancel_requested = False
 
@@ -768,7 +776,18 @@ class RangeIcebergExecutor(ExecutorBase):
         self._lookup_started.add(order_id)
         state = await self._lookup_order_state(order_id)
         self._refresh_tracked_orders()
-        if self._is_confirmed_absent(state) or state == OrderState.CANCELED:
+        self._absorb_counted_fills()
+        if self._is_confirmed_absent(state):
+            if self._order_blocks_absent(order_id):
+                self._halt_for_unknown_order(
+                    order_id,
+                    "The order was already seen, so a later not-found does not prove it never filled.",
+                )
+                return True
+            self._resolved_terminal.add(order_id)
+            self._clear_open_retry(order_id)
+            return True
+        if state == OrderState.CANCELED:
             self._resolved_terminal.add(order_id)
             self._clear_open_retry(order_id)
             return True
@@ -824,11 +843,81 @@ class RangeIcebergExecutor(ExecutorBase):
         return state == "confirmed_absent"
 
     def _lookup_clears_halt(self, order_id: str, state) -> bool:
+        self._absorb_counted_fills()
         if self._is_confirmed_absent(state):
-            return True
+            return not self._order_blocks_absent(order_id)
         if state == OrderState.FILLED:
-            return self._known_fill_size(order_id)
+            return self._known_fill_size(order_id) or self._counted_fill_base.get(order_id, Decimal("0")) > 0
         return state == OrderState.CANCELED
+
+    def _order_blocks_absent(self, order_id: str) -> bool:
+        if order_id in self._seen_live_order_ids:
+            return True
+        if self._counted_fill_base.get(order_id, Decimal("0")) > 0:
+            return True
+        return self._known_fill_size(order_id)
+
+    def _absorb_counted_fills(self):
+        connector = self.connectors[self.config.connector_name]
+        counted = self._real_callable(connector, "counted_fill")
+        seen = self._real_callable(connector, "order_was_seen_live")
+        order_ids = set(self._counted_fill_base)
+        order_ids.update(self._unknown_order_ids)
+        order_ids.update(self._unconfirmed_cancels)
+        order_ids.update(self._accounted_fill_by_order)
+        for slot in self._slices:
+            if slot.order_id and slot.order_id != "skipped":
+                order_ids.add(slot.order_id)
+        for order_id in order_ids:
+            if counted is not None:
+                try:
+                    base, quote = counted(order_id)
+                except Exception:
+                    base, quote = Decimal("0"), Decimal("0")
+                base = Decimal(str(base or 0))
+                quote = Decimal(str(quote or 0))
+                previous = self._counted_fill_base.get(order_id, Decimal("0"))
+                previous_quote = self._counted_fill_quote.get(order_id, Decimal("0"))
+                if base > previous:
+                    self._counted_fill_base[order_id] = base
+                    self._counted_fill_quote[order_id] = quote
+                elif base == previous and quote > previous_quote:
+                    self._counted_fill_quote[order_id] = quote
+            if seen is not None:
+                try:
+                    if seen(order_id):
+                        self._seen_live_order_ids.add(order_id)
+                except Exception:
+                    pass
+
+    def _live_fill(self, order_id: str):
+        slot = self._slot_for(order_id)
+        order = slot.tracked.order if slot and slot.tracked else None
+        if order is None and slot and slot.tracked:
+            order = self.get_in_flight_order(self.config.connector_name, order_id)
+        if order is None:
+            return Decimal("0"), Decimal("0")
+        return (
+            Decimal(str(order.executed_amount_base or 0)),
+            Decimal(str(order.executed_amount_quote or 0)),
+        )
+
+    def _best_fill(self, order_id: str):
+        self._absorb_counted_fills()
+        live_base, live_quote = self._live_fill(order_id)
+        counted_base = self._counted_fill_base.get(order_id, Decimal("0"))
+        counted_quote = self._counted_fill_quote.get(order_id, Decimal("0"))
+        accounted_base = self._accounted_fill_by_order.get(order_id, Decimal("0"))
+        accounted_quote = self._accounted_quote_by_order.get(order_id, Decimal("0"))
+        base = max(live_base, counted_base, accounted_base)
+        if base == live_base:
+            quote = live_quote
+        elif base == counted_base:
+            quote = counted_quote
+        else:
+            quote = accounted_quote
+        quote = max(quote, live_quote if live_base == base else Decimal("0"), counted_quote if counted_base == base else Decimal("0"))
+        return base, quote
 
     def _clear_open_retry(self, order_id: str):
         self._open_lookup_count.pop(order_id, None)
@@ -955,13 +1044,27 @@ class RangeIcebergExecutor(ExecutorBase):
 
     @property
     def filled_base(self) -> Decimal:
-        live = sum((slot.tracked.executed_amount_base for slot in self._slices if slot.tracked), Decimal("0"))
-        return live + self._accounted_fill_base
+        self._absorb_counted_fills()
+        return self._sum_best_fills()[0]
 
     @property
     def filled_amount_quote(self) -> Decimal:
-        live = sum((slot.tracked.executed_amount_quote for slot in self._slices if slot.tracked), Decimal("0"))
-        return live + self._accounted_fill_quote
+        self._absorb_counted_fills()
+        return self._sum_best_fills()[1]
+
+    def _sum_best_fills(self):
+        order_ids = set(self._counted_fill_base)
+        order_ids.update(self._accounted_fill_by_order)
+        for slot in self._slices:
+            if slot.order_id and slot.order_id != "skipped":
+                order_ids.add(slot.order_id)
+        base = Decimal("0")
+        quote = Decimal("0")
+        for order_id in order_ids:
+            part_base, part_quote = self._best_fill(order_id)
+            base += part_base
+            quote += part_quote
+        return base, quote
 
     @property
     def total_base(self) -> Decimal:

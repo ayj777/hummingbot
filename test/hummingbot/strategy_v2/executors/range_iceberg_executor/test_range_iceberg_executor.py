@@ -1023,8 +1023,8 @@ class RangeIcebergExecutorTests(IsolatedAsyncioWrapperTestCase):
 
         async def api_get(path_url, **kwargs):
             if read["kind"] == "absent":
-                raise IOError("Error: 2040 - order not exist")
-            raise IOError("http status is 500")
+                return {"success": False, "code": 2040, "message": "Order does not exist", "data": None}
+            raise IOError(f"Error executing request GET https://api.mexc.com{path_url}. HTTP status is 500.")
 
         exchange._api_get = api_get
         self.connector.resolve_unknown_order = exchange.resolve_unknown_order
@@ -1125,6 +1125,89 @@ class RangeIcebergExecutorTests(IsolatedAsyncioWrapperTestCase):
         self.assertIn("buy-1", info["status_reason"])
         self.assertEqual(OrderState.OPEN, order.current_state)
         self.assertEqual(Decimal("0"), order.executed_amount_base)
+
+    def test_conflicting_fill_is_kept_and_a_later_2040_does_not_buy_again(self):
+        from hummingbot.core.event.events import MarketOrderFailureEvent
+        from hummingbot.connector.derivative.mexc_perpetual.mexc_perpetual_derivative import (
+            MexcPerpetualDerivative,
+        )
+        from bidict import bidict
+
+        self._book(Decimal("0.07815"), Decimal("0.07816"))
+        executor = self._up_to(total_amount=Decimal("1000"), slice_amount=Decimal("1000"))
+        executor._cancel_resolve_after_attempts = 1
+        self._run(executor.control_task())
+        order = self.orders["buy-1"]
+        order.exchange_order_id = "ex-1"
+        exchange = MexcPerpetualDerivative(
+            mexc_perpetual_api_key="key",
+            mexc_perpetual_api_secret="secret",
+            trading_pairs=["AIOT-USDT"],
+            trading_required=True,
+        )
+        exchange._set_trading_pair_symbol_map(bidict({"AIOT_USDT": "AIOT-USDT"}))
+        exchange._set_current_timestamp(self.now)
+        exchange._contract_sizes["AIOT-USDT"] = Decimal("10")
+        exchange._order_tracker.TRADE_FILLS_WAIT_TIMEOUT = 0.01
+        exchange.start_tracking_order(
+            order_id="buy-1",
+            exchange_order_id="ex-1",
+            trading_pair="AIOT-USDT",
+            trade_type=TradeType.BUY,
+            price=order.price,
+            amount=Decimal("1000"),
+            order_type=OrderType.LIMIT,
+            position_action=PositionAction.OPEN,
+        )
+        phase = {"step": "conflict"}
+
+        async def api_get(path_url, **kwargs):
+            if phase["step"] == "absent":
+                return {"success": False, "code": 2040, "message": "Order does not exist", "data": None}
+            if "external" in path_url:
+                payload = {
+                    "orderId": "ex-1",
+                    "externalOid": "buy-1",
+                    "state": 3,
+                    "dealVol": "100",
+                    "dealAvgPrice": "0.07816",
+                    "price": "0.07816",
+                    "vol": "100",
+                }
+            else:
+                payload = {
+                    "orderId": "ex-1",
+                    "externalOid": "buy-1",
+                    "state": 2,
+                    "dealVol": 0,
+                    "price": "0.07816",
+                    "vol": "100",
+                }
+            return {"success": True, "code": 0, "data": payload}
+
+        exchange._api_get = api_get
+        self.connector.is_cancel_confirmed = lambda order_id: False
+        self.connector.resolve_unknown_order = exchange.resolve_unknown_order
+        self.connector.counted_fill = exchange.counted_fill
+        self.connector.order_was_seen_live = exchange.order_was_seen_live
+        executor.process_order_failed_event(
+            0,
+            None,
+            MarketOrderFailureEvent(self.now, "buy-1", OrderType.LIMIT),
+        )
+        self._run(executor.control_task())
+        self.assertEqual(1, len(self.buy_ids))
+        self.assertEqual(Decimal("1000"), executor.filled_base)
+        self.assertEqual(Decimal("78.16"), executor.filled_amount_quote)
+        self.assertTrue(executor.get_custom_info()["paused"])
+        phase["step"] = "absent"
+        self._run(executor.resume())
+        self._run(executor.control_task())
+        self.assertTrue(executor.get_custom_info()["paused"])
+        self.assertTrue(executor.get_custom_info()["unknown_order_halt"])
+        self.assertEqual(1, len(self.buy_ids))
+        self.assertEqual(Decimal("1000"), executor.filled_base)
+        self.assertLessEqual(sum(amount for _oid, amount, _price, _otype, _action in self.buy_ids), Decimal("1000"))
 
     def test_stop_cancels_a_child_that_is_not_tracked_yet(self):
         self._book(Decimal("0.07815"), Decimal("0.07816"))

@@ -1,5 +1,6 @@
 import asyncio
 import json
+import random
 from decimal import Decimal
 from test.isolated_asyncio_wrapper_test_case import IsolatedAsyncioWrapperTestCase
 from unittest.mock import AsyncMock
@@ -169,7 +170,7 @@ class MexcPerpetualReviewFixTests(IsolatedAsyncioWrapperTestCase):
 
         self.exchange._api_get = get
         state = await self.exchange.resolve_unknown_order(self.trading_pair, "oid-1", "ex-1")
-        self.assertEqual(OrderState.FILLED, state)
+        self.assertIsNone(state)
         self.assertTrue(any("external" in path for path in calls))
         self.assertTrue(any("/order/get/" in path for path in calls))
         self.assertEqual(Decimal("100"), order.executed_amount_base)
@@ -248,7 +249,7 @@ class MexcPerpetualReviewFixTests(IsolatedAsyncioWrapperTestCase):
 
     async def test_order_not_exist_on_both_reads_is_confirmed_absent(self):
         async def get(path_url, **kwargs):
-            raise IOError("Error: 2040 - order not exist")
+            return {"success": False, "code": 2040, "message": "Order does not exist", "data": None}
 
         self.exchange._api_get = get
         state = await self.exchange.resolve_unknown_order(self.trading_pair, "oid-1", "ex-1")
@@ -269,6 +270,252 @@ class MexcPerpetualReviewFixTests(IsolatedAsyncioWrapperTestCase):
         self.exchange._api_get = get
         state = await self.exchange.resolve_unknown_order(self.trading_pair, "oid-1", "ex-1")
         self.assertIsNone(state)
+
+    async def test_filled_versus_open_keeps_the_fill_and_a_later_2040_does_not_clear_it(self):
+        order = self._track(Decimal("1000"))
+        order.current_state = OrderState.OPEN
+        phase = {"step": "conflict"}
+
+        async def get(path_url, **kwargs):
+            if phase["step"] == "absent":
+                return {"success": False, "code": 2040, "message": "Order does not exist", "data": None}
+            if "external" in path_url:
+                data = {
+                    "orderId": "ex-1",
+                    "externalOid": "oid-1",
+                    "state": 3,
+                    "dealVol": "100",
+                    "dealAvgPrice": "0.07816",
+                    "price": "0.07816",
+                    "vol": "100",
+                }
+            else:
+                data = {
+                    "orderId": "ex-1",
+                    "externalOid": "oid-1",
+                    "state": 2,
+                    "dealVol": 0,
+                    "price": "0.07816",
+                    "vol": "100",
+                }
+            return {"success": True, "code": 0, "data": data}
+
+        self.exchange._api_get = get
+        state = await self.exchange.resolve_unknown_order(self.trading_pair, "oid-1", "ex-1")
+        self.assertIsNone(state)
+        self.assertEqual(Decimal("1000"), order.executed_amount_base)
+        self.assertEqual(Decimal("78.16"), order.executed_amount_quote)
+        base, quote = self.exchange.counted_fill("oid-1")
+        self.assertEqual(Decimal("1000"), base)
+        self.assertEqual(Decimal("78.16"), quote)
+        phase["step"] = "absent"
+        later = await self.exchange.resolve_unknown_order(self.trading_pair, "oid-1", "ex-1")
+        self.assertNotEqual("confirmed_absent", later)
+        self.assertIsNone(later)
+        self.assertEqual(Decimal("1000"), order.executed_amount_base)
+        self.assertTrue(self.exchange.order_was_seen_live("oid-1"))
+
+    async def test_http_500_whose_url_contains_2040_stays_unknown(self):
+        order = self._track(Decimal("1000"))
+        order.current_state = OrderState.OPEN
+
+        async def get(path_url, **kwargs):
+            raise IOError(
+                f"Error executing request GET https://api.mexc.com{path_url}. HTTP status is 500."
+            )
+
+        self.exchange._api_get = get
+        state = await self.exchange.resolve_unknown_order(self.trading_pair, "cid-2040", "2040")
+        self.assertIsNone(state)
+        self.assertEqual(OrderState.OPEN, order.current_state)
+        self.assertEqual(Decimal("0"), order.executed_amount_base)
+
+    async def test_random_read_sequences_never_drop_a_fill_or_exceed_the_total(self):
+        self.exchange._order_tracker.TRADE_FILLS_WAIT_TIMEOUT = 0.01
+        rng = random.Random(20261117)
+        total = Decimal("1000")
+        sequences = [self._review_fill_then_absent_sequence()]
+        sequences.extend(self._random_read_sequence(rng) for _ in range(20))
+        for sequence in sequences:
+            order = self._track(Decimal("1000"))
+            order.current_state = OrderState.OPEN
+            reported = Decimal("0")
+            seen_live = False
+            extra = Decimal("0")
+            resolved = False
+            previous_base = Decimal("0")
+            for client_read, order_read in sequence:
+                reported = max(reported, self._fill_base(client_read), self._fill_base(order_read))
+                seen_live = seen_live or self._read_shows_live_order(client_read) or self._read_shows_live_order(order_read)
+
+                async def get(path_url, client_read=client_read, order_read=order_read, **kwargs):
+                    chosen = order_read if "external" not in path_url else client_read
+                    if isinstance(chosen, Exception):
+                        raise chosen
+                    return chosen
+
+                self.exchange._api_get = get
+                state = await self.exchange.resolve_unknown_order(self.trading_pair, "oid-1", "ex-1")
+                self.assertGreaterEqual(order.executed_amount_base, reported)
+                self.assertGreaterEqual(order.executed_amount_base, previous_base)
+                previous_base = order.executed_amount_base
+                if seen_live:
+                    self.assertNotEqual("confirmed_absent", state)
+                if self._read_is_unknown(client_read) or self._read_is_unknown(order_read):
+                    self.assertIsNone(state)
+                if (
+                    not self._read_is_unknown(client_read)
+                    and not self._read_is_unknown(order_read)
+                    and self._read_is_open_state(client_read)
+                    and self._read_is_open_state(order_read)
+                ):
+                    self.assertIn(state, (OrderState.OPEN, OrderState.PARTIALLY_FILLED))
+                if state in (OrderState.CANCELED, OrderState.FILLED) or (
+                    state == "confirmed_absent" and not seen_live
+                ):
+                    child = max(Decimal("0"), total - order.executed_amount_base)
+                    self.assertLessEqual(order.executed_amount_base + child, total)
+                    if not resolved:
+                        extra = child
+                        resolved = True
+                if not resolved:
+                    self.assertLessEqual(max(order.amount, order.executed_amount_base), total)
+                else:
+                    self.assertLessEqual(extra, total)
+            self.exchange._order_tracker._in_flight_orders.clear()
+            if hasattr(self.exchange, "_max_fill_base"):
+                self.exchange._max_fill_base.clear()
+                self.exchange._max_fill_quote.clear()
+                self.exchange._seen_live_client_ids.clear()
+
+    def _review_fill_then_absent_sequence(self):
+        filled = {
+            "success": True,
+            "code": 0,
+            "data": {
+                "orderId": "ex-1",
+                "externalOid": "oid-1",
+                "state": 3,
+                "dealVol": "100",
+                "dealAvgPrice": "0.07816",
+                "price": "0.07816",
+                "vol": "100",
+            },
+        }
+        opened = {
+            "success": True,
+            "code": 0,
+            "data": {
+                "orderId": "ex-1",
+                "externalOid": "oid-1",
+                "state": 2,
+                "dealVol": 0,
+                "price": "0.07816",
+                "vol": "100",
+            },
+        }
+        absent = {"success": False, "code": 2040, "message": "Order does not exist", "data": None}
+        pending = {
+            "success": True,
+            "code": 0,
+            "data": {"orderId": "ex-1", "externalOid": "oid-1", "state": 1, "dealVol": 0, "price": "1", "vol": "100"},
+        }
+        unfilled = {
+            "success": True,
+            "code": 0,
+            "data": {"orderId": "ex-1", "externalOid": "oid-1", "state": 2, "dealVol": 0, "price": "1", "vol": "100"},
+        }
+        http_500 = IOError("Error executing request GET https://api.mexc.com/api/v1/private/order/get/2040. HTTP status is 500.")
+        return [
+            (filled, opened),
+            (absent, absent),
+            (pending, unfilled),
+            (http_500, http_500),
+        ]
+
+    def _random_read_sequence(self, rng: random.Random):
+        steps = []
+        for _ in range(6):
+            steps.append((self._random_read(rng), self._random_read(rng)))
+        return steps
+
+    def _random_read(self, rng: random.Random):
+        kind = rng.randrange(6)
+        if kind == 0:
+            return IOError("Error executing request GET https://api.mexc.com/api/v1/private/order/get/2040. HTTP status is 500.")
+        if kind == 1:
+            return {"success": False, "code": 2040, "message": "Order does not exist", "data": None}
+        if kind == 2:
+            return {"success": True, "code": 0, "data": None}
+        if kind == 3:
+            return {"success": False, "code": 401, "message": "Not logged in", "data": None}
+        if kind == 4:
+            return IOError("connection reset")
+        deal = rng.choice(["0", "34", "100"])
+        state = rng.choice([1, 2, 3, 4, 5])
+        return {
+            "success": True,
+            "code": 0,
+            "data": {
+                "orderId": "ex-1",
+                "externalOid": "oid-1",
+                "state": state,
+                "dealVol": deal,
+                "dealAvgPrice": "0.07816",
+                "price": "0.07816",
+                "vol": "100",
+            },
+        }
+
+    @staticmethod
+    def _fill_base(read) -> Decimal:
+        if not isinstance(read, dict):
+            return Decimal("0")
+        data = read.get("data")
+        if not isinstance(data, dict) or data.get("dealVol") in (None, ""):
+            return Decimal("0")
+        return Decimal(str(data["dealVol"])) * Decimal("10")
+
+    @staticmethod
+    def _read_is_unknown(read) -> bool:
+        if isinstance(read, Exception) or not isinstance(read, dict):
+            return True
+        code = read.get("code")
+        try:
+            numeric = 0 if code in (None, "") else int(code)
+        except (TypeError, ValueError):
+            return True
+        if numeric == 2040:
+            return False
+        if read.get("success") is False or numeric != 0:
+            return True
+        return False
+
+    @staticmethod
+    def _read_is_open_state(read) -> bool:
+        if not isinstance(read, dict):
+            return False
+        data = read.get("data")
+        if not isinstance(data, dict):
+            return False
+        try:
+            return int(data.get("state") or 0) in (1, 2)
+        except (TypeError, ValueError):
+            return False
+
+    @staticmethod
+    def _read_shows_live_order(read) -> bool:
+        if not isinstance(read, dict):
+            return False
+        data = read.get("data")
+        if not isinstance(data, dict):
+            return False
+        try:
+            state = int(data.get("state") or 0)
+            deal = Decimal(str(data.get("dealVol") or "0"))
+        except Exception:
+            return False
+        return state in (1, 2, 3) or deal > 0
 
     async def test_cancel_push_records_deal_volume_before_the_order_is_done(self):
         order = self._track(Decimal("1000"))
