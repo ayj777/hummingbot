@@ -114,3 +114,22 @@ class TimeScheduleTests(TestCase):
         placeable = schedule.opened(10) - schedule.skipped - Decimal("40") - Decimal("60")
         self.assertEqual(Decimal("100"), placeable)
         self.assertEqual(Decimal("0"), schedule.skipped)
+
+    def test_window_accounting_round_trips(self):
+        schedule = SliceSchedule(
+            amounts=[Decimal("100"), Decimal("100")],
+            offsets=[0.0, 10.0],
+            duration=20.0,
+            skip_unplaced=True,
+        )
+        schedule.advance(10, Decimal("0"), Decimal("0"), outside_cap=True)
+        restored = SliceSchedule(
+            amounts=[Decimal("100"), Decimal("100")],
+            offsets=[0.0, 10.0],
+            duration=20.0,
+            skip_unplaced=True,
+        )
+        restored.restore_state(schedule.export_state())
+        self.assertEqual(schedule.skipped, restored.skipped)
+        self.assertEqual(schedule._closed, restored._closed)
+        self.assertEqual(schedule._assigned, restored._assigned)
