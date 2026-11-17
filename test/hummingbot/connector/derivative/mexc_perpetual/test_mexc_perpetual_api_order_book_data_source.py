@@ -162,6 +162,31 @@ class MexcPerpetualAPIOrderBookDataSourceTests(IsolatedAsyncioWrapperTestCase):
         self.assertIn(11, versions)
         self.assertGreaterEqual(self.data_source._last_depth_version[self.exchange_symbol], 12)
 
+    def test_failed_snapshot_keeps_diffs_blocked_until_a_later_snapshot(self):
+        async def scenario():
+            queue = asyncio.Queue()
+
+            async def boom(trading_pair):
+                raise IOError("snapshot failed")
+
+            self.data_source._order_book_snapshot = boom
+            self.data_source._diffs_need_snapshot = True
+            self.data_source._diff_output = queue
+            self.data_source._last_depth_version[self.exchange_symbol] = 100
+            await self.data_source._publish_fresh_snapshots()
+            self.assertTrue(self.data_source._diffs_need_snapshot)
+            message = {
+                "channel": CONSTANTS.WS_DEPTH_CHANNEL,
+                "symbol": self.exchange_symbol,
+                "data": {"asks": [[1, 5, 1]], "bids": [], "begin": 101, "end": 101},
+                "ts": 1,
+            }
+            await self.data_source._parse_order_book_diff_message(message, queue)
+            self.assertTrue(queue.empty())
+            self.assertEqual(100, self.data_source._last_depth_version[self.exchange_symbol])
+
+        self.async_run_with_timeout(scenario())
+
     @aioresponses()
     def test_depth_gap_does_not_apply_the_stale_diff(self, mock_api):
         self.data_source._last_depth_version[self.exchange_symbol] = 10

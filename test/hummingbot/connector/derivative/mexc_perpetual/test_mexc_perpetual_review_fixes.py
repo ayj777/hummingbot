@@ -52,6 +52,99 @@ class MexcPerpetualReviewFixTests(IsolatedAsyncioWrapperTestCase):
         )
         return self.exchange.in_flight_orders["oid-1"]
 
+    async def test_rest_fill_poll_replaces_the_synthetic_fill_without_double_counting(self):
+        order = self._track(Decimal("1000"))
+        self.exchange._order_tracker.TRADE_FILLS_WAIT_TIMEOUT = 0.05
+        self.exchange._process_order_event_message({
+            "orderId": "ex-1",
+            "externalOid": "oid-1",
+            "state": 4,
+            "dealVol": "34",
+            "dealAvgPrice": "0.07816",
+        })
+        await asyncio.sleep(0.2)
+        self.assertEqual(Decimal("340"), order.executed_amount_base)
+
+        async def get(path_url, **kwargs):
+            return {
+                "success": True,
+                "code": 0,
+                "data": [{
+                    "id": "555",
+                    "price": "0.07816",
+                    "vol": "34",
+                    "fee": "0.01",
+                    "feeCurrency": "USDT",
+                    "timestamp": 1_700_000_000_000,
+                }],
+            }
+
+        self.exchange._api_get = get
+        await self.exchange._update_orders_fills([order])
+        await self.exchange._update_orders_fills([order])
+        self.assertEqual(Decimal("340"), order.executed_amount_base)
+        self.assertNotIn(f"mexc-reported-deal-{order.client_order_id}", order.order_fills)
+        self.assertEqual(Decimal("340"), order.order_fills["555"].fill_base_amount)
+
+    async def test_http_500_does_not_count_as_order_not_found(self):
+        order = self._track()
+        await self.exchange._handle_update_error_for_active_order(
+            order,
+            IOError("Error executing request GET https://api.mexc.com/order. HTTP status is 500. Error: unavailable"),
+        )
+        self.assertEqual(0, self.exchange._order_tracker._order_not_found_records.get(order.client_order_id, 0))
+        self.assertNotEqual(OrderState.FAILED, order.current_state)
+
+    async def test_cancel_is_confirmed_only_after_cancel_or_not_found(self):
+        order = self._track()
+        self.assertFalse(self.exchange.is_cancel_confirmed(order.client_order_id))
+        self.exchange._cancel_requests.add(order.client_order_id)
+        order.current_state = OrderState.CANCELED
+        self.assertFalse(self.exchange.is_cancel_confirmed(order.client_order_id))
+        self.exchange._cancel_requests.discard(order.client_order_id)
+        self.assertTrue(self.exchange.is_cancel_confirmed(order.client_order_id))
+        self.exchange._confirmed_absent.add("missing-id")
+        self.assertTrue(self.exchange.is_cancel_confirmed("missing-id"))
+
+    async def test_cancel_2041_retries_the_follow_up_read(self):
+        order = self._track(Decimal("100"))
+        attempts = {"n": 0}
+
+        async def post(*args, **kwargs):
+            return {
+                "success": True,
+                "code": 0,
+                "data": [{"orderId": "ex-1", "errorCode": 2041, "errorMsg": "order state cannot be cancelled"}],
+            }
+
+        async def get(path_url, **kwargs):
+            attempts["n"] += 1
+            if attempts["n"] < 3:
+                raise IOError("temporary read failure")
+            if "deal_details" in path_url:
+                return {"success": True, "code": 0, "data": []}
+            return {
+                "success": True,
+                "code": 0,
+                "data": {
+                    "orderId": "ex-1",
+                    "externalOid": "oid-1",
+                    "state": 3,
+                    "dealVol": "10",
+                    "dealAvgPrice": "2",
+                    "price": "2",
+                    "vol": "10",
+                },
+            }
+
+        self.exchange._api_post = post
+        self.exchange._api_get = get
+        await self.exchange._place_cancel("oid-1", order)
+        await asyncio.sleep(0.3)
+        self.assertGreaterEqual(attempts["n"], 3)
+        self.assertEqual(Decimal("100"), order.executed_amount_base)
+        self.assertEqual(OrderState.FILLED, order.current_state)
+
     async def test_cancel_push_records_deal_volume_before_the_order_is_done(self):
         order = self._track(Decimal("1000"))
         self.exchange._order_tracker.TRADE_FILLS_WAIT_TIMEOUT = 0.05

@@ -680,6 +680,7 @@ class RangeIcebergExecutor(ExecutorBase):
     def _release_confirmed_failures(self):
         for order_id in list(self._unconfirmed_cancels):
             if not self._cancel_confirmed(order_id):
+                self._strategy.cancel(self.config.connector_name, self.config.trading_pair, order_id)
                 continue
             self._unconfirmed_cancels.discard(order_id)
             if order_id not in self._failed_order_ids:
@@ -697,6 +698,9 @@ class RangeIcebergExecutor(ExecutorBase):
         if self._account_settings_failed:
             return False
         connector = self.connectors[self.config.connector_name]
+        position_mode_ready = self._real_callable(connector, "is_position_mode_ready")
+        if position_mode_ready is not None and not position_mode_ready():
+            return False
         confirm = self._real_callable(connector, "confirm_leverage_and_margin")
         if confirm is not None:
             try:

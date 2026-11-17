@@ -656,6 +656,31 @@ class RangeIcebergExecutorTests(IsolatedAsyncioWrapperTestCase):
         self.assertEqual([("AIOT-USDT", 2, "ISOLATED")], calls)
         self.assertEqual(1, len(self.buy_ids))
 
+    def test_executor_waits_while_position_mode_is_still_unread(self):
+        ready = {"ok": False}
+        calls = []
+
+        def is_ready():
+            return ready["ok"]
+
+        async def confirm(pair, leverage, mode):
+            calls.append((pair, int(leverage), str(getattr(mode, "value", mode))))
+            return True
+
+        self.connector.is_position_mode_ready = is_ready
+        self.connector.confirm_leverage_and_margin = confirm
+        self._book(Decimal("0.07815"), Decimal("0.07816"))
+        executor = self._up_to(total_amount=Decimal("100"), slice_amount=Decimal("100"), leverage=2)
+        self._run(executor.control_task())
+        self.assertEqual([], calls)
+        self.assertEqual(0, len(self.buy_ids))
+        self.assertIsNone(executor.close_type)
+        self.assertEqual(RunnableStatus.RUNNING, executor.status)
+        ready["ok"] = True
+        self._run(executor.control_task())
+        self.assertEqual([("AIOT-USDT", 2, "ISOLATED")], calls)
+        self.assertEqual(1, len(self.buy_ids))
+
     def test_failed_create_cancels_that_client_id_before_a_replacement(self):
         from hummingbot.core.event.events import MarketOrderFailureEvent
 

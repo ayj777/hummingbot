@@ -67,7 +67,18 @@ class TimeScheduleTests(TestCase):
         schedule.advance(23 * 3600.0, Decimal("0"), Decimal("0"), outside_cap=True)
         self.assertEqual(sum(schedule.amounts[:23]), schedule.skipped)
 
-    def test_skip_remembers_that_a_window_was_blocked(self):
+    def test_one_outside_tick_does_not_skip_the_window_after_price_returns(self):
+        schedule = SliceSchedule(
+            amounts=[Decimal("100")] * 4,
+            offsets=[0.0, 10.0, 20.0, 30.0],
+            duration=40.0,
+            skip_unplaced=True,
+        )
+        schedule.advance(0, Decimal("0"), Decimal("0"), outside_cap=True)
+        schedule.advance(40, Decimal("0"), Decimal("0"), outside_cap=False)
+        self.assertEqual(Decimal("0"), schedule.skipped)
+
+    def test_skip_does_not_keep_a_window_blocked_after_price_returns(self):
         schedule = SliceSchedule(
             amounts=[Decimal("2500"), Decimal("2500")],
             offsets=[0.0, 25.0],
@@ -76,7 +87,7 @@ class TimeScheduleTests(TestCase):
         )
         schedule.advance(0, Decimal("0"), Decimal("0"), outside_cap=True)
         schedule.advance(25, Decimal("0"), Decimal("0"), outside_cap=False)
-        self.assertEqual(Decimal("2500"), schedule.skipped)
+        self.assertEqual(Decimal("0"), schedule.skipped)
 
     def test_closing_several_windows_at_once_skips_only_the_unplaced_part(self):
         schedule = SliceSchedule(

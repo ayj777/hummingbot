@@ -40,6 +40,7 @@ class MexcPerpetualAPIOrderBookDataSource(PerpetualAPIOrderBookDataSource):
         self._snapshot_output: Optional[asyncio.Queue] = None
         self._diff_output: Optional[asyncio.Queue] = None
         self._diffs_need_snapshot = False
+        self._snapshot_retry_task: Optional[asyncio.Task] = None
 
     async def get_last_traded_prices(self, trading_pairs: List[str], domain: Optional[str] = None) -> Dict[str, float]:
         return await self._connector.get_last_traded_prices(trading_pairs=trading_pairs)
@@ -312,7 +313,7 @@ class MexcPerpetualAPIOrderBookDataSource(PerpetualAPIOrderBookDataSource):
                 await self._subscribe_channels(ws)
                 self._diffs_need_snapshot = True
                 self._last_depth_version.clear()
-                await self._publish_fresh_snapshots()
+                self._snapshot_retry_task = asyncio.create_task(self._retry_snapshots_until_ready())
                 self._ping_task = asyncio.create_task(self._send_interval_ping(ws))
                 await self._process_websocket_messages(websocket_assistant=ws)
             except asyncio.CancelledError:
@@ -326,6 +327,7 @@ class MexcPerpetualAPIOrderBookDataSource(PerpetualAPIOrderBookDataSource):
                 await self._sleep(5.0)
             finally:
                 await self._cancel_ping_task()
+                await self._cancel_snapshot_retry_task()
                 self._diffs_need_snapshot = True
                 self._last_depth_version.clear()
                 self._ws_assistant = None
@@ -349,18 +351,43 @@ class MexcPerpetualAPIOrderBookDataSource(PerpetualAPIOrderBookDataSource):
         queue.put_nowait(snapshot)
         self._diffs_need_snapshot = False
 
-    async def _publish_fresh_snapshots(self):
+    async def _publish_fresh_snapshots(self) -> bool:
         queue = self._diff_output or self._snapshot_output
-        if queue is None:
-            return
+        if queue is None or not self._trading_pairs:
+            self._diffs_need_snapshot = True
+            return False
         for trading_pair in list(self._trading_pairs):
             try:
                 snapshot = await self._order_book_snapshot(trading_pair)
             except Exception:
                 self.logger().exception(f"Could not snapshot {trading_pair} before applying diffs.")
-                continue
+                self._diffs_need_snapshot = True
+                return False
             queue.put_nowait(snapshot)
         self._diffs_need_snapshot = False
+        return True
+
+    async def _retry_snapshots_until_ready(self):
+        while self._diffs_need_snapshot:
+            try:
+                if await self._publish_fresh_snapshots():
+                    return
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                self.logger().exception("Order book snapshot retry failed.")
+            await self._sleep(1.0)
+
+    async def _cancel_snapshot_retry_task(self):
+        task = self._snapshot_retry_task
+        self._snapshot_retry_task = None
+        if task is None:
+            return
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
 
     async def _public_get(
         self,

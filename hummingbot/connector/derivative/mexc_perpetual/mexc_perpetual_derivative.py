@@ -89,6 +89,7 @@ class MexcPerpetualDerivative(PerpetualDerivativePyBase):
         self._position_mode_confirmed = False
         self._equity_gap: Dict[str, Decimal] = {}
         self._cancel_requests = set()
+        self._confirmed_absent = set()
         self._creates_in_flight = set()
         self._creates_finished = set()
         super().__init__(balance_asset_limit, rate_limits_share_pct)
@@ -192,8 +193,13 @@ class MexcPerpetualDerivative(PerpetualDerivativePyBase):
     def _is_maintenance_error(self, exception: Exception) -> bool:
         return self._exception_contains_code(exception, CONSTANTS.MAINTENANCE_ERROR_CODES)
 
-    async def _handle_update_error_for_active_order(self, order: InFlightOrder, error: Exception):
+    def _is_unconfirmed_status_error(self, error: Exception) -> bool:
         if isinstance(error, (asyncio.TimeoutError, TimeoutError)) or self._is_maintenance_error(error):
+            return True
+        return "http status is 500" in str(error).lower()
+
+    async def _handle_update_error_for_active_order(self, order: InFlightOrder, error: Exception):
+        if self._is_unconfirmed_status_error(error):
             self.logger().warning(
                 "Status update for %s failed without proving the order is gone: %s",
                 order.client_order_id,
@@ -777,35 +783,64 @@ class MexcPerpetualDerivative(PerpetualDerivativePyBase):
             self._creates_in_flight.discard(order_id)
             self._creates_finished.add(order_id)
 
+    def _find_order(self, order_id: str) -> Optional[InFlightOrder]:
+        return (
+            self._order_tracker.fetch_tracked_order(order_id)
+            or self._order_tracker.fetch_order(order_id)
+            or self._order_tracker.fetch_lost_order(order_id)
+        )
+
+    @staticmethod
+    def _order_is_terminal(order: Optional[InFlightOrder]) -> bool:
+        if order is None:
+            return False
+        return order.current_state in (OrderState.CANCELED, OrderState.FAILED) or (
+            order.is_done and order.is_filled
+        )
+
+    def is_cancel_confirmed(self, order_id: str) -> bool:
+        """
+        True only after the cancel is done, the order is filled, or the exchange has
+        confirmed that this client id does not exist. An in-flight cancel is not confirmed.
+        """
+        if order_id in self._cancel_requests:
+            return False
+        if order_id in self._confirmed_absent:
+            return True
+        return self._order_is_terminal(self._find_order(order_id))
+
+    def is_position_mode_ready(self) -> bool:
+        return bool(self._position_mode_confirmed)
+
+    def _settle_cancel(self, order_id: str, order: Optional[InFlightOrder]) -> str:
+        self._cancel_requests.discard(order_id)
+        if order is not None and order.current_state == OrderState.FAILED:
+            self._confirmed_absent.add(order_id)
+        elif order is None:
+            self._confirmed_absent.add(order_id)
+        return order_id
+
     async def _execute_cancel(self, trading_pair: str, order_id: str):
         self._cancel_requests.add(order_id)
         spins = 0
         while order_id in self._cancel_requests and spins < 200:
-            tracked = self._order_tracker.fetch_tracked_order(order_id)
-            if tracked is not None and (
-                tracked.current_state in (OrderState.CANCELED, OrderState.FAILED)
-                or (tracked.is_done and tracked.is_filled)
-            ):
-                self._cancel_requests.discard(order_id)
-                return order_id
+            tracked = self._find_order(order_id)
+            if self._order_is_terminal(tracked):
+                return self._settle_cancel(order_id, tracked)
             if tracked is None:
                 if order_id in self._creates_in_flight or order_id not in self._creates_finished:
                     await self._sleep(0.01)
                     spins += 1
                     continue
-                self._cancel_requests.discard(order_id)
-                return order_id
-            result = await self._execute_order_cancel(tracked)
+                return self._settle_cancel(order_id, None)
+            await self._execute_order_cancel(tracked)
             await self._sleep(0)
-            if tracked.current_state in (OrderState.CANCELED, OrderState.FAILED) or (
-                tracked.is_done and tracked.is_filled
-            ):
-                self._cancel_requests.discard(order_id)
-                return result or order_id
-            if result is None:
-                self._cancel_requests.discard(order_id)
-                return None
-            spins += 1
+            tracked = self._find_order(order_id)
+            if self._order_is_terminal(tracked):
+                return self._settle_cancel(order_id, tracked)
+            # Not canceled and not confirmed absent. Leave the request open so the
+            # executor retries instead of placing a replacement.
+            return None
         return None
 
     async def _place_order_and_process_update(self, order: InFlightOrder, **kwargs) -> str:
@@ -902,25 +937,36 @@ class MexcPerpetualDerivative(PerpetualDerivativePyBase):
         return True
 
     async def _reconcile_uncancelable_order(self, order: InFlightOrder):
-        try:
-            order_data = await self._request_order_by_client_id(order.trading_pair, order.client_order_id)
-        except Exception:
-            self.logger().warning("Cancel error 2041 for %s and the order could not be read.", order.client_order_id)
-            return
-        self._remember_reported_deal(order, order_data)
-        await self._apply_deal_details(order)
-        self.synthesize_reported_fill(order)
-        state = self._order_state_from_payload(order_data)
-        if state in (OrderState.FILLED, OrderState.CANCELED, OrderState.FAILED):
-            self._order_tracker.process_order_update(
-                OrderUpdate(
-                    trading_pair=order.trading_pair,
-                    update_timestamp=self.current_timestamp,
-                    new_state=state,
-                    client_order_id=order.client_order_id,
-                    exchange_order_id=str(order_data.get("orderId") or order.exchange_order_id or ""),
+        last_error: Optional[Exception] = None
+        for _attempt in range(5):
+            try:
+                order_data = await self._request_order_by_client_id(order.trading_pair, order.client_order_id)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                last_error = exc
+                await self._sleep(0.02)
+                continue
+            self._remember_reported_deal(order, order_data)
+            await self._apply_deal_details(order)
+            self.synthesize_reported_fill(order)
+            state = self._order_state_from_payload(order_data)
+            if state in (OrderState.FILLED, OrderState.CANCELED, OrderState.FAILED):
+                self._order_tracker.process_order_update(
+                    OrderUpdate(
+                        trading_pair=order.trading_pair,
+                        update_timestamp=self.current_timestamp,
+                        new_state=state,
+                        client_order_id=order.client_order_id,
+                        exchange_order_id=str(order_data.get("orderId") or order.exchange_order_id or ""),
+                    )
                 )
-            )
+            return
+        self.logger().warning(
+            "Cancel error 2041 for %s and the order could not be read after retries: %s",
+            order.client_order_id,
+            last_error,
+        )
 
     async def _apply_deal_details(self, order: InFlightOrder):
         if order.exchange_order_id in (None, ""):
@@ -1058,6 +1104,34 @@ class MexcPerpetualDerivative(PerpetualDerivativePyBase):
         for pos_key in list(self.account_positions.keys()):
             if pos_key not in seen_keys:
                 self._perpetual_trading.remove_position(pos_key)
+
+    async def _update_orders_fills(self, orders: List[InFlightOrder]):
+        for order in orders:
+            try:
+                await self._reconcile_exchange_deals(order)
+            except asyncio.CancelledError:
+                raise
+            except Exception as request_error:
+                self.logger().warning(
+                    f"Failed to fetch trade updates for order {order.client_order_id}. Error: {request_error}",
+                    exc_info=request_error,
+                )
+
+    async def _reconcile_exchange_deals(self, order: InFlightOrder):
+        """
+        Replace a synthesized dealVol fill with the exchange's real deals.
+        Executed size stays at the reported deal when the real deals are short,
+        and it does not grow past that by keeping the synthetic fill as well.
+        """
+        self._drop_synthetic_fill(order)
+        try:
+            updates = await self._all_trade_updates_for_order(order)
+        except Exception:
+            self.synthesize_reported_fill(order)
+            raise
+        for update in updates:
+            self._order_tracker.process_trade_update(update)
+        self.synthesize_reported_fill(order)
 
     async def _all_trade_updates_for_order(self, order: InFlightOrder) -> List[TradeUpdate]:
         if order.exchange_order_id is None:
@@ -1288,8 +1362,7 @@ class MexcPerpetualDerivative(PerpetualDerivativePyBase):
             return
         self._drop_synthetic_fill(tracked_order)
         self._order_tracker.process_trade_update(self._parse_trade_update(trade_msg, tracked_order))
-        if tracked_order.current_state in (OrderState.FILLED, OrderState.CANCELED):
-            self.synthesize_reported_fill(tracked_order)
+        self.synthesize_reported_fill(tracked_order)
 
     async def _process_account_position_event(self, position_msg: Any):
         entries = position_msg if isinstance(position_msg, list) else [position_msg]
