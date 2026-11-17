@@ -83,6 +83,8 @@ CANCEL_ORDER_PATH = "/api/v1/private/order/cancel"
 CANCEL_BY_EXTERNAL_PATH = "/api/v1/private/order/cancel_with_external"
 ORDER_BY_EXTERNAL_PATH = "/api/v1/private/order/external/{symbol}/{external_oid}"
 ORDER_BY_EXTERNAL_LIMIT_ID = "/api/v1/private/order/external"
+ORDER_GET_PATH = "/api/v1/private/order/get/{order_id}"
+ORDER_GET_LIMIT_ID = "/api/v1/private/order/get"
 ORDER_DEALS_PATH = "/api/v1/private/order/deal_details/{order_id}"
 ORDER_DEALS_LIMIT_ID = "/api/v1/private/order/deal_details"
 ASSETS_PATH = "/api/v1/private/account/assets"
@@ -188,6 +190,7 @@ RATE_LIMITS = [
     RateLimit(limit_id=STOP_ORDER_LIST_PATH, limit=20, time_interval=2),
     RateLimit(limit_id=CANCEL_BY_EXTERNAL_PATH, limit=20, time_interval=2),
     RateLimit(limit_id=ORDER_BY_EXTERNAL_LIMIT_ID, limit=20, time_interval=2),
+    RateLimit(limit_id=ORDER_GET_LIMIT_ID, limit=20, time_interval=2),
     RateLimit(limit_id=ORDER_DEALS_LIMIT_ID, limit=20, time_interval=2),
     RateLimit(limit_id=ASSETS_PATH, limit=20, time_interval=2),
     RateLimit(limit_id=OPEN_POSITIONS_PATH, limit=20, time_interval=2),

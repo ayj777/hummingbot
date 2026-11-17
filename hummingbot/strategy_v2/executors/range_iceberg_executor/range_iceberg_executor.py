@@ -4,6 +4,7 @@ from decimal import Decimal
 from typing import List, Optional, Set
 
 from hummingbot.core.data_type.common import OrderType, PositionAction, PriceType, TradeType
+from hummingbot.core.data_type.in_flight_order import OrderState
 from hummingbot.logger import HummingbotLogger
 from hummingbot.strategy.strategy_v2_base import StrategyV2Base
 from hummingbot.strategy_v2.executors.executor_base import ExecutorBase
@@ -98,6 +99,16 @@ class RangeIcebergExecutor(ExecutorBase):
         self._unconfirmed_cancels: Set[str] = set()
         self._failed_order_ids: Set[str] = set()
         self._submitted_order_ids: List[str] = []
+        self._accounted_fill_base = Decimal("0")
+        self._accounted_fill_quote = Decimal("0")
+        self._cancel_attempt_count: dict = {}
+        self._cancel_attempt_started: dict = {}
+        self._unknown_order_ids: Set[str] = set()
+        self._unknown_order_error = ""
+        self._resolved_terminal: Set[str] = set()
+        self._lookup_done: Set[str] = set()
+        self._cancel_resolve_after_attempts = 5
+        self._cancel_resolve_after_seconds = 30.0
 
     def _make_schedule(self) -> Optional[SliceSchedule]:
         resolved = self.config.resolved_schedule()
@@ -227,7 +238,7 @@ class RangeIcebergExecutor(ExecutorBase):
         if self.close_type == CloseType.FAILED and not self._slices:
             self.stop()
             return
-        self._release_confirmed_failures()
+        await self._release_confirmed_failures()
         self._refresh_tracked_orders()
         self._advance_schedule()
         if self._time_limit_reached():
@@ -245,6 +256,8 @@ class RangeIcebergExecutor(ExecutorBase):
             return
         if self.config.mode == ExecutionMode.UP_TO:
             self._control_up_to()
+            return
+        if self._replacement_blocked():
             return
         if self._slippage_blocks_new_orders():
             return
@@ -661,7 +674,7 @@ class RangeIcebergExecutor(ExecutorBase):
         return slot.is_working or self._holds_unaccounted_fill(slot)
 
     def _replacement_blocked(self) -> bool:
-        return bool(self._unconfirmed_cancels)
+        return bool(self._unconfirmed_cancels) or bool(self._unknown_order_ids)
 
     def _real_callable(self, owner, name):
         value = getattr(owner, name, None)
@@ -672,25 +685,118 @@ class RangeIcebergExecutor(ExecutorBase):
         return value
 
     def _cancel_confirmed(self, order_id: str) -> bool:
+        if order_id in self._resolved_terminal:
+            return True
         checker = self._real_callable(self.connectors[self.config.connector_name], "is_cancel_confirmed")
         if checker is None:
             return True
         return bool(checker(order_id))
 
-    def _release_confirmed_failures(self):
+    async def _release_confirmed_failures(self):
         for order_id in list(self._unconfirmed_cancels):
-            if not self._cancel_confirmed(order_id):
-                self._strategy.cancel(self.config.connector_name, self.config.trading_pair, order_id)
+            if order_id in self._unknown_order_ids:
                 continue
+            if not self._cancel_confirmed(order_id):
+                if await self._escalate_unresolved_cancel(order_id):
+                    if order_id in self._unknown_order_ids or not self._cancel_confirmed(order_id):
+                        continue
+                else:
+                    self._strategy.cancel(self.config.connector_name, self.config.trading_pair, order_id)
+                    continue
             self._unconfirmed_cancels.discard(order_id)
             if order_id not in self._failed_order_ids:
                 continue
             self._failed_order_ids.discard(order_id)
-            slot = self._slot_for(order_id)
-            if slot is None:
-                continue
-            slot.tracked = None
-            slot.cancel_requested = False
+            self._remember_fill_before_clearing(order_id)
+
+    def _remember_fill_before_clearing(self, order_id: str):
+        slot = self._slot_for(order_id)
+        if slot is None or slot.tracked is None:
+            return
+        order = self._order_for(order_id)
+        if order is not None:
+            base = Decimal(str(order.executed_amount_base or 0))
+            quote = Decimal(str(order.executed_amount_quote or 0))
+            reported = getattr(order, "reported_deal_base", None)
+            if reported is not None and Decimal(str(reported)) > base:
+                extra = Decimal(str(reported)) - base
+                price = getattr(order, "reported_deal_price", None) or order.price or Decimal("0")
+                base = Decimal(str(reported))
+                quote += Decimal(str(price or 0)) * extra
+            if base > 0:
+                self._accounted_fill_base += base
+                self._accounted_fill_quote += quote
+        slot.tracked = None
+        slot.cancel_requested = False
+
+    async def _escalate_unresolved_cancel(self, order_id: str) -> bool:
+        """
+        Keep canceling until the retry count or the time limit, then look the order up once.
+        True means this tick already settled the lookup, so the caller should not send another cancel.
+        """
+        if order_id in self._lookup_done:
+            return False
+        now = self._strategy.current_timestamp
+        self._cancel_attempt_count[order_id] = self._cancel_attempt_count.get(order_id, 0) + 1
+        self._cancel_attempt_started.setdefault(order_id, now)
+        attempts = self._cancel_attempt_count[order_id]
+        elapsed = now - self._cancel_attempt_started[order_id]
+        if attempts < self._cancel_resolve_after_attempts and elapsed < self._cancel_resolve_after_seconds:
+            return False
+        self._lookup_done.add(order_id)
+        connector = self.connectors[self.config.connector_name]
+        resolve = self._real_callable(connector, "resolve_unknown_order")
+        exchange_order_id = self._exchange_order_id_for(order_id)
+        state = None
+        if resolve is not None:
+            try:
+                state = await resolve(self.config.trading_pair, order_id, exchange_order_id)
+            except Exception:
+                self.logger().exception("Could not resolve order %s.", order_id)
+                state = None
+        self._refresh_tracked_orders()
+        if state is None:
+            self._halt_for_unknown_order(order_id)
+            return True
+        if state in (OrderState.FILLED, OrderState.CANCELED, OrderState.FAILED):
+            if state == OrderState.FILLED and not self._known_fill_size(order_id):
+                self._halt_for_unknown_order(order_id)
+                return True
+            self._resolved_terminal.add(order_id)
+            return True
+        return False
+
+    def _known_fill_size(self, order_id: str) -> bool:
+        order = self._order_for(order_id)
+        if order is None:
+            return False
+        base = Decimal(str(order.executed_amount_base or 0))
+        reported = getattr(order, "reported_deal_base", None)
+        if reported is not None:
+            base = max(base, Decimal(str(reported)))
+        return base > 0
+
+    def _order_for(self, order_id: str):
+        slot = self._slot_for(order_id)
+        order = slot.tracked.order if slot and slot.tracked else None
+        if order is None:
+            order = self.get_in_flight_order(self.config.connector_name, order_id)
+        return order
+
+    def _exchange_order_id_for(self, order_id: str) -> Optional[str]:
+        order = self._order_for(order_id)
+        if order is None or not order.exchange_order_id:
+            return None
+        return str(order.exchange_order_id)
+
+    def _halt_for_unknown_order(self, order_id: str):
+        self._unknown_order_ids.add(order_id)
+        self._unknown_order_error = (
+            f"Order {order_id} is still unresolved after cancel retries. "
+            "Paused so it is not bought again while its state is unknown."
+        )
+        self.logger().error(self._unknown_order_error)
+        self.pause()
 
     async def _ensure_account_settings(self) -> bool:
         if self._account_settings_ready:
@@ -765,11 +871,13 @@ class RangeIcebergExecutor(ExecutorBase):
 
     @property
     def filled_base(self) -> Decimal:
-        return sum((slot.tracked.executed_amount_base for slot in self._slices if slot.tracked), Decimal("0"))
+        live = sum((slot.tracked.executed_amount_base for slot in self._slices if slot.tracked), Decimal("0"))
+        return live + self._accounted_fill_base
 
     @property
     def filled_amount_quote(self) -> Decimal:
-        return sum((slot.tracked.executed_amount_quote for slot in self._slices if slot.tracked), Decimal("0"))
+        live = sum((slot.tracked.executed_amount_quote for slot in self._slices if slot.tracked), Decimal("0"))
+        return live + self._accounted_fill_quote
 
     @property
     def total_base(self) -> Decimal:
@@ -813,6 +921,7 @@ class RangeIcebergExecutor(ExecutorBase):
             "side": self.config.side.name,
             "mode": self.config.mode.value,
             "paused": self._paused,
+            "unknown_order_error": self._unknown_order_error,
             "filled_base": str(self.filled_base),
             "filled_quote": str(self.filled_amount_quote),
             "total_base": str(self.total_base),

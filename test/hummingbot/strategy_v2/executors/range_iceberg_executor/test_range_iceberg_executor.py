@@ -701,6 +701,127 @@ class RangeIcebergExecutorTests(IsolatedAsyncioWrapperTestCase):
         self._run(executor.control_task())
         self.assertEqual(2, len(self.buy_ids))
 
+    def test_failed_create_that_later_fills_is_kept_in_the_tally(self):
+        from hummingbot.core.event.events import MarketOrderFailureEvent
+
+        self._book(Decimal("0.07815"), Decimal("0.07816"))
+        executor = self._up_to(total_amount=Decimal("1000"), slice_amount=Decimal("1000"))
+        self._run(executor.control_task())
+        order = self.orders["buy-1"]
+        self.cancel_confirmed = False
+        self.connector.is_cancel_confirmed = lambda order_id: self.cancel_confirmed
+        executor.process_order_failed_event(
+            0,
+            None,
+            MarketOrderFailureEvent(self.now, "buy-1", OrderType.LIMIT),
+        )
+        self._run(executor.control_task())
+        self.assertEqual(1, len(self.buy_ids))
+        order.executed_amount_base = Decimal("340")
+        order.executed_amount_quote = Decimal("26.5744")
+        order.current_state = OrderState.FILLED
+        self.cancel_confirmed = True
+        self._run(executor.control_task())
+        self.assertEqual(Decimal("340"), executor.filled_base)
+        self.assertEqual(Decimal("26.5744"), executor.filled_amount_quote)
+        self.assertEqual(2, len(self.buy_ids))
+        self.assertEqual(Decimal("660"), self.buy_ids[1][1])
+        self.assertLessEqual(executor.filled_base + self.buy_ids[1][1], Decimal("1000"))
+
+    def test_unresolved_cancel_pauses_and_does_not_buy_again(self):
+        from hummingbot.core.event.events import MarketOrderFailureEvent
+
+        self._book(Decimal("0.07815"), Decimal("0.07816"))
+        executor = self._up_to(total_amount=Decimal("1000"), slice_amount=Decimal("1000"))
+        executor._cancel_resolve_after_attempts = 3
+        self._run(executor.control_task())
+        lookups = []
+
+        async def resolve(trading_pair, client_order_id, exchange_order_id=None):
+            lookups.append((trading_pair, client_order_id, exchange_order_id))
+            return None
+
+        self.connector.is_cancel_confirmed = lambda order_id: False
+        self.connector.resolve_unknown_order = resolve
+        executor.process_order_failed_event(
+            0,
+            None,
+            MarketOrderFailureEvent(self.now, "buy-1", OrderType.LIMIT),
+        )
+        self._run(executor.control_task())
+        self._run(executor.control_task())
+        self.assertEqual([], lookups)
+        self.assertEqual(1, len(self.buy_ids))
+        self.assertFalse(executor.get_custom_info()["paused"])
+        self._run(executor.control_task())
+        self.assertEqual(1, len(lookups))
+        self.assertEqual("buy-1", lookups[0][1])
+        self.assertTrue(executor.get_custom_info()["paused"])
+        self.assertIn("buy-1", executor.get_custom_info()["unknown_order_error"])
+        self.now += 10
+        self._run(executor.control_task())
+        self.assertEqual(1, len(self.buy_ids))
+
+    def test_cancel_lookup_runs_when_the_time_limit_is_reached(self):
+        from hummingbot.core.event.events import MarketOrderFailureEvent
+
+        self._book(Decimal("0.07815"), Decimal("0.07816"))
+        executor = self._up_to(total_amount=Decimal("1000"), slice_amount=Decimal("1000"))
+        executor._cancel_resolve_after_attempts = 100
+        executor._cancel_resolve_after_seconds = 30
+        self._run(executor.control_task())
+        lookups = []
+
+        async def resolve(trading_pair, client_order_id, exchange_order_id=None):
+            lookups.append(client_order_id)
+            return None
+
+        self.connector.is_cancel_confirmed = lambda order_id: False
+        self.connector.resolve_unknown_order = resolve
+        executor.process_order_failed_event(
+            0,
+            None,
+            MarketOrderFailureEvent(self.now, "buy-1", OrderType.LIMIT),
+        )
+        self._run(executor.control_task())
+        self.assertEqual([], lookups)
+        self.now += 30
+        self._run(executor.control_task())
+        self.assertEqual(["buy-1"], lookups)
+        self.assertTrue(executor.get_custom_info()["paused"])
+        self.assertEqual(1, len(self.buy_ids))
+
+    def test_lookup_that_shows_a_fill_is_kept_and_not_bought_again(self):
+        from hummingbot.core.event.events import MarketOrderFailureEvent
+
+        self._book(Decimal("0.07815"), Decimal("0.07816"))
+        executor = self._up_to(total_amount=Decimal("1000"), slice_amount=Decimal("1000"))
+        executor._cancel_resolve_after_attempts = 1
+        self._run(executor.control_task())
+        order = self.orders["buy-1"]
+        order.exchange_order_id = "ex-9"
+
+        async def resolve(trading_pair, client_order_id, exchange_order_id=None):
+            self.assertEqual("ex-9", exchange_order_id)
+            order.executed_amount_base = Decimal("340")
+            order.executed_amount_quote = Decimal("26.5744")
+            order.current_state = OrderState.FILLED
+            return OrderState.FILLED
+
+        self.connector.is_cancel_confirmed = lambda order_id: False
+        self.connector.resolve_unknown_order = resolve
+        executor.process_order_failed_event(
+            0,
+            None,
+            MarketOrderFailureEvent(self.now, "buy-1", OrderType.LIMIT),
+        )
+        self._run(executor.control_task())
+        self.assertEqual(Decimal("340"), executor.filled_base)
+        self.assertEqual(Decimal("26.5744"), executor.filled_amount_quote)
+        self.assertEqual(2, len(self.buy_ids))
+        self.assertEqual(Decimal("660"), self.buy_ids[1][1])
+        self.assertFalse(executor.get_custom_info()["paused"])
+
     def test_stop_cancels_a_child_that_is_not_tracked_yet(self):
         self._book(Decimal("0.07815"), Decimal("0.07816"))
         executor = self._up_to(total_amount=Decimal("100"), slice_amount=Decimal("100"))

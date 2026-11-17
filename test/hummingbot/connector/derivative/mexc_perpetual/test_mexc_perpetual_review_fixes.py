@@ -145,6 +145,35 @@ class MexcPerpetualReviewFixTests(IsolatedAsyncioWrapperTestCase):
         self.assertEqual(Decimal("100"), order.executed_amount_base)
         self.assertEqual(OrderState.FILLED, order.current_state)
 
+    async def test_resolve_unknown_order_reads_client_id_then_order_id(self):
+        order = self._track(Decimal("100"))
+        calls = []
+
+        async def get(path_url, **kwargs):
+            calls.append(path_url)
+            if "external" in path_url:
+                raise IOError("client id lookup failed")
+            return {
+                "success": True,
+                "code": 0,
+                "data": {
+                    "orderId": "ex-1",
+                    "externalOid": "oid-1",
+                    "state": 3,
+                    "dealVol": "10",
+                    "dealAvgPrice": "2",
+                    "price": "2",
+                    "vol": "10",
+                },
+            }
+
+        self.exchange._api_get = get
+        state = await self.exchange.resolve_unknown_order(self.trading_pair, "oid-1", "ex-1")
+        self.assertEqual(OrderState.FILLED, state)
+        self.assertTrue(any("external" in path for path in calls))
+        self.assertTrue(any("/order/get/" in path for path in calls))
+        self.assertEqual(Decimal("100"), order.executed_amount_base)
+
     async def test_cancel_push_records_deal_volume_before_the_order_is_done(self):
         order = self._track(Decimal("1000"))
         self.exchange._order_tracker.TRADE_FILLS_WAIT_TIMEOUT = 0.05

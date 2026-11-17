@@ -1184,6 +1184,67 @@ class MexcPerpetualDerivative(PerpetualDerivativePyBase):
             raise ValueError(f"Order {client_order_id} not found")
         return data
 
+    async def _request_order_by_exchange_id(self, exchange_order_id: str) -> Dict[str, Any]:
+        path = CONSTANTS.ORDER_GET_PATH.format(order_id=exchange_order_id)
+        response = await self._api_get(
+            path_url=path,
+            is_auth_required=True,
+            limit_id=CONSTANTS.ORDER_GET_LIMIT_ID,
+        )
+        data = response.get("data")
+        if not data:
+            raise ValueError(f"Order {exchange_order_id} not found")
+        return data
+
+    async def resolve_unknown_order(
+        self,
+        trading_pair: str,
+        client_order_id: str,
+        exchange_order_id: Optional[str] = None,
+    ) -> Optional[OrderState]:
+        """
+        Look the order up by client id and, if that misses, by exchange order id.
+        Apply the result to the tracked order. None means both lookups failed.
+        """
+        by_client = None
+        by_order_id = None
+        try:
+            by_client = await self._request_order_by_client_id(trading_pair, client_order_id)
+        except Exception as exc:
+            self.logger().warning("Client id lookup for %s failed: %s", client_order_id, exc)
+        if exchange_order_id:
+            try:
+                by_order_id = await self._request_order_by_exchange_id(str(exchange_order_id))
+            except Exception as exc:
+                self.logger().warning("Order id lookup for %s failed: %s", exchange_order_id, exc)
+        data = self._prefer_order_payload(by_client, by_order_id)
+        if not data:
+            return None
+        order = self._find_order(client_order_id)
+        if order is None and data.get("externalOid"):
+            order = self._find_order(str(data["externalOid"]))
+        state = self._order_state_from_payload(data)
+        if order is not None:
+            if order.exchange_order_id in (None, "") and data.get("orderId"):
+                order.update_exchange_order_id(str(data["orderId"]))
+            self._remember_reported_deal(order, data)
+            await self._apply_deal_details(order)
+            self.synthesize_reported_fill(order)
+            self._order_tracker.process_order_update(
+                OrderUpdate(
+                    trading_pair=order.trading_pair,
+                    update_timestamp=self.current_timestamp,
+                    new_state=state,
+                    client_order_id=order.client_order_id,
+                    exchange_order_id=str(data.get("orderId") or order.exchange_order_id or ""),
+                )
+            )
+        if state in (OrderState.CANCELED, OrderState.FAILED, OrderState.FILLED):
+            self._cancel_requests.discard(client_order_id)
+        if state == OrderState.FAILED:
+            self._confirmed_absent.add(client_order_id)
+        return state
+
     async def _get_last_traded_price(self, trading_pair: str) -> float:
         symbol = await self.exchange_symbol_associated_to_pair(trading_pair)
         response = await self._api_get(path_url=CONSTANTS.TICKER_PATH, params={"symbol": symbol})
@@ -1511,6 +1572,27 @@ class MexcPerpetualDerivative(PerpetualDerivativePyBase):
             client_order_id=str(order_data.get("externalOid") or tracked_order.client_order_id),
             exchange_order_id=str(order_data.get("orderId") or tracked_order.exchange_order_id or ""),
         )
+
+    @staticmethod
+    def _prefer_order_payload(left: Optional[Dict[str, Any]], right: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        if not left:
+            return right
+        if not right:
+            return left
+        left_deal = Decimal(str(left.get("dealVol") or "0"))
+        right_deal = Decimal(str(right.get("dealVol") or "0"))
+        if right_deal > left_deal:
+            return right
+        terminal = {
+            CONSTANTS.ORDER_STATE_FILLED,
+            CONSTANTS.ORDER_STATE_CANCELED,
+            CONSTANTS.ORDER_STATE_INVALID,
+        }
+        left_state = int(left.get("state") or 0)
+        right_state = int(right.get("state") or 0)
+        if right_state in terminal and left_state not in terminal:
+            return right
+        return left
 
     @staticmethod
     def _order_state_from_payload(order_data: Dict[str, Any]) -> OrderState:
