@@ -3,7 +3,11 @@ from unittest import TestCase
 
 from hummingbot.core.data_type.common import TradeType
 from hummingbot.strategy_v2.executors.range_iceberg_executor.data_types import LadderDistribution, SizeUnit
-from hummingbot.strategy_v2.executors.range_iceberg_executor.ladder import build_range_ladder
+from hummingbot.strategy_v2.executors.range_iceberg_executor.ladder import (
+    build_range_ladder,
+    cap_buy_price,
+    floor_sell_price,
+)
 
 
 class RangeLadderTests(TestCase):
@@ -84,3 +88,17 @@ class RangeLadderTests(TestCase):
         )
         self.assertGreater(levels[0].base_amount, levels[-1].base_amount)
         self.assertEqual(Decimal("100"), sum(level.base_amount for level in levels))
+
+    def test_buy_price_rounds_down_and_never_crosses_the_cap(self):
+        step = Decimal("0.00001")
+        cap = Decimal("0.09")
+        self.assertEqual(Decimal("0.08501"), cap_buy_price(Decimal("0.085019"), step, cap))
+        self.assertEqual(Decimal("0.09"), cap_buy_price(Decimal("0.090019"), step, cap))
+        self.assertLessEqual(cap_buy_price(Decimal("0.095"), step, cap), cap)
+
+    def test_sell_price_rounds_up_and_never_crosses_below_the_floor(self):
+        step = Decimal("0.00001")
+        floor = Decimal("0.08")
+        self.assertEqual(Decimal("0.08501"), floor_sell_price(Decimal("0.085001"), step, floor))
+        self.assertEqual(Decimal("0.08"), floor_sell_price(Decimal("0.07"), step, floor))
+        self.assertGreaterEqual(floor_sell_price(Decimal("0.079999"), step, floor), floor)

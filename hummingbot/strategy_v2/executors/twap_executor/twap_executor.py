@@ -16,6 +16,7 @@ from hummingbot.core.event.events import (
 from hummingbot.logger import HummingbotLogger
 from hummingbot.strategy.strategy_v2_base import StrategyV2Base
 from hummingbot.strategy_v2.executors.executor_base import ExecutorBase
+from hummingbot.strategy_v2.executors.time_schedule import release_timestamps
 from hummingbot.strategy_v2.executors.twap_executor.data_types import TWAPExecutorConfig
 from hummingbot.strategy_v2.models.base import RunnableStatus
 from hummingbot.strategy_v2.models.executors import CloseType, TrackedOrder
@@ -49,8 +50,10 @@ class TWAPExecutor(ExecutorBase):
 
     def create_order_plan(self):
         order_plan = {}
-        for i in range(self.config.number_of_orders):
-            timestamp = self._start_timestamp + i * self.config.order_interval
+        # Same clock the range iceberg schedule uses: start + i * interval.
+        for timestamp in release_timestamps(
+            self._start_timestamp, self.config.number_of_orders, self.config.order_interval
+        ):
             order_plan[timestamp] = None  # Initialized with None, to be replaced with a TrackedOrder
         return order_plan
 

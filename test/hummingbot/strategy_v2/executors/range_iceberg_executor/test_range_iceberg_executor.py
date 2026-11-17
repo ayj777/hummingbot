@@ -6,6 +6,9 @@ from hummingbot.connector.trading_rule import TradingRule
 from hummingbot.core.data_type.common import OrderType, PositionAction, PriceType, TradeType
 from hummingbot.core.data_type.in_flight_order import InFlightOrder, OrderState
 from hummingbot.strategy_v2.executors.range_iceberg_executor.data_types import (
+    CapBehavior,
+    CatchUpPolicy,
+    ExecutionMode,
     RangeIcebergExecutorConfig,
     SizeUnit,
 )
@@ -172,3 +175,333 @@ class RangeIcebergExecutorTests(IsolatedAsyncioWrapperTestCase):
         self.assertEqual(Decimal("0.08"), executor.average_fill_price)
         self.assertEqual(Decimal("20"), executor.filled_base)
         self.assertEqual(CloseType.COMPLETED, executor.close_type)
+
+    def _book(self, bid: Decimal, ask: Decimal):
+        self.connector.get_price_by_type.side_effect = lambda pair, price_type: {
+            PriceType.BestBid: bid,
+            PriceType.BestAsk: ask,
+            PriceType.MidPrice: (bid + ask) / Decimal("2"),
+        }.get(price_type, ask)
+
+    def _up_to(self, **overrides) -> RangeIcebergExecutor:
+        values = dict(
+            timestamp=self.now,
+            connector_name="mexc_perpetual",
+            trading_pair="AIOT-USDT",
+            side=TradeType.BUY,
+            total_amount=Decimal("10000"),
+            size_unit=SizeUnit.BASE,
+            mode=ExecutionMode.UP_TO,
+            limit_price=Decimal("0.09"),
+            iceberg=True,
+            visible_count=1,
+            levels=1,
+            slice_amount=Decimal("10000"),
+            min_order_interval=0,
+            random_seed=1,
+        )
+        values.update(overrides)
+        executor = RangeIcebergExecutor(self.strategy, RangeIcebergExecutorConfig(**values), update_interval=0.1)
+        executor._status = RunnableStatus.RUNNING
+        return executor
+
+    def test_up_to_buy_joins_the_ask_and_rounds_down(self):
+        self._book(Decimal("0.08500"), Decimal("0.085019"))
+        executor = self._up_to(total_amount=Decimal("100"), slice_amount=Decimal("100"))
+        self._run(executor.control_task())
+        price = self.buy_ids[0][2]
+        self.assertEqual(Decimal("0.08501"), price)
+        self.assertLessEqual(price, Decimal("0.09"))
+        self.assertEqual(Decimal("100"), self.buy_ids[0][1])
+
+    def test_up_to_rests_at_the_cap_when_the_ask_is_above_it(self):
+        self._book(Decimal("0.094"), Decimal("0.095"))
+        executor = self._up_to(total_amount=Decimal("100"), slice_amount=Decimal("100"))
+        self._run(executor.control_task())
+        self.assertEqual(Decimal("0.09"), self.buy_ids[0][2])
+        self.assertLessEqual(self.buy_ids[0][2], Decimal("0.09"))
+
+    def test_up_to_waits_above_the_cap_and_buys_when_price_returns(self):
+        self._book(Decimal("0.094"), Decimal("0.095"))
+        executor = self._up_to(
+            total_amount=Decimal("100"),
+            slice_amount=Decimal("100"),
+            cap_behavior=CapBehavior.WAIT,
+        )
+        self._run(executor.control_task())
+        self.assertEqual(0, len(self.buy_ids))
+        self._book(Decimal("0.087"), Decimal("0.088"))
+        self._run(executor.control_task())
+        self.assertEqual(Decimal("0.088"), self.buy_ids[0][2])
+        self.assertLessEqual(self.buy_ids[0][2], Decimal("0.09"))
+
+    def test_up_to_sell_rests_on_the_floor_and_rounds_up(self):
+        self._book(Decimal("0.07"), Decimal("0.071"))
+        executor = self._up_to(
+            side="SELL",
+            limit_price=Decimal("0.08"),
+            total_amount=Decimal("100"),
+            slice_amount=Decimal("100"),
+        )
+        self._run(executor.control_task())
+        self.assertGreaterEqual(self.buy_ids[0][2], Decimal("0.08"))
+        self.assertEqual(Decimal("0.08"), self.buy_ids[0][2])
+
+        self.buy_ids.clear()
+        self._book(Decimal("0.085001"), Decimal("0.086"))
+        executor = self._up_to(
+            side="SELL",
+            limit_price=Decimal("0.08"),
+            total_amount=Decimal("100"),
+            slice_amount=Decimal("100"),
+            cap_behavior=CapBehavior.WAIT,
+        )
+        self._run(executor.control_task())
+        self.assertEqual(Decimal("0.08501"), self.buy_ids[0][2])
+        self.assertGreaterEqual(self.buy_ids[0][2], Decimal("0.08"))
+
+    def test_up_to_post_only_buy_sits_one_tick_above_the_bid(self):
+        self._book(Decimal("0.08"), Decimal("0.081"))
+        executor = self._up_to(post_only=True, total_amount=Decimal("100"), slice_amount=Decimal("100"))
+        self._run(executor.control_task())
+        self.assertEqual(OrderType.LIMIT_MAKER, self.buy_ids[0][3])
+        self.assertEqual(Decimal("0.08001"), self.buy_ids[0][2])
+        self.assertLess(self.buy_ids[0][2], Decimal("0.081"))
+        self.assertLessEqual(self.buy_ids[0][2], Decimal("0.09"))
+
+    def test_up_to_reprices_toward_the_ask_and_never_above_the_cap(self):
+        self._book(Decimal("0.079"), Decimal("0.08"))
+        executor = self._up_to(total_amount=Decimal("100"), slice_amount=Decimal("100"))
+        self._run(executor.control_task())
+        self.assertEqual(Decimal("0.08"), self.buy_ids[0][2])
+
+        self._book(Decimal("0.084"), Decimal("0.085"))
+        self._run(executor.control_task())
+        self.strategy.cancel.assert_called_with("mexc_perpetual", "AIOT-USDT", "buy-1")
+        self.orders["buy-1"].current_state = OrderState.CANCELED
+        self._run(executor.control_task())
+        self.assertEqual(Decimal("0.085"), self.buy_ids[1][2])
+
+        self._book(Decimal("0.19"), Decimal("0.20"))
+        self._run(executor.control_task())
+        self.orders["buy-2"].current_state = OrderState.CANCELED
+        self._run(executor.control_task())
+        self.assertEqual(Decimal("0.09"), self.buy_ids[2][2])
+        self.assertLessEqual(self.buy_ids[2][2], Decimal("0.09"))
+
+    def test_up_to_partial_fill_keeps_the_fill_and_replaces_the_rest(self):
+        self._book(Decimal("0.079"), Decimal("0.08"))
+        executor = self._up_to(total_amount=Decimal("100"), slice_amount=Decimal("100"))
+        self._run(executor.control_task())
+        order = self.orders["buy-1"]
+        order.executed_amount_base = Decimal("40")
+        order.executed_amount_quote = Decimal("3.2")
+        order.current_state = OrderState.PARTIALLY_FILLED
+        self._book(Decimal("0.080"), Decimal("0.081"))
+        self._run(executor.control_task())
+        order.current_state = OrderState.CANCELED
+        self._run(executor.control_task())
+        self.assertEqual(Decimal("40"), executor.filled_base)
+        self.assertEqual(Decimal("0.08"), executor.average_fill_price)
+        self.assertEqual(Decimal("60"), self.buy_ids[1][1])
+        self.assertEqual(Decimal("0.081"), self.buy_ids[1][2])
+        self.assertEqual("60", executor.get_custom_info()["unfilled_amount"])
+
+    def test_up_to_stops_when_the_total_is_filled(self):
+        self._book(Decimal("0.079"), Decimal("0.08"))
+        executor = self._up_to(total_amount=Decimal("100"), slice_amount=Decimal("100"))
+        self._run(executor.control_task())
+        order = self.orders["buy-1"]
+        order.executed_amount_base = Decimal("100")
+        order.executed_amount_quote = Decimal("8")
+        order.current_state = OrderState.FILLED
+        self._run(executor.control_task())
+        self.assertEqual(CloseType.COMPLETED, executor.close_type)
+        self.assertEqual(1, len(self.buy_ids))
+        self.assertEqual("0", executor.get_custom_info()["unfilled_amount"])
+        self.assertEqual("100", executor.get_custom_info()["filled_amount"])
+
+    def test_schedule_releases_each_slice_on_its_interval(self):
+        self._book(Decimal("0.084"), Decimal("0.085"))
+        executor = self._up_to(duration=100, schedule_slices=4, slice_amount=Decimal("2500"))
+        self._run(executor.control_task())
+        self.assertEqual(Decimal("2500"), self.buy_ids[0][1])
+        self.orders["buy-1"].executed_amount_base = Decimal("2500")
+        self.orders["buy-1"].executed_amount_quote = Decimal("212.5")
+        self.orders["buy-1"].current_state = OrderState.FILLED
+        self.now = 1_024
+        self._run(executor.control_task())
+        self.assertEqual(1, len(self.buy_ids))
+        self.now = 1_025
+        self._run(executor.control_task())
+        self.assertEqual(2, len(self.buy_ids))
+        self.assertEqual(Decimal("2500"), self.buy_ids[1][1])
+        self.assertLessEqual(self.buy_ids[1][2], Decimal("0.09"))
+
+    def test_duration_cancels_working_orders_and_reports_the_remainder(self):
+        self._book(Decimal("0.084"), Decimal("0.085"))
+        executor = self._up_to(duration=100, schedule_slices=4, slice_amount=Decimal("2500"))
+        self._run(executor.control_task())
+        self.now = 1_100
+        self._run(executor.control_task())
+        self.strategy.cancel.assert_called_once_with("mexc_perpetual", "AIOT-USDT", "buy-1")
+        self.assertEqual(CloseType.TIME_LIMIT, executor.close_type)
+        info = executor.get_custom_info()
+        self.assertEqual("0", info["filled_amount"])
+        self.assertEqual("10000", info["unfilled_amount"])
+        self.assertEqual("10000", info["target_amount"])
+
+    def test_skip_drops_a_window_that_was_blocked_by_the_cap(self):
+        self._book(Decimal("0.10"), Decimal("0.11"))
+        executor = self._up_to(
+            duration=100,
+            schedule_slices=4,
+            slice_amount=Decimal("2500"),
+            cap_behavior=CapBehavior.WAIT,
+            catch_up=CatchUpPolicy.SKIP,
+        )
+        self._run(executor.control_task())
+        self.assertEqual(0, len(self.buy_ids))
+        self.now = 1_025
+        self._run(executor.control_task())
+        self.assertEqual(Decimal("2500"), executor._schedule.skipped)
+        self._book(Decimal("0.084"), Decimal("0.085"))
+        self._run(executor.control_task())
+        self.assertEqual(1, len(self.buy_ids))
+        self.assertEqual(Decimal("2500"), self.buy_ids[0][1])
+        self.orders["buy-1"].executed_amount_base = Decimal("2500")
+        self.orders["buy-1"].executed_amount_quote = Decimal("212.5")
+        self.orders["buy-1"].current_state = OrderState.FILLED
+        self._run(executor.control_task())
+        self.assertEqual(1, len(self.buy_ids))
+        self.assertEqual("2500", executor.get_custom_info()["skipped_amount"])
+        self.assertEqual("7500", executor.get_custom_info()["unfilled_amount"])
+
+    def test_carry_adds_a_blocked_window_onto_the_next_slice(self):
+        self._book(Decimal("0.10"), Decimal("0.11"))
+        executor = self._up_to(
+            duration=100,
+            schedule_slices=4,
+            slice_amount=Decimal("2500"),
+            cap_behavior=CapBehavior.WAIT,
+            catch_up=CatchUpPolicy.CARRY,
+        )
+        self._run(executor.control_task())
+        self.now = 1_025
+        self._run(executor.control_task())
+        self.assertEqual(Decimal("0"), executor._schedule.skipped)
+        self._book(Decimal("0.084"), Decimal("0.085"))
+        self._run(executor.control_task())
+        self.orders["buy-1"].executed_amount_base = Decimal("2500")
+        self.orders["buy-1"].executed_amount_quote = Decimal("212.5")
+        self.orders["buy-1"].current_state = OrderState.FILLED
+        self._run(executor.control_task())
+        self.assertEqual(2, len(self.buy_ids))
+        self.assertEqual(Decimal("2500"), self.buy_ids[0][1])
+        self.assertEqual(Decimal("2500"), self.buy_ids[1][1])
+
+    def test_pause_freezes_the_schedule_clock(self):
+        self._book(Decimal("0.084"), Decimal("0.085"))
+        executor = self._up_to(duration=100, schedule_slices=4, slice_amount=Decimal("2500"))
+        self._run(executor.control_task())
+        self.orders["buy-1"].executed_amount_base = Decimal("2500")
+        self.orders["buy-1"].executed_amount_quote = Decimal("212.5")
+        self.orders["buy-1"].current_state = OrderState.FILLED
+        executor.pause()
+        self.now = 1_030
+        self._run(executor.control_task())
+        self.assertEqual(1, len(self.buy_ids))
+        self.assertTrue(executor.get_custom_info()["paused"])
+        executor.resume()
+        self.now = 1_055
+        self._run(executor.control_task())
+        self.assertEqual(2, len(self.buy_ids))
+
+    def test_up_to_sell_waits_below_the_floor(self):
+        self._book(Decimal("0.07"), Decimal("0.071"))
+        executor = self._up_to(
+            side="SELL",
+            limit_price=Decimal("0.08"),
+            cap_behavior=CapBehavior.WAIT,
+            total_amount=Decimal("100"),
+            slice_amount=Decimal("100"),
+        )
+        self._run(executor.control_task())
+        self.assertEqual(0, len(self.buy_ids))
+        self._book(Decimal("0.085"), Decimal("0.086"))
+        self._run(executor.control_task())
+        self.assertGreaterEqual(self.buy_ids[0][2], Decimal("0.08"))
+
+    def test_range_schedule_holds_later_rungs_until_the_clock_releases_them(self):
+        executor = self._executor(
+            size_unit=SizeUnit.BASE,
+            total_amount=Decimal("100"),
+            levels=4,
+            iceberg=False,
+            visible_count=4,
+            duration=100,
+            schedule_slices=4,
+            min_order_interval=0,
+        )
+        self._run(executor.control_task())
+        self.assertEqual(1, len(self.buy_ids))
+        self.now = 1_025
+        self._run(executor.control_task())
+        self.assertEqual(2, len(self.buy_ids))
+        for _order_id, _amount, price, _order_type, _action in self.buy_ids:
+            self.assertGreaterEqual(price, Decimal("0.08"))
+            self.assertLessEqual(price, Decimal("0.09"))
+
+    def test_rounding_dust_is_added_to_a_later_slice(self):
+        self._book(Decimal("0.084"), Decimal("0.085"))
+        executor = self._up_to(
+            total_amount=Decimal("40"),
+            slice_amount=None,
+            levels=3,
+            duration=30,
+            schedule_slices=3,
+        )
+        self._run(executor.control_task())
+        self.assertEqual(Decimal("10"), self.buy_ids[0][1])
+        self.orders["buy-1"].executed_amount_base = Decimal("10")
+        self.orders["buy-1"].executed_amount_quote = Decimal("0.85")
+        self.orders["buy-1"].current_state = OrderState.FILLED
+        self.now = 1_010
+        self._run(executor.control_task())
+        self.orders["buy-2"].executed_amount_base = Decimal("10")
+        self.orders["buy-2"].executed_amount_quote = Decimal("0.85")
+        self.orders["buy-2"].current_state = OrderState.FILLED
+        self.now = 1_020
+        self._run(executor.control_task())
+        self.assertEqual(Decimal("20"), self.buy_ids[2][1])
+        self.assertEqual(Decimal("40"), sum(amount for _id, amount, _price, _type, _action in self.buy_ids))
+
+    def test_twenty_four_hour_up_to_config(self):
+        config = RangeIcebergExecutorConfig(
+            timestamp=self.now,
+            connector_name="mexc_perpetual",
+            trading_pair="AIOT-USDT",
+            side="BUY",
+            total_amount=Decimal("10000"),
+            size_unit=SizeUnit.BASE,
+            mode="UP_TO",
+            limit_price=Decimal("0.09"),
+            iceberg=True,
+            visible_count=1,
+            duration="24h",
+            schedule_slices=24,
+            catch_up="CARRY",
+            cap_behavior="REST_AT_CAP",
+            min_order_interval=0.6,
+        )
+        self.assertEqual(86400.0, config.duration_seconds)
+        count, interval = config.resolved_schedule()
+        self.assertEqual(24, count)
+        self.assertEqual(3600.0, interval)
+        executor = RangeIcebergExecutor(self.strategy, config, update_interval=0.1)
+        self._book(Decimal("0.084"), Decimal("0.085"))
+        executor._status = RunnableStatus.RUNNING
+        self._run(executor.control_task())
+        self.assertEqual(1, len(self.buy_ids))
+        self.assertLessEqual(self.buy_ids[0][2], Decimal("0.09"))
+        self.assertEqual(0, self.buy_ids[0][1] % Decimal("10"))

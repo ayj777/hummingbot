@@ -56,6 +56,36 @@ def quantize_down(value: Decimal, step: Decimal) -> Decimal:
     return (value / step).to_integral_value(rounding=ROUND_DOWN) * step
 
 
+def quantize_up(value: Decimal, step: Decimal) -> Decimal:
+    if step is None or step <= 0:
+        return value
+    return (value / step).to_integral_value(rounding=ROUND_CEILING) * step
+
+
+def cap_buy_price(price: Decimal, step: Decimal, cap: Decimal) -> Decimal:
+    """
+    Round a buy limit down onto the price step and never above the cap.
+    Rounding down is the safe direction: the order cannot pay more than price or the cap.
+    """
+    capped = price if price <= cap else cap
+    quantized = quantize_down(capped, step)
+    if quantized > cap:
+        quantized = quantize_down(cap, step)
+    return quantized
+
+
+def floor_sell_price(price: Decimal, step: Decimal, floor: Decimal) -> Decimal:
+    """
+    Round a sell limit up onto the price step and never below the floor.
+    Rounding up is the safe direction: the order cannot sell for less than price or the floor.
+    """
+    floored = price if price >= floor else floor
+    quantized = quantize_up(floored, step)
+    if quantized < floor:
+        quantized = quantize_up(floor, step)
+    return quantized
+
+
 def clamp_price(price: Decimal, price_low: Decimal, price_high: Decimal, price_step: Decimal) -> Decimal:
     if price_step is None or price_step <= 0:
         quantized = price
