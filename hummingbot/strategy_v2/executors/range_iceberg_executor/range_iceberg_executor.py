@@ -3,7 +3,7 @@ import random
 from decimal import Decimal
 from typing import List, Optional, Set
 
-from hummingbot.core.data_type.common import OrderType, PositionAction, PriceType, TradeType
+from hummingbot.core.data_type.common import OrderType, PositionAction, PositionSide, PriceType, TradeType
 from hummingbot.core.data_type.in_flight_order import OrderState
 from hummingbot.logger import HummingbotLogger
 from hummingbot.strategy.strategy_v2_base import StrategyV2Base
@@ -96,6 +96,7 @@ class RangeIcebergExecutor(ExecutorBase):
         self._rounding_remainder_base = Decimal("0")
         self._account_settings_ready = False
         self._account_settings_failed = False
+        self._account_settings_error = ""
         self._unconfirmed_cancels: Set[str] = set()
         self._failed_order_ids: Set[str] = set()
         self._submitted_order_ids: List[str] = []
@@ -897,7 +898,17 @@ class RangeIcebergExecutor(ExecutorBase):
         if query is None:
             return amount
         try:
-            position_base, open_base = await query(self.config.trading_pair, self.config.side)
+            try:
+                result = query(
+                    self.config.trading_pair,
+                    self.config.side,
+                    position_side=self._settings_position_side(),
+                )
+            except TypeError:
+                result = query(self.config.trading_pair, self.config.side)
+            if hasattr(result, "__await__"):
+                result = await result
+            position_base, open_base = result
             position_base = Decimal(str(position_base))
             open_base = Decimal(str(open_base))
         except Exception:
@@ -1036,6 +1047,8 @@ class RangeIcebergExecutor(ExecutorBase):
     def _status_reason(self) -> str:
         if self._unknown_order_ids:
             return "unknown_order_halt: " + ", ".join(sorted(self._unknown_order_ids))
+        if self._account_settings_error:
+            return self._account_settings_error
         if self._open_lookup_count:
             return "open_order_retry: " + ", ".join(sorted(self._open_lookup_count))
         return ""
@@ -1052,38 +1065,111 @@ class RangeIcebergExecutor(ExecutorBase):
         position_mode_ready = self._real_callable(connector, "is_position_mode_ready")
         if position_mode_ready is not None and not position_mode_ready():
             return False
+        # None means do not change margin. A matching position leverage is left as it is.
+        if self.config.margin_mode is None and self._position_leverage_matches(connector):
+            self._account_settings_ready = True
+            return True
+        position_side = self._settings_position_side()
         confirm = self._real_callable(connector, "confirm_leverage_and_margin")
         if confirm is not None:
             try:
-                accepted = await confirm(
-                    self.config.trading_pair,
-                    int(self.config.leverage),
-                    self.config.margin_mode,
-                )
+                try:
+                    accepted = await confirm(
+                        self.config.trading_pair,
+                        int(self.config.leverage),
+                        self.config.margin_mode,
+                        position_side=position_side,
+                    )
+                except TypeError:
+                    accepted = await confirm(
+                        self.config.trading_pair,
+                        int(self.config.leverage),
+                        self.config.margin_mode,
+                    )
             except Exception:
                 self.logger().exception("Could not confirm leverage and margin mode.")
                 accepted = False
             if not accepted:
-                self.logger().error(
-                    "The exchange did not confirm leverage %s and margin mode %s. Refusing to trade.",
-                    self.config.leverage,
-                    self.config.margin_mode,
-                )
-                self._account_settings_failed = True
-                self.close_type = CloseType.FAILED
-                self.stop()
+                reason = self._confirmation_error(connector)
+                if not reason:
+                    if self.config.margin_mode is None:
+                        reason = (
+                            f"The exchange did not confirm leverage {self.config.leverage}. Refusing to trade."
+                        )
+                    else:
+                        reason = (
+                            f"The exchange did not confirm leverage {self.config.leverage} "
+                            f"and margin mode {self.config.margin_mode}. Refusing to trade."
+                        )
+                self._halt_account_settings(reason)
                 return False
         else:
-            set_mode = self._real_callable(connector, "set_margin_mode")
-            if set_mode is not None:
-                result = set_mode(self.config.margin_mode)
-                if hasattr(result, "__await__"):
-                    await result
-            set_leverage = self._real_callable(connector, "set_leverage")
-            if set_leverage is not None:
-                set_leverage(self.config.trading_pair, int(self.config.leverage))
+            if self.config.margin_mode is not None:
+                set_mode = self._real_callable(connector, "set_margin_mode")
+                if set_mode is not None:
+                    result = set_mode(self.config.margin_mode)
+                    if hasattr(result, "__await__"):
+                        await result
+            if not self._position_leverage_matches(connector):
+                set_leverage = self._real_callable(connector, "set_leverage")
+                if set_leverage is not None:
+                    try:
+                        set_leverage(
+                            self.config.trading_pair,
+                            int(self.config.leverage),
+                            position_side=position_side,
+                        )
+                    except TypeError:
+                        set_leverage(self.config.trading_pair, int(self.config.leverage))
         self._account_settings_ready = True
         return True
+
+    def _settings_position_side(self) -> PositionSide:
+        """
+        Hedge mode keeps a long and a short. Opening a buy is the long. Opening a sell
+        is the short. A reduce-only order belongs to the position it closes.
+        """
+        if self.config.reduce_only:
+            return PositionSide.LONG if self.config.side == TradeType.SELL else PositionSide.SHORT
+        return PositionSide.LONG if self.config.side == TradeType.BUY else PositionSide.SHORT
+
+    def _position_leverage_matches(self, connector) -> bool:
+        positions = getattr(connector, "account_positions", None)
+        if not isinstance(positions, dict):
+            return False
+        side = self._settings_position_side()
+        for position in positions.values():
+            if getattr(position, "trading_pair", None) != self.config.trading_pair:
+                continue
+            if getattr(position, "position_side", None) != side:
+                continue
+            leverage = getattr(position, "leverage", None)
+            if leverage is None:
+                continue
+            try:
+                return Decimal(str(leverage)) == Decimal(int(self.config.leverage))
+            except (TypeError, ValueError, ArithmeticError):
+                return False
+        return False
+
+    def _confirmation_error(self, connector) -> str:
+        reader = self._real_callable(connector, "leverage_confirmation_error")
+        if reader is None:
+            return ""
+        try:
+            text = reader()
+        except Exception:
+            return ""
+        if not isinstance(text, str):
+            return ""
+        return text
+
+    def _halt_account_settings(self, reason: str):
+        self._account_settings_error = reason
+        self.logger().error(reason)
+        self._account_settings_failed = True
+        self.close_type = CloseType.FAILED
+        self.stop()
 
     def _size_remainder(self) -> Decimal:
         return self._rounding_remainder_base

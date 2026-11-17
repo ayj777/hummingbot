@@ -2,8 +2,9 @@ from decimal import Decimal
 from test.isolated_asyncio_wrapper_test_case import IsolatedAsyncioWrapperTestCase
 from unittest.mock import MagicMock, PropertyMock
 
+from hummingbot.connector.derivative.position import Position
 from hummingbot.connector.trading_rule import TradingRule
-from hummingbot.core.data_type.common import OrderType, PositionAction, PriceType, TradeType
+from hummingbot.core.data_type.common import OrderType, PositionAction, PositionSide, PriceType, TradeType
 from hummingbot.core.data_type.in_flight_order import InFlightOrder, OrderState
 from hummingbot.strategy_v2.executors.range_iceberg_executor.data_types import (
     CapBehavior,
@@ -621,8 +622,8 @@ class RangeIcebergExecutorTests(IsolatedAsyncioWrapperTestCase):
     def test_exchange_must_confirm_leverage_and_isolated_margin_before_the_first_child(self):
         calls = []
 
-        async def confirm(pair, leverage, mode):
-            calls.append((pair, int(leverage), str(getattr(mode, "value", mode))))
+        async def confirm(pair, leverage, mode, position_side=None):
+            calls.append((pair, int(leverage), str(getattr(mode, "value", mode)), getattr(position_side, "name", None)))
             return False
 
         self.connector.confirm_leverage_and_margin = confirm
@@ -633,15 +634,15 @@ class RangeIcebergExecutorTests(IsolatedAsyncioWrapperTestCase):
             margin_mode="ISOLATED",
         )
         self._run(executor.control_task())
-        self.assertEqual([("AIOT-USDT", 2, "ISOLATED")], calls)
+        self.assertEqual([("AIOT-USDT", 2, "ISOLATED", "LONG")], calls)
         self.assertEqual(0, len(self.buy_ids))
         self.assertEqual(CloseType.FAILED, executor.close_type)
 
         calls.clear()
         self.buy_ids.clear()
 
-        async def accept(pair, leverage, mode):
-            calls.append((pair, int(leverage), str(getattr(mode, "value", mode))))
+        async def accept(pair, leverage, mode, position_side=None):
+            calls.append((pair, int(leverage), str(getattr(mode, "value", mode)), getattr(position_side, "name", None)))
             return True
 
         self.connector.confirm_leverage_and_margin = accept
@@ -653,7 +654,7 @@ class RangeIcebergExecutorTests(IsolatedAsyncioWrapperTestCase):
             margin_mode="ISOLATED",
         )
         self._run(executor.control_task())
-        self.assertEqual([("AIOT-USDT", 2, "ISOLATED")], calls)
+        self.assertEqual([("AIOT-USDT", 2, "ISOLATED", "LONG")], calls)
         self.assertEqual(1, len(self.buy_ids))
 
     def test_executor_waits_while_position_mode_is_still_unread(self):
@@ -663,8 +664,13 @@ class RangeIcebergExecutorTests(IsolatedAsyncioWrapperTestCase):
         def is_ready():
             return ready["ok"]
 
-        async def confirm(pair, leverage, mode):
-            calls.append((pair, int(leverage), str(getattr(mode, "value", mode))))
+        async def confirm(pair, leverage, mode, position_side=None):
+            calls.append((
+                pair,
+                int(leverage),
+                None if mode is None else str(getattr(mode, "value", mode)),
+                getattr(position_side, "name", None),
+            ))
             return True
 
         self.connector.is_position_mode_ready = is_ready
@@ -678,8 +684,131 @@ class RangeIcebergExecutorTests(IsolatedAsyncioWrapperTestCase):
         self.assertEqual(RunnableStatus.RUNNING, executor.status)
         ready["ok"] = True
         self._run(executor.control_task())
-        self.assertEqual([("AIOT-USDT", 2, "ISOLATED")], calls)
+        self.assertEqual([("AIOT-USDT", 2, None, "LONG")], calls)
         self.assertEqual(1, len(self.buy_ids))
+
+    def _held_position(self, side: PositionSide, leverage: int, amount: str = "60770") -> Position:
+        return Position(
+            trading_pair="AIOT-USDT",
+            position_side=side,
+            unrealized_pnl=Decimal("0"),
+            entry_price=Decimal("0.08"),
+            amount=Decimal(amount) if side is PositionSide.LONG else Decimal(amount) * Decimal("-1"),
+            leverage=Decimal(leverage),
+        )
+
+    def test_margin_mode_defaults_to_none_and_rejects_unknown_values(self):
+        self.assertIsNone(self._config().margin_mode)
+        with self.assertRaises(Exception):
+            self._config(margin_mode="BOTH")
+
+    def test_matching_hedge_long_skips_leverage_and_does_not_touch_the_short(self):
+        calls = []
+
+        def set_leverage(pair, leverage, position_side=None):
+            calls.append((pair, int(leverage), getattr(position_side, "name", None)))
+
+        self.connector.account_positions = {
+            "AIOT-USDTLONG": self._held_position(PositionSide.LONG, 2),
+            "AIOT-USDTSHORT": self._held_position(PositionSide.SHORT, 5, "10"),
+        }
+        self.connector.set_leverage = set_leverage
+        self._book(Decimal("0.07815"), Decimal("0.07816"))
+        executor = self._up_to(total_amount=Decimal("100"), slice_amount=Decimal("100"), leverage=2)
+        self._run(executor.control_task())
+        self.assertEqual([], calls)
+        self.assertEqual(1, len(self.buy_ids))
+        self.assertIsNone(executor.close_type)
+
+    def test_hedge_short_leverage_is_set_without_a_margin_mode(self):
+        calls = []
+
+        def set_leverage(pair, leverage, position_side=None):
+            calls.append((pair, int(leverage), getattr(position_side, "name", None)))
+
+        self.connector.account_positions = {
+            "AIOT-USDTLONG": self._held_position(PositionSide.LONG, 2),
+            "AIOT-USDTSHORT": self._held_position(PositionSide.SHORT, 5, "10"),
+        }
+        self.connector.set_leverage = set_leverage
+        self._book(Decimal("0.07815"), Decimal("0.07816"))
+        executor = self._up_to(
+            total_amount=Decimal("100"),
+            slice_amount=Decimal("100"),
+            leverage=2,
+            side=TradeType.SELL,
+        )
+        self._run(executor.control_task())
+        self.assertEqual([("AIOT-USDT", 2, "SHORT")], calls)
+        self.assertEqual(1, len(self.buy_ids))
+
+    def test_explicit_margin_switch_rejection_halts_with_the_exchange_reason(self):
+        reason = (
+            "MEXC rejected switching AIOT-USDT LONG margin from CROSS to ISOLATED "
+            "while the position is open: Error: 2027 - There is only one cross or isolated "
+            "in the same direction. Refusing to trade."
+        )
+
+        async def confirm(pair, leverage, mode, position_side=None):
+            return False
+
+        self.connector.confirm_leverage_and_margin = confirm
+        self.connector.leverage_confirmation_error = lambda: reason
+        self.connector.account_positions = {
+            "AIOT-USDTLONG": self._held_position(PositionSide.LONG, 2),
+        }
+        self._book(Decimal("0.07815"), Decimal("0.07816"))
+        executor = self._up_to(
+            total_amount=Decimal("100"),
+            slice_amount=Decimal("100"),
+            leverage=2,
+            margin_mode="ISOLATED",
+        )
+        self._run(executor.control_task())
+        self.assertEqual([], self.buy_ids)
+        self.assertEqual(CloseType.FAILED, executor.close_type)
+        self.assertEqual(reason, executor.to_format_status())
+        self.assertIn("CROSS", executor.get_custom_info()["status_reason"])
+        self.assertIn("ISOLATED", executor.get_custom_info()["status_reason"])
+
+    def test_hedge_position_read_uses_the_long_for_a_buy_and_the_short_for_a_sell(self):
+        seen = []
+
+        async def exposure(trading_pair, side, position_side=None):
+            seen.append((trading_pair, side, getattr(position_side, "name", None)))
+            return (Decimal("0"), Decimal("0"))
+
+        self.connector.ground_truth_exposure = exposure
+        self.connector.account_positions = {
+            "AIOT-USDTLONG": self._held_position(PositionSide.LONG, 2),
+            "AIOT-USDTSHORT": self._held_position(PositionSide.SHORT, 2, "10"),
+        }
+        self._book(Decimal("0.07815"), Decimal("0.07816"))
+        buy = self._up_to(total_amount=Decimal("100"), slice_amount=Decimal("100"), leverage=2)
+        self._run(buy.control_task())
+        sell = self._up_to(
+            total_amount=Decimal("100"),
+            slice_amount=Decimal("100"),
+            leverage=2,
+            side=TradeType.SELL,
+        )
+        self._run(sell.control_task())
+        close_long = self._up_to(
+            total_amount=Decimal("100"),
+            slice_amount=Decimal("100"),
+            leverage=2,
+            side=TradeType.SELL,
+            reduce_only=True,
+        )
+        self._run(close_long.control_task())
+        self.assertEqual(
+            [
+                ("AIOT-USDT", TradeType.BUY, "LONG"),
+                ("AIOT-USDT", TradeType.SELL, "SHORT"),
+                ("AIOT-USDT", TradeType.SELL, "LONG"),
+            ],
+            seen,
+        )
 
     def test_failed_create_cancels_that_client_id_before_a_replacement(self):
         from hummingbot.core.event.events import MarketOrderFailureEvent

@@ -28,6 +28,7 @@ from hummingbot.core.data_type.in_flight_order import InFlightOrder, OrderState,
 from hummingbot.core.data_type.order_book_tracker_data_source import OrderBookTrackerDataSource
 from hummingbot.core.data_type.trade_fee import TokenAmount, TradeFeeBase, TradeFeeSchema
 from hummingbot.core.data_type.user_stream_tracker_data_source import UserStreamTrackerDataSource
+from hummingbot.core.utils.async_utils import safe_ensure_future
 from hummingbot.core.utils.estimate_fee import build_trade_fee
 from hummingbot.core.web_assistant.web_assistants_factory import WebAssistantsFactory
 
@@ -94,8 +95,14 @@ class MexcPerpetualDerivative(PerpetualDerivativePyBase):
         self._trading_pairs = trading_pairs
         self._contract_sizes: Dict[str, Decimal] = {}
         self._position_ids: Dict[Tuple[str, PositionSide], int] = {}
-        # Margin mode is sent as openType on each order. Isolated is the default.
+        # openType of each open position, keyed by pair and side. Hedge mode keeps both.
+        self._position_margin_modes: Dict[Tuple[str, PositionSide], str] = {}
+        # Margin mode is sent as openType on orders. Isolated is the default until one is set.
+        # Leverage changes omit openType unless a margin mode was requested for that call.
         self._margin_mode = MarginMode.ISOLATED
+        self._margin_mode_explicit = False
+        self._leverage_explicit = False
+        self._leverage_confirmation_error = ""
         # Stay false until GET position_mode succeeds. Orders are refused before that.
         self._position_mode_confirmed = False
         self._equity_gap: Dict[str, Decimal] = {}
@@ -449,9 +456,7 @@ class MexcPerpetualDerivative(PerpetualDerivativePyBase):
         **kwargs,
     ) -> Dict[str, Any]:
         symbol = await self.exchange_symbol_associated_to_pair(trading_pair)
-        leverage = kwargs.get("leverage")
-        if leverage is None:
-            leverage = self.get_leverage(trading_pair)
+        leverage = self._order_leverage(trading_pair, trade_type, position_action, kwargs)
         data: Dict[str, Any] = {
             "symbol": symbol,
             "price": self._json_number(self._price_string(price, order_type)),
@@ -459,7 +464,7 @@ class MexcPerpetualDerivative(PerpetualDerivativePyBase):
             "leverage": int(leverage),
             "side": self._exchange_side(trade_type, position_action),
             "type": self._execution_type_code(order_type, kwargs.get("time_in_force")),
-            "openType": self._open_type(),
+            "openType": self._order_open_type(trading_pair, trade_type, position_action),
             "positionMode": self._position_mode_code(kwargs.get("position_mode")),
         }
         position_id = self._position_id_for_order(trading_pair, trade_type, position_action, kwargs.get("reduce_only"))
@@ -468,7 +473,10 @@ class MexcPerpetualDerivative(PerpetualDerivativePyBase):
         if client_order_id:
             data["externalOid"] = client_order_id
         reduce_only = kwargs.get("reduce_only")
-        if reduce_only is None:
+        if self.position_mode is PositionMode.HEDGE:
+            # Hedge closes with side 2 or 4. reduceOnly is only valid in one-way mode.
+            reduce_only = False
+        elif reduce_only is None:
             reduce_only = self.position_mode is PositionMode.ONEWAY and position_action is PositionAction.CLOSE
         if reduce_only:
             data["reduceOnly"] = True
@@ -529,9 +537,9 @@ class MexcPerpetualDerivative(PerpetualDerivativePyBase):
         data: Dict[str, Any] = {
             "symbol": symbol,
             "vol": self._json_number(self._base_amount_to_contracts(trading_pair, amount)),
-            "leverage": int(kwargs.get("leverage", self.get_leverage(trading_pair))),
+            "leverage": self._order_leverage(trading_pair, trade_type, position_action, kwargs),
             "side": self._exchange_side(trade_type, position_action),
-            "openType": self._open_type(),
+            "openType": self._order_open_type(trading_pair, trade_type, position_action),
             "triggerPrice": self._json_number(trigger_price),
             "triggerType": int(trigger_type),
             "executeCycle": int(execute_cycle),
@@ -1153,16 +1161,21 @@ class MexcPerpetualDerivative(PerpetualDerivativePyBase):
     async def _update_positions(self):
         response = await self._api_get(path_url=CONSTANTS.OPEN_POSITIONS_PATH, is_auth_required=True)
         seen_keys = set()
+        seen_sides = set()
         for raw_position in response.get("data") or []:
             parsed = await self._parse_position(raw_position)
             if parsed is None:
                 continue
             pos_key, position = parsed
             seen_keys.add(pos_key)
+            seen_sides.add((position.trading_pair, position.position_side))
             self._perpetual_trading.set_position(pos_key, position)
         for pos_key in list(self.account_positions.keys()):
             if pos_key not in seen_keys:
                 self._perpetual_trading.remove_position(pos_key)
+        for key in list(self._position_margin_modes):
+            if key not in seen_sides:
+                self._position_margin_modes.pop(key, None)
 
     async def _update_orders_fills(self, orders: List[InFlightOrder]):
         for order in orders:
@@ -1387,11 +1400,17 @@ class MexcPerpetualDerivative(PerpetualDerivativePyBase):
     def orders_awaiting_resolution(self) -> Set[str]:
         return set(self._status_unknown_client_ids)
 
-    async def ground_truth_exposure(self, trading_pair: str, side: TradeType) -> Tuple[Decimal, Decimal]:
+    async def ground_truth_exposure(
+        self,
+        trading_pair: str,
+        side: TradeType,
+        position_side: Optional[PositionSide] = None,
+    ) -> Tuple[Decimal, Decimal]:
         """
         Read the live position and open orders for this pair.
         Returns position base in the order's direction, and the remaining size of open
-        orders on that side. Raises when either read fails.
+        orders on that side. In hedge mode, or when position_side is set, the read is
+        the long or the short, not both. Raises when either read fails.
         """
         symbol = await self.exchange_symbol_associated_to_pair(trading_pair)
         contract_size = self.get_contract_size(trading_pair)
@@ -1402,10 +1421,7 @@ class MexcPerpetualDerivative(PerpetualDerivativePyBase):
         )
         position_rows = self._rows_for_symbol(self._position_page(positions), symbol)
         order_rows = self._rows_for_symbol(await self._open_order_rows(), symbol)
-        wanted_position = 1 if side is TradeType.BUY else 2
-        buy_sides = {1, 2}
-        sell_sides = {3, 4}
-        wanted_sides = buy_sides if side is TradeType.BUY else sell_sides
+        wanted_position, wanted_sides = self._exposure_filters(side, position_side)
         position_base = s_decimal_0
         for row in position_rows:
             if int(row.get("positionType") or 0) != wanted_position:
@@ -1685,13 +1701,45 @@ class MexcPerpetualDerivative(PerpetualDerivativePyBase):
 
     async def set_margin_mode(self, mode: str):
         """
-        Remember isolated or cross margin and send it as openType on later orders and leverage changes.
+        Remember isolated or cross margin and send it as openType on later orders.
         MEXC applies the mode per order. Switching it while a position is open is rejected by the exchange.
+        A leverage change does not send openType unless that call was given a margin mode.
         """
-        if mode not in (MarginMode.CROSS, MarginMode.ISOLATED):
+        normalized = self._coerce_margin_mode(mode)
+        if normalized is None:
             raise ValueError(f"Unsupported margin mode {mode}")
-        self._margin_mode = mode
-        self.logger().info(f"Margin mode set to {mode}. New orders will use this open type.")
+        self._margin_mode = normalized
+        self._margin_mode_explicit = True
+        self.logger().info(f"Margin mode set to {normalized}. New orders will use this open type.")
+
+    def set_leverage(self, trading_pair: str, leverage: int = 1, position_side: Optional[PositionSide] = None):
+        """
+        Set leverage for one pair. In hedge mode, pass position_side so the other side is left alone.
+        This path does not send openType.
+        """
+        safe_ensure_future(self._execute_set_leverage(trading_pair, leverage, position_side))
+
+    async def _execute_set_leverage(
+        self,
+        trading_pair: str,
+        leverage: int,
+        position_side: Optional[PositionSide] = None,
+    ):
+        success, msg = await self._set_trading_pair_leverage(
+            trading_pair,
+            leverage,
+            margin_mode=None,
+            position_side=position_side,
+        )
+        if success:
+            self._perpetual_trading.set_leverage(trading_pair, leverage)
+            self._leverage_explicit = True
+            self.logger().info(f"Leverage for {trading_pair} successfully set to {leverage}.")
+        else:
+            self.logger().network(f"Error setting leverage {leverage} for {trading_pair}: {msg}")
+
+    def leverage_confirmation_error(self) -> str:
+        return self._leverage_confirmation_error
 
     async def _fetch_account_position_mode(self) -> Optional[PositionMode]:
         response = await self._api_get(path_url=CONSTANTS.POSITION_MODE_PATH, is_auth_required=True)
@@ -1712,65 +1760,106 @@ class MexcPerpetualDerivative(PerpetualDerivativePyBase):
             return False, str(exception)
         return True, ""
 
-    async def _set_trading_pair_leverage(self, trading_pair: str, leverage: int) -> Tuple[bool, str]:
+    async def _set_trading_pair_leverage(
+        self,
+        trading_pair: str,
+        leverage: int,
+        margin_mode: Optional[str] = None,
+        position_side: Optional[PositionSide] = None,
+    ) -> Tuple[bool, str]:
+        """
+        Change leverage for the pair. openType is included only when margin_mode is set.
+        A named position_side is the only side that is read or changed. Hedge mode can
+        hold a long and a short at different leverage, so one side must not move the other.
+        When that side's open position already uses this leverage, and margin is not being
+        changed, the exchange is not called.
+        """
         symbol = await self.exchange_symbol_associated_to_pair(trading_pair)
-        position_ids = [
-            (side, position_id)
-            for (pair, side), position_id in self._position_ids.items()
-            if pair == trading_pair
-        ]
+        requested = None if margin_mode is None else self._coerce_margin_mode(margin_mode)
+        if margin_mode is not None and requested is None:
+            return False, f"Unsupported margin mode {margin_mode}"
+        side = self._coerce_position_side(position_side)
+        if position_side is not None and side is None:
+            return False, f"Unsupported position side {position_side}"
         try:
-            if position_ids:
-                for _side, position_id in position_ids:
-                    await self._api_post(
-                        path_url=CONSTANTS.CHANGE_LEVERAGE_PATH,
-                        data={
-                            "positionId": position_id,
-                            "leverage": int(leverage),
-                            "openType": self._open_type(),
-                        },
-                        is_auth_required=True,
-                    )
-            else:
-                position_types = [CONSTANTS.POSITION_TYPE_LONG]
-                if self.position_mode is PositionMode.HEDGE:
-                    position_types.append(CONSTANTS.POSITION_TYPE_SHORT)
-                for position_type in position_types:
-                    await self._api_post(
-                        path_url=CONSTANTS.CHANGE_LEVERAGE_PATH,
-                        data={
-                            "symbol": symbol,
-                            "leverage": int(leverage),
-                            "openType": self._open_type(),
-                            "positionType": position_type,
-                        },
-                        is_auth_required=True,
-                    )
+            for item in self._leverage_sides(trading_pair, side):
+                call, send_open_type = self._leverage_call_plan(trading_pair, item, leverage, requested)
+                if not call:
+                    continue
+                await self._api_post(
+                    path_url=CONSTANTS.CHANGE_LEVERAGE_PATH,
+                    data=self._leverage_payload(
+                        trading_pair,
+                        symbol,
+                        item,
+                        leverage,
+                        requested if send_open_type else None,
+                    ),
+                    is_auth_required=True,
+                )
+                if send_open_type and requested is not None:
+                    self._position_margin_modes[(trading_pair, item)] = requested
         except Exception as exception:
             return False, str(exception)
         return True, ""
 
-    async def confirm_leverage_and_margin(self, trading_pair: str, leverage: int, margin_mode: str) -> bool:
+    async def confirm_leverage_and_margin(
+        self,
+        trading_pair: str,
+        leverage: int,
+        margin_mode: Optional[str] = None,
+        position_side: Optional[PositionSide] = None,
+    ) -> bool:
         """
-        Apply leverage and isolated or cross margin and return whether the exchange accepted them.
-        Local state changes only after the exchange call succeeds.
+        Apply leverage, and margin mode only when one was requested.
+        None leaves the position margin unchanged and does not send openType.
+        The open position for this pair and side is read first. A matching leverage
+        with no margin change skips the exchange call. Local state changes only
+        after that check passes. A rejected switch away from the open position's
+        mode is reported on leverage_confirmation_error.
         """
+        self._leverage_confirmation_error = ""
         if not self._position_mode_confirmed:
             self.logger().warning("Cannot confirm leverage before the account position mode is read.")
             return False
-        mode = str(getattr(margin_mode, "value", margin_mode))
-        if mode not in (MarginMode.CROSS, MarginMode.ISOLATED):
+        requested = None if margin_mode is None else self._coerce_margin_mode(margin_mode)
+        if margin_mode is not None and requested is None:
             self.logger().error(f"Unsupported margin mode {margin_mode}")
             return False
+        side = self._coerce_position_side(position_side)
+        if position_side is not None and side is None:
+            self.logger().error(f"Unsupported position side {position_side}")
+            return False
         previous_mode = self._margin_mode
-        self._margin_mode = mode
-        success, message = await self._set_trading_pair_leverage(trading_pair, int(leverage))
+        previous_explicit = self._margin_mode_explicit
+        if requested is not None:
+            self._margin_mode = requested
+            self._margin_mode_explicit = True
+        success, message = await self._set_trading_pair_leverage(
+            trading_pair,
+            int(leverage),
+            margin_mode=requested,
+            position_side=side,
+        )
         if not success:
             self._margin_mode = previous_mode
-            self.logger().warning(f"Exchange rejected leverage {leverage} {mode} for {trading_pair}: {message}")
+            self._margin_mode_explicit = previous_explicit
+            reason = self._margin_switch_rejection(trading_pair, side, requested, message)
+            if reason:
+                self._leverage_confirmation_error = reason
+                self.logger().error(reason)
+            else:
+                shown = requested if requested is not None else "unchanged"
+                self.logger().warning(
+                    f"Exchange rejected leverage {leverage} with margin mode {shown} for {trading_pair}: {message}"
+                )
             return False
         self._perpetual_trading.set_leverage(trading_pair, int(leverage))
-        self.logger().info(f"Confirmed {mode} leverage {leverage} for {trading_pair}.")
+        self._leverage_explicit = True
+        if requested is None:
+            self.logger().info(f"Confirmed leverage {leverage} for {trading_pair} without changing margin mode.")
+        else:
+            self.logger().info(f"Confirmed {requested} leverage {leverage} for {trading_pair}.")
         return True
 
     async def _initialize_position_mode(self):
@@ -1951,8 +2040,10 @@ class MexcPerpetualDerivative(PerpetualDerivativePyBase):
         position_id = raw_position.get("positionId")
         if position_id not in (None, "", 0, "0"):
             self._position_ids[(trading_pair, side)] = self._normalize_order_id(position_id)
+        self._remember_position_margin(trading_pair, side, raw_position.get("openType"))
         if contracts == s_decimal_0 or state == 3:
             self._position_ids.pop((trading_pair, side), None)
+            self._position_margin_modes.pop((trading_pair, side), None)
             return None
         amount = contracts * self.get_contract_size(trading_pair)
         if side is PositionSide.SHORT:
@@ -2134,6 +2225,214 @@ class MexcPerpetualDerivative(PerpetualDerivativePyBase):
             data["takeProfitReverse"] = int(kwargs["take_profit_reverse"])
         if kwargs.get("stop_loss_reverse") is not None:
             data["stopLossReverse"] = int(kwargs["stop_loss_reverse"])
+
+    def _exposure_filters(self, side: TradeType, position_side: Optional[PositionSide]) -> Tuple[int, Set[int]]:
+        """
+        Hedge mode, and any caller that names a position side, counts only that long or short.
+        One-way reads that do not name a side stay grouped by the buy or sell order side.
+        """
+        resolved = self._coerce_position_side(position_side)
+        if resolved is None and self.position_mode is PositionMode.HEDGE:
+            resolved = PositionSide.LONG if side is TradeType.BUY else PositionSide.SHORT
+        if resolved is not None and (position_side is not None or self.position_mode is PositionMode.HEDGE):
+            if resolved is PositionSide.LONG:
+                return CONSTANTS.POSITION_TYPE_LONG, {CONSTANTS.SIDE_OPEN_LONG, CONSTANTS.SIDE_CLOSE_LONG}
+            return CONSTANTS.POSITION_TYPE_SHORT, {CONSTANTS.SIDE_OPEN_SHORT, CONSTANTS.SIDE_CLOSE_SHORT}
+        if side is TradeType.BUY:
+            return CONSTANTS.POSITION_TYPE_LONG, {CONSTANTS.SIDE_OPEN_LONG, CONSTANTS.SIDE_CLOSE_SHORT}
+        return CONSTANTS.POSITION_TYPE_SHORT, {CONSTANTS.SIDE_OPEN_SHORT, CONSTANTS.SIDE_CLOSE_LONG}
+
+    def _remember_position_margin(self, trading_pair: str, side: PositionSide, open_type: Any):
+        if open_type in (None, ""):
+            return
+        try:
+            code = int(open_type)
+        except (TypeError, ValueError):
+            return
+        if code == CONSTANTS.OPEN_TYPE_ISOLATED:
+            self._position_margin_modes[(trading_pair, side)] = MarginMode.ISOLATED
+        elif code == CONSTANTS.OPEN_TYPE_CROSS:
+            self._position_margin_modes[(trading_pair, side)] = MarginMode.CROSS
+
+    def _open_position(self, trading_pair: str, side: PositionSide) -> Optional[Position]:
+        for position in self.account_positions.values():
+            if position.trading_pair != trading_pair or position.position_side != side:
+                continue
+            if position.amount == s_decimal_0:
+                continue
+            return position
+        return None
+
+    def _leverage_sides(self, trading_pair: str, position_side: Optional[PositionSide]) -> List[PositionSide]:
+        if position_side is not None:
+            return [position_side]
+        sides: List[PositionSide] = []
+        for pair, side in self._position_ids:
+            if pair == trading_pair and side not in sides:
+                sides.append(side)
+        if sides:
+            return sides
+        for position in self.account_positions.values():
+            if position.trading_pair == trading_pair and position.position_side not in sides:
+                sides.append(position.position_side)
+        if sides:
+            return sides
+        if self.position_mode is PositionMode.HEDGE:
+            return [PositionSide.LONG, PositionSide.SHORT]
+        return [PositionSide.LONG]
+
+    def _leverage_call_plan(
+        self,
+        trading_pair: str,
+        side: PositionSide,
+        leverage: int,
+        requested_mode: Optional[str],
+    ) -> Tuple[bool, bool]:
+        """
+        Returns (call the exchange, include openType).
+        openType is sent only when a margin mode was requested and this side does not
+        already use it. A matching leverage with no margin change is not sent.
+        """
+        position = self._open_position(trading_pair, side)
+        current_mode = self._position_margin_modes.get((trading_pair, side))
+        send_open_type = requested_mode is not None and (position is None or current_mode != requested_mode)
+        if position is not None and self._same_leverage(position.leverage, leverage):
+            if requested_mode is None or current_mode == requested_mode:
+                return False, False
+        return True, send_open_type
+
+    def _leverage_payload(
+        self,
+        trading_pair: str,
+        symbol: str,
+        side: PositionSide,
+        leverage: int,
+        open_type_mode: Optional[str],
+    ) -> Dict[str, Any]:
+        position_id = self._position_ids.get((trading_pair, side))
+        if position_id is not None:
+            data: Dict[str, Any] = {"positionId": position_id, "leverage": int(leverage)}
+        else:
+            data = {
+                "symbol": symbol,
+                "leverage": int(leverage),
+                "positionType": (
+                    CONSTANTS.POSITION_TYPE_LONG if side is PositionSide.LONG else CONSTANTS.POSITION_TYPE_SHORT
+                ),
+            }
+        if open_type_mode is not None:
+            data["openType"] = self._open_type_code(open_type_mode)
+        return data
+
+    def _margin_switch_rejection(
+        self,
+        trading_pair: str,
+        side: Optional[PositionSide],
+        requested: Optional[str],
+        message: str,
+    ) -> str:
+        if requested is None:
+            return ""
+        sides = [side] if side is not None else self._leverage_sides(trading_pair, None)
+        for item in sides:
+            if item is None or self._open_position(trading_pair, item) is None:
+                continue
+            current = self._position_margin_modes.get((trading_pair, item))
+            differs = current is not None and current != requested
+            code_rejected = current != requested and self._message_is_margin_switch(message)
+            if not differs and not code_rejected:
+                continue
+            current_text = current if current is not None else "unknown"
+            return (
+                f"MEXC rejected switching {trading_pair} {item.name} margin from {current_text} "
+                f"to {requested} while the position is open: {message}. Refusing to trade."
+            )
+        return ""
+
+    @staticmethod
+    def _message_is_margin_switch(message: str) -> bool:
+        text = str(message)
+        return any(str(code) in text for code in CONSTANTS.MARGIN_MODE_SWITCH_ERROR_CODES)
+
+    @staticmethod
+    def _same_leverage(current: Any, requested: int) -> bool:
+        try:
+            return Decimal(str(current)) == Decimal(int(requested))
+        except (TypeError, ValueError, ArithmeticError):
+            return False
+
+    @staticmethod
+    def _coerce_margin_mode(margin_mode: Optional[str]) -> Optional[str]:
+        if margin_mode is None:
+            return None
+        mode = str(getattr(margin_mode, "value", margin_mode)).upper()
+        if mode in (MarginMode.CROSS, MarginMode.ISOLATED):
+            return mode
+        return None
+
+    @staticmethod
+    def _coerce_position_side(position_side: Optional[Any]) -> Optional[PositionSide]:
+        if position_side is None:
+            return None
+        if isinstance(position_side, PositionSide):
+            return position_side
+        text = str(getattr(position_side, "name", position_side)).upper()
+        if text == PositionSide.LONG.name:
+            return PositionSide.LONG
+        if text == PositionSide.SHORT.name:
+            return PositionSide.SHORT
+        return None
+
+    def _order_position_side(self, trade_type: TradeType, position_action: PositionAction) -> PositionSide:
+        closing = position_action is PositionAction.CLOSE
+        if trade_type is TradeType.BUY:
+            return PositionSide.SHORT if closing else PositionSide.LONG
+        return PositionSide.LONG if closing else PositionSide.SHORT
+
+    def _order_leverage(
+        self,
+        trading_pair: str,
+        trade_type: TradeType,
+        position_action: PositionAction,
+        kwargs: Dict[str, Any],
+    ) -> int:
+        """
+        Use an explicit leverage when this process set one. Otherwise use the open
+        position leverage for this pair and side, so a hedge long and short stay apart.
+        """
+        requested = kwargs.get("leverage")
+        if requested is not None:
+            return int(requested)
+        if self._leverage_explicit:
+            return int(self.get_leverage(trading_pair))
+        position = self._open_position(trading_pair, self._order_position_side(trade_type, position_action))
+        if position is not None:
+            try:
+                return int(Decimal(str(position.leverage)))
+            except (TypeError, ValueError, ArithmeticError):
+                pass
+        return int(self.get_leverage(trading_pair))
+
+    def _order_open_type(self, trading_pair: str, trade_type: TradeType, position_action: PositionAction) -> int:
+        """
+        Orders must send openType. When no margin mode was requested, use the open
+        position's mode for this pair and side so the order does not switch it.
+        """
+        if self._margin_mode_explicit:
+            return self._open_type()
+        mode = self._position_margin_modes.get((trading_pair, self._order_position_side(trade_type, position_action)))
+        if mode == MarginMode.CROSS:
+            return CONSTANTS.OPEN_TYPE_CROSS
+        if mode == MarginMode.ISOLATED:
+            return CONSTANTS.OPEN_TYPE_ISOLATED
+        return self._open_type()
+
+    def _open_type_code(self, mode: str) -> int:
+        if mode == MarginMode.ISOLATED:
+            return CONSTANTS.OPEN_TYPE_ISOLATED
+        if mode == MarginMode.CROSS:
+            return CONSTANTS.OPEN_TYPE_CROSS
+        raise ValueError(f"Unsupported margin mode {mode}")
 
     def _exchange_side(self, trade_type: TradeType, position_action: PositionAction) -> int:
         if trade_type is TradeType.BUY and position_action is PositionAction.OPEN:

@@ -49,7 +49,7 @@ class CatchUpPolicy(str, Enum):
 
 
 class MarginMode(str, Enum):
-    """Margin mode sent as openType. Isolated is the default for this executor."""
+    """Margin mode sent as openType when it is set. None leaves the account margin unchanged."""
 
     ISOLATED = "ISOLATED"
     CROSS = "CROSS"
@@ -95,7 +95,7 @@ class RangeIcebergExecutorConfig(ExecutorConfigBase):
     max_slippage: Optional[Decimal] = None
     reduce_only: bool = False
     leverage: int = 1
-    margin_mode: MarginMode = MarginMode.ISOLATED
+    margin_mode: Optional[MarginMode] = None
     random_seed: Optional[int] = None
 
     @field_validator("side", mode="before")
@@ -108,6 +108,8 @@ class RangeIcebergExecutorConfig(ExecutorConfigBase):
     @field_validator("margin_mode", mode="before")
     @classmethod
     def parse_margin_mode(cls, value):
+        if value is None:
+            return None
         text = str(getattr(value, "value", value)).upper()
         if text not in (MarginMode.ISOLATED.value, MarginMode.CROSS.value):
             raise ValueError(f"margin_mode ({value}) must be ISOLATED or CROSS")
