@@ -1400,33 +1400,19 @@ class MexcPerpetualDerivative(PerpetualDerivativePyBase):
             params={"symbol": symbol},
             is_auth_required=True,
         )
-        orders = await self._api_get(
-            path_url=CONSTANTS.OPEN_ORDERS_PATH.format(symbol=symbol),
-            is_auth_required=True,
-            limit_id=CONSTANTS.OPEN_ORDERS_LIMIT_ID,
-        )
-        if not isinstance(positions, dict) or not isinstance(orders, dict):
-            raise IOError("Position or open-order response was not JSON")
-        if positions.get("success") is False or orders.get("success") is False:
-            raise IOError("Position or open-order response was rejected")
+        position_rows = self._rows_for_symbol(self._position_page(positions), symbol)
+        order_rows = self._rows_for_symbol(await self._open_order_rows(), symbol)
         wanted_position = 1 if side is TradeType.BUY else 2
         buy_sides = {1, 2}
         sell_sides = {3, 4}
         wanted_sides = buy_sides if side is TradeType.BUY else sell_sides
         position_base = s_decimal_0
-        for row in positions.get("data") or []:
-            if not isinstance(row, dict):
-                continue
+        for row in position_rows:
             if int(row.get("positionType") or 0) != wanted_position:
                 continue
             position_base += Decimal(str(row.get("holdVol") or "0")) * contract_size
         open_base = s_decimal_0
-        order_rows = orders.get("data") or []
-        if isinstance(order_rows, dict):
-            order_rows = order_rows.get("resultList") or order_rows.get("list") or []
         for row in order_rows:
-            if not isinstance(row, dict):
-                continue
             if int(row.get("side") or 0) not in wanted_sides:
                 continue
             remaining = Decimal(str(row.get("vol") or "0")) - Decimal(str(row.get("dealVol") or "0"))
@@ -1434,6 +1420,97 @@ class MexcPerpetualDerivative(PerpetualDerivativePyBase):
                 remaining = s_decimal_0
             open_base += remaining * contract_size
         return position_base, open_base
+
+    async def _open_order_rows(self) -> List[Dict[str, Any]]:
+        """
+        Walk GET /api/v1/private/order/list/open_orders.
+        The documented query is page_num and page_size. Symbol is not a parameter,
+        so each row is filtered by the caller.
+        A short page, totalCount, or totalPage ends the walk. Hitting the page cap
+        is a failed read, not a partial book.
+        """
+        page_size = CONSTANTS.OPEN_ORDERS_PAGE_SIZE
+        collected: List[Dict[str, Any]] = []
+        for page_num in range(1, CONSTANTS.OPEN_ORDERS_MAX_PAGES + 1):
+            response = await self._api_get(
+                path_url=CONSTANTS.OPEN_ORDERS_PATH,
+                params={"page_num": page_num, "page_size": page_size},
+                is_auth_required=True,
+                limit_id=CONSTANTS.OPEN_ORDERS_LIMIT_ID,
+            )
+            rows, total_count, total_page = self._open_order_page(response)
+            collected.extend(rows)
+            if total_count is not None and len(collected) >= total_count:
+                return collected
+            if total_page is not None and page_num >= total_page:
+                return collected
+            if len(rows) < page_size:
+                return collected
+        raise IOError("Open-order read exceeded the page limit")
+
+    @staticmethod
+    def _open_order_page(response: Any) -> Tuple[List[Dict[str, Any]], Optional[int], Optional[int]]:
+        if not isinstance(response, dict):
+            raise IOError("Open-order page was not JSON")
+        code = response.get("code")
+        if response.get("success") is False or code not in (None, 0, "0"):
+            raise IOError("Open-order page was rejected")
+        data = response.get("data")
+        total_count = MexcPerpetualDerivative._documented_count(response.get("totalCount"))
+        total_page = MexcPerpetualDerivative._documented_count(response.get("totalPage"))
+        if isinstance(data, dict):
+            raw = data.get("resultList")
+            if raw is None:
+                raw = data.get("list")
+            if raw is None:
+                raw = []
+            if total_count is None:
+                total_count = MexcPerpetualDerivative._documented_count(data.get("totalCount"))
+            if total_page is None:
+                total_page = MexcPerpetualDerivative._documented_count(data.get("totalPage"))
+        elif isinstance(data, list):
+            raw = data
+        elif data in (None, ""):
+            raw = []
+        else:
+            raise IOError("Open-order page was not a list")
+        if not isinstance(raw, list):
+            raise IOError("Open-order page had no order list")
+        return [row for row in raw if isinstance(row, dict)], total_count, total_page
+
+    @staticmethod
+    def _position_page(response: Any) -> List[Dict[str, Any]]:
+        if not isinstance(response, dict):
+            raise IOError("Position response was not JSON")
+        code = response.get("code")
+        if response.get("success") is False or code not in (None, 0, "0"):
+            raise IOError("Position response was rejected")
+        data = response.get("data")
+        if isinstance(data, dict):
+            data = data.get("resultList")
+            if data is None:
+                data = response.get("data", {}).get("list")
+        if data in (None, ""):
+            data = []
+        if not isinstance(data, list):
+            raise IOError("Position response was not a list")
+        return [row for row in data if isinstance(row, dict)]
+
+    @staticmethod
+    def _rows_for_symbol(rows: List[Dict[str, Any]], symbol: str) -> List[Dict[str, Any]]:
+        return [row for row in rows if str(row.get("symbol") or "") == symbol]
+
+    @staticmethod
+    def _documented_count(value: Any) -> Optional[int]:
+        if value in (None, ""):
+            return None
+        try:
+            number = int(value)
+        except (TypeError, ValueError):
+            return None
+        if number < 0:
+            return None
+        return number
 
     async def _read_order_response(self, path: str, limit_id: str) -> Tuple[str, Optional[Dict[str, Any]]]:
         """

@@ -1175,6 +1175,48 @@ class RangeIcebergExecutorTests(IsolatedAsyncioWrapperTestCase):
         self._run(executor.control_task())
         self.assertEqual(2, len(self.buy_ids))
 
+    def test_open_order_page_failure_sends_no_child(self):
+        from hummingbot.connector.derivative.mexc_perpetual import mexc_perpetual_constants as CONSTANTS
+        from hummingbot.connector.derivative.mexc_perpetual.mexc_perpetual_derivative import (
+            MexcPerpetualDerivative,
+        )
+        from bidict import bidict
+
+        self._book(Decimal("0.07815"), Decimal("0.07816"))
+        exchange = MexcPerpetualDerivative(
+            mexc_perpetual_api_key="key",
+            mexc_perpetual_api_secret="secret",
+            trading_pairs=["AIOT-USDT"],
+            trading_required=True,
+        )
+        exchange._set_trading_pair_symbol_map(bidict({"AIOT_USDT": "AIOT-USDT"}))
+        exchange._contract_sizes["AIOT-USDT"] = Decimal("10")
+        previous_size = CONSTANTS.OPEN_ORDERS_PAGE_SIZE
+        CONSTANTS.OPEN_ORDERS_PAGE_SIZE = 1
+
+        async def get(path_url, params=None, **kwargs):
+            if path_url == CONSTANTS.OPEN_POSITIONS_PATH:
+                return {"success": True, "code": 0, "data": []}
+            page = int((params or {}).get("page_num") or 0)
+            if path_url == CONSTANTS.OPEN_ORDERS_PATH and page == 1:
+                return {
+                    "success": True,
+                    "code": 0,
+                    "data": [{"symbol": "AIOT_USDT", "side": 1, "vol": 1, "dealVol": 0}],
+                }
+            if path_url == CONSTANTS.OPEN_ORDERS_PATH and page >= 2:
+                raise IOError("open order page failed")
+            return {"success": True, "code": 0, "data": []}
+
+        exchange._api_get = get
+        self.connector.ground_truth_exposure = exchange.ground_truth_exposure
+        executor = self._up_to(total_amount=Decimal("1000"), slice_amount=Decimal("1000"))
+        try:
+            self._run(executor.control_task())
+        finally:
+            CONSTANTS.OPEN_ORDERS_PAGE_SIZE = previous_size
+        self.assertEqual([], self.buy_ids)
+
     def test_websocket_open_then_empty_lookup_does_not_buy_again(self):
         import json
 

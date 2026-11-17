@@ -1162,3 +1162,130 @@ class MexcPerpetualReviewFixTests(IsolatedAsyncioWrapperTestCase):
         )
         self.assertEqual(99, captured["data"]["positionId"])
         self.assertEqual(CONSTANTS.SIDE_CLOSE_LONG, captured["data"]["side"])
+
+    async def test_mixed_contract_page_counts_only_this_symbol(self):
+        self.exchange._contract_sizes[self.trading_pair] = Decimal("10")
+        calls = []
+
+        async def get(path_url, params=None, **kwargs):
+            calls.append((path_url, params))
+            if path_url == CONSTANTS.OPEN_POSITIONS_PATH:
+                return {
+                    "success": True,
+                    "code": 0,
+                    "data": [
+                        {"symbol": "AIOT_USDT", "positionType": 1, "holdVol": 34},
+                        {"symbol": "BTC_USDT", "positionType": 1, "holdVol": 5},
+                    ],
+                }
+            return {
+                "success": True,
+                "code": 0,
+                "data": [
+                    {"symbol": "AIOT_USDT", "side": 1, "vol": 10, "dealVol": 0},
+                    {"symbol": "AIOT_USDT", "side": 2, "vol": 7, "dealVol": 0},
+                    {"symbol": "BTC_USDT", "side": 1, "vol": 10, "dealVol": 0},
+                    {"symbol": "AIOT_USDT", "side": 4, "vol": 50, "dealVol": 0},
+                ],
+            }
+
+        self.exchange._api_get = get
+        position, open_size = await self.exchange.ground_truth_exposure(self.trading_pair, TradeType.BUY)
+        self.assertEqual(Decimal("340"), position)
+        self.assertEqual(Decimal("170"), open_size)
+        order_calls = [call for call in calls if call[0] != CONSTANTS.OPEN_POSITIONS_PATH]
+        self.assertEqual([(CONSTANTS.OPEN_ORDERS_PATH, {"page_num": 1, "page_size": CONSTANTS.OPEN_ORDERS_PAGE_SIZE})], order_calls)
+        self.assertEqual({"symbol": "AIOT_USDT"}, calls[0][1])
+
+    async def test_open_orders_are_counted_across_pages(self):
+        self.exchange._contract_sizes[self.trading_pair] = Decimal("10")
+        previous_size = CONSTANTS.OPEN_ORDERS_PAGE_SIZE
+        CONSTANTS.OPEN_ORDERS_PAGE_SIZE = 2
+        pages = {
+            1: [
+                {"symbol": "AIOT_USDT", "side": 1, "vol": 10, "dealVol": 0},
+                {"symbol": "BTC_USDT", "side": 1, "vol": 10, "dealVol": 0},
+            ],
+            2: [
+                {"symbol": "AIOT_USDT", "side": 1, "vol": 6, "dealVol": 1},
+            ],
+        }
+        seen = []
+
+        async def get(path_url, params=None, **kwargs):
+            if path_url == CONSTANTS.OPEN_POSITIONS_PATH:
+                return {"success": True, "code": 0, "data": []}
+            seen.append(params)
+            page = int((params or {}).get("page_num") or 0)
+            return {"success": True, "code": 0, "data": pages.get(page, [])}
+
+        self.exchange._api_get = get
+        try:
+            position, open_size = await self.exchange.ground_truth_exposure(self.trading_pair, TradeType.BUY)
+        finally:
+            CONSTANTS.OPEN_ORDERS_PAGE_SIZE = previous_size
+        self.assertEqual(Decimal("0"), position)
+        self.assertEqual(Decimal("150"), open_size)
+        self.assertEqual([{"page_num": 1, "page_size": 2}, {"page_num": 2, "page_size": 2}], seen)
+
+    async def test_open_orders_stop_when_the_documented_total_is_reached(self):
+        self.exchange._contract_sizes[self.trading_pair] = Decimal("10")
+        previous_size = CONSTANTS.OPEN_ORDERS_PAGE_SIZE
+        CONSTANTS.OPEN_ORDERS_PAGE_SIZE = 2
+        seen = []
+
+        async def get(path_url, params=None, **kwargs):
+            if path_url == CONSTANTS.OPEN_POSITIONS_PATH:
+                return {"success": True, "code": 0, "data": []}
+            seen.append(params)
+            page = int((params or {}).get("page_num") or 0)
+            if page == 1:
+                rows = [
+                    {"symbol": "AIOT_USDT", "side": 1, "vol": 1, "dealVol": 0},
+                    {"symbol": "AIOT_USDT", "side": 1, "vol": 1, "dealVol": 0},
+                ]
+            elif page == 2:
+                rows = [
+                    {"symbol": "AIOT_USDT", "side": 1, "vol": 1, "dealVol": 0},
+                    {"symbol": "BTC_USDT", "side": 1, "vol": 9, "dealVol": 0},
+                ]
+            else:
+                rows = [{"symbol": "AIOT_USDT", "side": 1, "vol": 50, "dealVol": 0}]
+            return {
+                "success": True,
+                "code": 0,
+                "data": {"totalCount": 4, "totalPage": 2, "resultList": rows},
+            }
+
+        self.exchange._api_get = get
+        try:
+            position, open_size = await self.exchange.ground_truth_exposure(self.trading_pair, TradeType.BUY)
+        finally:
+            CONSTANTS.OPEN_ORDERS_PAGE_SIZE = previous_size
+        self.assertEqual(Decimal("0"), position)
+        self.assertEqual(Decimal("30"), open_size)
+        self.assertEqual([{"page_num": 1, "page_size": 2}, {"page_num": 2, "page_size": 2}], seen)
+
+    async def test_open_order_page_limit_fails_the_read(self):
+        self.exchange._contract_sizes[self.trading_pair] = Decimal("10")
+        previous_size = CONSTANTS.OPEN_ORDERS_PAGE_SIZE
+        previous_pages = CONSTANTS.OPEN_ORDERS_MAX_PAGES
+        CONSTANTS.OPEN_ORDERS_PAGE_SIZE = 1
+        CONSTANTS.OPEN_ORDERS_MAX_PAGES = 2
+
+        async def get(path_url, params=None, **kwargs):
+            if path_url == CONSTANTS.OPEN_POSITIONS_PATH:
+                return {"success": True, "code": 0, "data": []}
+            return {
+                "success": True,
+                "code": 0,
+                "data": [{"symbol": "AIOT_USDT", "side": 1, "vol": 1, "dealVol": 0}],
+            }
+
+        self.exchange._api_get = get
+        try:
+            with self.assertRaises(IOError):
+                await self.exchange.ground_truth_exposure(self.trading_pair, TradeType.BUY)
+        finally:
+            CONSTANTS.OPEN_ORDERS_PAGE_SIZE = previous_size
+            CONSTANTS.OPEN_ORDERS_MAX_PAGES = previous_pages
