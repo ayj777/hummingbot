@@ -103,8 +103,75 @@ class MexcPerpetualAPIOrderBookDataSourceTests(IsolatedAsyncioWrapperTestCase):
         self.assertEqual(["100", "10"], diff.content["asks"][0])
         self.assertEqual(["99", "0"], diff.content["bids"][0])
 
-    def test_depth_gap_does_not_apply_the_stale_diff(self):
+    def test_stale_depth_version_is_ignored(self):
+        self.data_source._last_depth_version[self.exchange_symbol] = 100
+        queue = asyncio.Queue()
+        message = {
+            "channel": CONSTANTS.WS_DEPTH_CHANNEL,
+            "symbol": self.exchange_symbol,
+            "data": {"asks": [[1, 5, 1]], "bids": [], "begin": 99, "end": 90},
+            "ts": 1,
+        }
+        self.async_run_with_timeout(self.data_source._parse_order_book_diff_message(message, queue))
+        self.assertTrue(queue.empty())
+        self.assertEqual(100, self.data_source._last_depth_version[self.exchange_symbol])
+
+    def test_diffs_wait_for_a_snapshot_after_reconnect(self):
+        self.data_source._diffs_need_snapshot = True
+        self.data_source._last_depth_version[self.exchange_symbol] = 100
+        queue = asyncio.Queue()
+        message = {
+            "channel": CONSTANTS.WS_DEPTH_CHANNEL,
+            "symbol": self.exchange_symbol,
+            "data": {"asks": [[1, 5, 1]], "bids": [], "begin": 101, "end": 101},
+            "ts": 1,
+        }
+        self.async_run_with_timeout(self.data_source._parse_order_book_diff_message(message, queue))
+        self.assertTrue(queue.empty())
+        self.assertEqual(100, self.data_source._last_depth_version.get(self.exchange_symbol))
+
+    @aioresponses()
+    def test_small_depth_gap_is_repaired_from_depth_commits(self, mock_api):
         self.data_source._last_depth_version[self.exchange_symbol] = 10
+        url = web_utils.public_rest_url(
+            CONSTANTS.DEPTH_COMMITS_PATH.format(symbol=self.exchange_symbol, limit=1000)
+        )
+        mock_api.get(
+            re.compile(f"^{re.escape(url)}.*"),
+            body=json.dumps({
+                "success": True,
+                "code": 0,
+                "data": [
+                    {"asks": [[100, 2, 1]], "bids": [], "version": 12},
+                    {"asks": [[100, 3, 1]], "bids": [], "version": 11},
+                ],
+            }),
+        )
+        queue = asyncio.Queue()
+        message = {
+            "channel": CONSTANTS.WS_DEPTH_CHANNEL,
+            "symbol": self.exchange_symbol,
+            "data": {"asks": [[100, 4, 1]], "bids": [], "begin": 12, "end": 12},
+            "ts": 1,
+        }
+        self.async_run_with_timeout(self.data_source._parse_order_book_diff_message(message, queue))
+        self.assertFalse(queue.empty())
+        versions = []
+        while not queue.empty():
+            versions.append(queue.get_nowait().update_id)
+        self.assertIn(11, versions)
+        self.assertGreaterEqual(self.data_source._last_depth_version[self.exchange_symbol], 12)
+
+    @aioresponses()
+    def test_depth_gap_does_not_apply_the_stale_diff(self, mock_api):
+        self.data_source._last_depth_version[self.exchange_symbol] = 10
+        commits = web_utils.public_rest_url(
+            CONSTANTS.DEPTH_COMMITS_PATH.format(symbol=self.exchange_symbol, limit=1000)
+        )
+        mock_api.get(
+            re.compile(f"^{re.escape(commits)}.*"),
+            body=json.dumps({"success": True, "code": 0, "data": []}),
+        )
         queue = asyncio.Queue()
         message = {
             "channel": CONSTANTS.WS_DEPTH_CHANNEL,

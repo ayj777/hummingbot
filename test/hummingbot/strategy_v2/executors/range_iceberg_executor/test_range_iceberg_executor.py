@@ -505,3 +505,210 @@ class RangeIcebergExecutorTests(IsolatedAsyncioWrapperTestCase):
         self.assertEqual(1, len(self.buy_ids))
         self.assertLessEqual(self.buy_ids[0][2], Decimal("0.09"))
         self.assertEqual(0, self.buy_ids[0][1] % Decimal("10"))
+
+    def test_reprice_does_not_replace_a_child_until_the_fill_is_counted(self):
+        self._book(Decimal("0.07815"), Decimal("0.07816"))
+        executor = self._up_to(total_amount=Decimal("1000"), slice_amount=Decimal("1000"))
+        self._run(executor.control_task())
+        self.assertEqual(Decimal("1000"), self.buy_ids[0][1])
+        order = self.orders["buy-1"]
+        order.current_state = OrderState.CANCELED
+        order.executed_amount_base = Decimal("0")
+        order.reported_deal_base = Decimal("340")
+        self._book(Decimal("0.07829"), Decimal("0.07830"))
+        self._run(executor.control_task())
+        self.assertEqual(1, len(self.buy_ids))
+        order.executed_amount_base = Decimal("340")
+        order.executed_amount_quote = Decimal("340") * Decimal("0.07816")
+        self._run(executor.control_task())
+        self.assertEqual(2, len(self.buy_ids))
+        self.assertEqual(Decimal("660"), self.buy_ids[1][1])
+        self.assertEqual("660", executor.get_custom_info()["unfilled_amount"])
+
+    def test_filled_child_is_not_replaced_while_its_fill_is_still_missing(self):
+        self._book(Decimal("0.07815"), Decimal("0.07816"))
+        executor = self._up_to(total_amount=Decimal("410"), slice_amount=Decimal("410"))
+        self._run(executor.control_task())
+        order = self.orders["buy-1"]
+        order.current_state = OrderState.FILLED
+        order.executed_amount_base = Decimal("0")
+        order.reported_deal_base = Decimal("410")
+        self._run(executor.control_task())
+        self.assertEqual(1, len(self.buy_ids))
+        order.executed_amount_base = Decimal("410")
+        order.executed_amount_quote = Decimal("410") * Decimal("0.07816")
+        self._run(executor.control_task())
+        self.assertEqual(1, len(self.buy_ids))
+        self.assertEqual(CloseType.COMPLETED, executor.close_type)
+
+    def test_carry_does_not_buy_a_delayed_fill_again(self):
+        self._book(Decimal("0.07815"), Decimal("0.07816"))
+        executor = self._up_to(
+            total_amount=Decimal("1000"),
+            slice_amount=Decimal("1000"),
+            duration=100,
+            schedule_slices=2,
+            catch_up=CatchUpPolicy.CARRY,
+        )
+        self._run(executor.control_task())
+        order = self.orders["buy-1"]
+        order.current_state = OrderState.CANCELED
+        order.executed_amount_base = Decimal("0")
+        order.reported_deal_base = Decimal("340")
+        self.now = 1_050
+        self._book(Decimal("0.07829"), Decimal("0.07830"))
+        self._run(executor.control_task())
+        self.assertEqual(1, len(self.buy_ids))
+        self.assertEqual(Decimal("0"), executor._schedule.skipped)
+
+    def test_skip_drops_blocked_windows_while_an_older_slice_rests_at_the_cap(self):
+        self._book(Decimal("0.094"), Decimal("0.095"))
+        executor = self._up_to(
+            total_amount=Decimal("10000"),
+            duration=86400,
+            schedule_slices=24,
+            cap_behavior=CapBehavior.REST_AT_CAP,
+            catch_up=CatchUpPolicy.SKIP,
+        )
+        self._run(executor.control_task())
+        self.assertEqual(1, len(self.buy_ids))
+        self.assertEqual(Decimal("0.09"), self.buy_ids[0][2])
+        self.now = 1_000 + 23 * 3600
+        self._run(executor.control_task())
+        self.assertGreater(executor._schedule.skipped, Decimal("9000"))
+        self.assertLess(executor._placeable(), Decimal("1000"))
+        self.assertEqual(1, len(self.buy_ids))
+
+    def test_size_jitter_cannot_push_the_child_over_the_parent_total(self):
+        executor = self._executor(
+            size_unit=SizeUnit.BASE,
+            total_amount=Decimal("100"),
+            levels=2,
+            iceberg=False,
+            visible_count=2,
+            size_jitter_pct=Decimal("0.5"),
+        )
+        executor._rng.random = lambda: 1.0
+        self._run(executor.control_task())
+        self._run(executor.control_task())
+        placed = sum(amount for _order_id, amount, _price, _order_type, _action in self.buy_ids)
+        self.assertGreaterEqual(len(self.buy_ids), 1)
+        self.assertLessEqual(placed, Decimal("100"))
+        for _order_id, amount, _price, _order_type, _action in self.buy_ids:
+            self.assertLessEqual(amount, Decimal("100"))
+
+    def test_off_grid_range_fails_and_does_not_trade(self):
+        self.connector.trading_rules["AIOT-USDT"] = TradingRule(
+            trading_pair="AIOT-USDT",
+            min_order_size=Decimal("10"),
+            min_price_increment=Decimal("0.0001"),
+            min_base_amount_increment=Decimal("10"),
+        )
+        executor = self._executor(
+            size_unit=SizeUnit.BASE,
+            total_amount=Decimal("100"),
+            price_low=Decimal("0.08001"),
+            price_high=Decimal("0.08005"),
+            levels=3,
+        )
+        self.assertEqual(CloseType.FAILED, executor.close_type)
+        self._run(executor.control_task())
+        self.assertEqual(0, len(self.buy_ids))
+        for slot in executor._slices:
+            self.assertGreaterEqual(slot.target_price, Decimal("0.08001"))
+            self.assertLessEqual(slot.target_price, Decimal("0.08005"))
+
+    def test_exchange_must_confirm_leverage_and_isolated_margin_before_the_first_child(self):
+        calls = []
+
+        async def confirm(pair, leverage, mode):
+            calls.append((pair, int(leverage), str(getattr(mode, "value", mode))))
+            return False
+
+        self.connector.confirm_leverage_and_margin = confirm
+        executor = self._up_to(
+            total_amount=Decimal("100"),
+            slice_amount=Decimal("100"),
+            leverage=2,
+            margin_mode="ISOLATED",
+        )
+        self._run(executor.control_task())
+        self.assertEqual([("AIOT-USDT", 2, "ISOLATED")], calls)
+        self.assertEqual(0, len(self.buy_ids))
+        self.assertEqual(CloseType.FAILED, executor.close_type)
+
+        calls.clear()
+        self.buy_ids.clear()
+
+        async def accept(pair, leverage, mode):
+            calls.append((pair, int(leverage), str(getattr(mode, "value", mode))))
+            return True
+
+        self.connector.confirm_leverage_and_margin = accept
+        self._book(Decimal("0.07815"), Decimal("0.07816"))
+        executor = self._up_to(
+            total_amount=Decimal("100"),
+            slice_amount=Decimal("100"),
+            leverage=2,
+            margin_mode="ISOLATED",
+        )
+        self._run(executor.control_task())
+        self.assertEqual([("AIOT-USDT", 2, "ISOLATED")], calls)
+        self.assertEqual(1, len(self.buy_ids))
+
+    def test_failed_create_cancels_that_client_id_before_a_replacement(self):
+        from hummingbot.core.event.events import MarketOrderFailureEvent
+
+        self._book(Decimal("0.07815"), Decimal("0.07816"))
+        executor = self._up_to(total_amount=Decimal("100"), slice_amount=Decimal("100"))
+        self._run(executor.control_task())
+        self.cancel_confirmed = False
+        self.connector.is_cancel_confirmed = lambda order_id: self.cancel_confirmed
+        executor.process_order_failed_event(
+            0,
+            None,
+            MarketOrderFailureEvent(self.now, "buy-1", OrderType.LIMIT),
+        )
+        self.strategy.cancel.assert_called_with("mexc_perpetual", "AIOT-USDT", "buy-1")
+        self._run(executor.control_task())
+        self.assertEqual(1, len(self.buy_ids))
+        self.cancel_confirmed = True
+        self._run(executor.control_task())
+        self.assertEqual(2, len(self.buy_ids))
+
+    def test_stop_cancels_a_child_that_is_not_tracked_yet(self):
+        self._book(Decimal("0.07815"), Decimal("0.07816"))
+        executor = self._up_to(total_amount=Decimal("100"), slice_amount=Decimal("100"))
+        self._run(executor.control_task())
+        self.orders.clear()
+        executor._slices[0].tracked.order = None
+        executor.early_stop()
+        self.strategy.cancel.assert_called_with("mexc_perpetual", "AIOT-USDT", "buy-1")
+
+    def test_rounding_remainder_is_tracked_and_folded_without_exceeding_the_total(self):
+        self._book(Decimal("0.084"), Decimal("0.085"))
+        executor = self._up_to(
+            total_amount=Decimal("10000"),
+            slice_amount=None,
+            levels=24,
+            duration=86400,
+            schedule_slices=24,
+        )
+        self._run(executor.control_task())
+        self.assertEqual(Decimal("410"), self.buy_ids[0][1])
+        info = executor.get_custom_info()
+        self.assertIn("rounding_remainder", info)
+        self.assertEqual(Decimal("10000") / Decimal("24") - Decimal("410"), Decimal(info["rounding_remainder"]))
+        placed = Decimal("0")
+        for index in range(23):
+            order_id = self.buy_ids[-1][0]
+            self.orders[order_id].executed_amount_base = self.buy_ids[-1][1]
+            self.orders[order_id].executed_amount_quote = self.buy_ids[-1][1] * Decimal("0.085")
+            self.orders[order_id].current_state = OrderState.FILLED
+            self.now = 1_000 + (index + 1) * 3600
+            self._run(executor.control_task())
+            placed = sum(amount for _order_id, amount, _price, _order_type, _action in self.buy_ids)
+            self.assertLessEqual(placed, Decimal("10000"))
+        remainder = Decimal(executor.get_custom_info()["rounding_remainder"])
+        self.assertLess(remainder, Decimal("10"))
+        self.assertEqual(Decimal("10000"), placed + remainder)

@@ -20,6 +20,8 @@ MARKET_ORDER_DEFAULT_LEVELS = 20
 # Feature is under maintenance / the futures system is under maintenance.
 MAINTENANCE_ERROR_CODES = {604, 801}
 ORDER_NOT_FOUND_ERROR_CODES = {2040}
+# The order can no longer be canceled. That is what a fill looks like on the cancel endpoint.
+ORDER_CANNOT_CANCEL_ERROR_CODE = 2041
 
 # Order side: 1 open long, 2 close short, 3 open short, 4 close long.
 SIDE_OPEN_LONG = 1

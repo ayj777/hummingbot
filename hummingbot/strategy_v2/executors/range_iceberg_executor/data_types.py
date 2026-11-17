@@ -48,6 +48,13 @@ class CatchUpPolicy(str, Enum):
     SKIP = "SKIP"
 
 
+class MarginMode(str, Enum):
+    """Margin mode sent as openType. Isolated is the default for this executor."""
+
+    ISOLATED = "ISOLATED"
+    CROSS = "CROSS"
+
+
 class RangeIcebergExecutorConfig(ExecutorConfigBase):
     """
     Buy or sell a total size as a range ladder or as an up-to iceberg.
@@ -88,6 +95,7 @@ class RangeIcebergExecutorConfig(ExecutorConfigBase):
     max_slippage: Optional[Decimal] = None
     reduce_only: bool = False
     leverage: int = 1
+    margin_mode: MarginMode = MarginMode.ISOLATED
     random_seed: Optional[int] = None
 
     @field_validator("side", mode="before")
@@ -96,6 +104,14 @@ class RangeIcebergExecutorConfig(ExecutorConfigBase):
         if isinstance(value, str):
             return TradeType[value.upper()]
         return value
+
+    @field_validator("margin_mode", mode="before")
+    @classmethod
+    def parse_margin_mode(cls, value):
+        text = str(getattr(value, "value", value)).upper()
+        if text not in (MarginMode.ISOLATED.value, MarginMode.CROSS.value):
+            raise ValueError(f"margin_mode ({value}) must be ISOLATED or CROSS")
+        return MarginMode(text)
 
     @property
     def duration_seconds(self) -> Optional[float]:

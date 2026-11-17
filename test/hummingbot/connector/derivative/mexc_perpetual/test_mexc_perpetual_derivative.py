@@ -287,6 +287,8 @@ class MexcPerpetualDerivativeTests(AbstractPerpetualDerivativeTests.PerpetualDer
             rate=Decimal(str(self.target_funding_payment_funding_rate)),
         )
         exchange._perpetual_trading._funding_info[self.trading_pair] = funding_info
+        exchange._contract_sizes[self.trading_pair] = Decimal("10")
+        exchange._position_mode_confirmed = True
         return exchange
 
     def validate_auth_credentials_present(self, request_call: RequestCall):
@@ -301,10 +303,11 @@ class MexcPerpetualDerivativeTests(AbstractPerpetualDerivativeTests.PerpetualDer
         position_action = order.position if order.position is not PositionAction.NIL else PositionAction.OPEN
         self.assertEqual(self.exchange_trading_pair, request_data["symbol"])
         self.assertEqual(order.client_order_id, request_data["externalOid"])
-        self.assertEqual(order.amount, Decimal(request_data["vol"]))
+        self.assertEqual(order.amount / self.exchange.get_contract_size(self.trading_pair), Decimal(str(request_data["vol"])))
+        self.assertIsInstance(request_data["vol"], (int, float))
         self.assertEqual(self.exchange._exchange_side(order.trade_type, position_action), request_data["side"])
         self.assertEqual(CONSTANTS.ORDER_TYPE_MAP[order.order_type], request_data["type"])
-        self.assertEqual(CONSTANTS.OPEN_TYPE_CROSS, request_data["openType"])
+        self.assertEqual(CONSTANTS.OPEN_TYPE_ISOLATED, request_data["openType"])
         self.assertEqual(int(self.exchange.get_leverage(self.trading_pair)), request_data["leverage"])
         if order.order_type.is_limit_type():
             self.assertEqual(order.price, Decimal(request_data["price"]))
@@ -319,8 +322,24 @@ class MexcPerpetualDerivativeTests(AbstractPerpetualDerivativeTests.PerpetualDer
     def validate_trades_request(self, order: InFlightOrder, request_call: RequestCall):
         self.assertFalse(request_call.kwargs.get("params"))
 
-    def _mock_response(self, mock_api, url, response: Dict[str, Any], method: str = "get", callback: Optional[Callable] = None):
-        getattr(mock_api, method)(url, body=json.dumps(response), callback=callback)
+    def _contracts_text(self, base_amount: Any) -> str:
+        size = self.exchange._contract_sizes.get(self.trading_pair, Decimal("1"))
+        value = Decimal(str(base_amount)) / size
+        text = format(value, "f")
+        if "." in text:
+            text = text.rstrip("0").rstrip(".")
+        return text or "0"
+
+    def _mock_response(
+        self,
+        mock_api,
+        url,
+        response: Dict[str, Any],
+        method: str = "get",
+        callback: Optional[Callable] = None,
+        repeat: bool = False,
+    ):
+        getattr(mock_api, method)(url, body=json.dumps(response), callback=callback, repeat=repeat)
         return url
 
     def configure_successful_cancelation_response(
@@ -329,6 +348,12 @@ class MexcPerpetualDerivativeTests(AbstractPerpetualDerivativeTests.PerpetualDer
         mock_api: aioresponses,
         callback: Optional[Callable] = lambda *args, **kwargs: None,
     ) -> str:
+        self._mock_response(
+            mock_api,
+            self._status_url(order),
+            self._order_status_body(order, state=4, deal_vol="0"),
+            repeat=True,
+        )
         return self._mock_response(
             mock_api,
             self.cancel_url,
@@ -382,8 +407,8 @@ class MexcPerpetualDerivativeTests(AbstractPerpetualDerivativeTests.PerpetualDer
             "symbol": self.exchange_trading_pair,
             "externalOid": order.client_order_id,
             "price": str(order.price),
-            "vol": str(order.amount),
-            "dealVol": deal_vol,
+            "vol": self._contracts_text(order.amount),
+            "dealVol": self._contracts_text(deal_vol),
             "dealAvgPrice": str(order.price),
             "state": state,
             "side": 1,
@@ -470,7 +495,7 @@ class MexcPerpetualDerivativeTests(AbstractPerpetualDerivativeTests.PerpetualDer
             "symbol": self.exchange_trading_pair,
             "orderId": order.exchange_order_id,
             "price": str(price),
-            "vol": str(amount),
+            "vol": self._contracts_text(amount),
             "fee": "0.1",
             "feeCurrency": self.quote_asset,
             "timestamp": 1640780000000,
@@ -521,8 +546,8 @@ class MexcPerpetualDerivativeTests(AbstractPerpetualDerivativeTests.PerpetualDer
                 "symbol": self.exchange_trading_pair,
                 "externalOid": order.client_order_id,
                 "price": str(order.price),
-                "vol": str(order.amount),
-                "dealVol": deal_vol,
+                "vol": self._contracts_text(order.amount),
+                "dealVol": self._contracts_text(deal_vol),
                 "state": state,
                 "side": 1,
             },
@@ -547,7 +572,7 @@ class MexcPerpetualDerivativeTests(AbstractPerpetualDerivativeTests.PerpetualDer
                 "orderId": order.exchange_order_id,
                 "externalOid": order.client_order_id,
                 "price": str(order.price),
-                "vol": str(order.amount),
+                "vol": self._contracts_text(order.amount),
                 "fee": "0.1",
                 "feeCurrency": self.quote_asset,
                 "timestamp": 1640780000000,
@@ -563,7 +588,7 @@ class MexcPerpetualDerivativeTests(AbstractPerpetualDerivativeTests.PerpetualDer
             "data": {
                 "symbol": self.exchange_trading_pair,
                 "positionType": 2,
-                "holdVol": str(order.amount),
+                "holdVol": self._contracts_text(order.amount),
                 "holdAvgPrice": str(order.price),
                 "leverage": 2,
                 "pnl": unrealized_pnl,
@@ -700,7 +725,8 @@ class MexcPerpetualDerivativeTests(AbstractPerpetualDerivativeTests.PerpetualDer
         self.place_buy_order(amount=Decimal("100"), price=Decimal("1"))
         self.async_run_with_timeout(request_sent_event.wait())
         payload = json.loads(self._all_executed_requests(mock_api, self.order_creation_url)[0].kwargs["data"])
-        self.assertEqual("10", payload["vol"])
+        self.assertEqual(10, payload["vol"])
+        self.assertIsInstance(payload["vol"], int)
 
     @aioresponses()
     def test_create_failure_looks_up_the_client_order_id_before_giving_up(self, mock_api):
@@ -745,9 +771,9 @@ class MexcPerpetualDerivativeTests(AbstractPerpetualDerivativeTests.PerpetualDer
             self.assertIn(str(code), str(raised.exception))
 
     def test_margin_mode_changes_the_open_type_sent_with_orders(self):
-        self.assertEqual(CONSTANTS.OPEN_TYPE_CROSS, self.exchange._open_type())
-        self.async_run_with_timeout(self.exchange.set_margin_mode(MarginMode.ISOLATED))
         self.assertEqual(CONSTANTS.OPEN_TYPE_ISOLATED, self.exchange._open_type())
+        self.async_run_with_timeout(self.exchange.set_margin_mode(MarginMode.CROSS))
+        self.assertEqual(CONSTANTS.OPEN_TYPE_CROSS, self.exchange._open_type())
 
     @aioresponses()
     def test_user_stream_position_snapshot_converts_contract_size(self, mock_api):

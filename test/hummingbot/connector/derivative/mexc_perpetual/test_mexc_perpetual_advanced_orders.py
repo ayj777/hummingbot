@@ -24,6 +24,7 @@ class MexcPerpetualAdvancedOrderTests(IsolatedAsyncioWrapperTestCase):
         )
         self.exchange._set_trading_pair_symbol_map(bidict({"AIOT_USDT": "AIOT-USDT"}))
         self.exchange._contract_sizes["AIOT-USDT"] = Decimal("10")
+        self.exchange._position_mode_confirmed = True
         self.exchange._set_current_timestamp(1_700_000_000)
 
     def _regex(self, path: str):
@@ -64,9 +65,11 @@ class MexcPerpetualAdvancedOrderTests(IsolatedAsyncioWrapperTestCase):
         self.assertEqual(7, payload["leverage"])
         self.assertEqual(CONSTANTS.POSITION_MODE_HEDGE, payload["positionMode"])
         self.assertTrue(payload["reduceOnly"])
-        self.assertEqual("10", payload["vol"])
-        self.assertEqual("0.07", payload["stopLossPrice"])
-        self.assertEqual("0.1", payload["takeProfitPrice"])
+        self.assertEqual(10, payload["vol"])
+        self.assertIsInstance(payload["price"], (int, float))
+        self.assertIsInstance(payload["vol"], int)
+        self.assertEqual(0.07, payload["stopLossPrice"])
+        self.assertEqual(0.1, payload["takeProfitPrice"])
         self.assertEqual(2, payload["lossTrend"])
         self.assertEqual(3, payload["profitTrend"])
 
@@ -97,7 +100,7 @@ class MexcPerpetualAdvancedOrderTests(IsolatedAsyncioWrapperTestCase):
         placed = self._payload(mock_api, CONSTANTS.PLAN_ORDER_PLACE_PATH)
         self.assertEqual(CONSTANTS.ORDER_TYPE_IOC, placed["orderType"])
         self.assertEqual(CONSTANTS.SIDE_CLOSE_LONG, placed["side"])
-        self.assertEqual("2", placed["vol"])
+        self.assertEqual(2, placed["vol"])
         self.assertTrue(placed["reduceOnly"])
 
         await self.exchange.cancel_plan_orders([{"symbol": "AIOT_USDT", "order_id": "900"}])
@@ -110,7 +113,7 @@ class MexcPerpetualAdvancedOrderTests(IsolatedAsyncioWrapperTestCase):
         self.assertEqual("900", listed[0]["id"])
         changed = self._payload(mock_api, CONSTANTS.PLAN_ORDER_CHANGE_PRICE_PATH)
         self.assertEqual(2, changed["from"])
-        self.assertEqual("0.12", changed["triggerPrice"])
+        self.assertEqual(0.12, changed["triggerPrice"])
 
     @aioresponses()
     async def test_stop_orders_place_list_change_and_cancel(self, mock_api):
@@ -137,8 +140,8 @@ class MexcPerpetualAdvancedOrderTests(IsolatedAsyncioWrapperTestCase):
         self.assertEqual("77", stop_id)
         placed = self._payload(mock_api, CONSTANTS.STOP_ORDER_PLACE_PATH)
         self.assertEqual(15, placed["positionId"])
-        self.assertEqual("5", placed["vol"])
-        self.assertEqual("0.05", placed["stopLossPrice"])
+        self.assertEqual(5, placed["vol"])
+        self.assertEqual(0.05, placed["stopLossPrice"])
         self.assertEqual(2, placed["lossTrend"])
 
         await self.exchange.change_stop_order_price("55", stop_loss_price=Decimal("0.04"), loss_trend=1)
@@ -151,7 +154,7 @@ class MexcPerpetualAdvancedOrderTests(IsolatedAsyncioWrapperTestCase):
         self.assertEqual(55, limit_change["orderId"])
         plan_change = self._payload(mock_api, CONSTANTS.STOP_ORDER_CHANGE_PLAN_PRICE_PATH)
         self.assertEqual(77, plan_change["stopPlanOrderId"])
-        self.assertEqual("0.21", plan_change["takeProfitPrice"])
+        self.assertEqual(0.21, plan_change["takeProfitPrice"])
 
     @aioresponses()
     async def test_batch_orders_send_a_list_and_reject_more_than_fifty(self, mock_api):
@@ -184,7 +187,7 @@ class MexcPerpetualAdvancedOrderTests(IsolatedAsyncioWrapperTestCase):
         self.assertEqual(2, len(result))
         payload = self._payload(mock_api, CONSTANTS.BATCH_ORDER_PATH)
         self.assertEqual(2, len(payload))
-        self.assertEqual("1", payload[0]["vol"])
+        self.assertEqual(1, payload[0]["vol"])
         self.assertEqual(3, payload[0]["leverage"])
         self.assertEqual(CONSTANTS.STP_MODE_NONE, payload[0]["stpMode"])
         self.assertEqual(CONSTANTS.ORDER_TYPE_FOK, payload[1]["type"])

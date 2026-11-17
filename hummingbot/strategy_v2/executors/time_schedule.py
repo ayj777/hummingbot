@@ -61,7 +61,8 @@ class SliceSchedule:
         self.skip_unplaced = skip_unplaced
         self.skipped = Decimal("0")
         self._closed = 0
-        self._filled_checkpoint = Decimal("0")
+        self._assigned = Decimal("0")
+        self._blocked = set()
 
     @property
     def count(self) -> int:
@@ -75,23 +76,31 @@ class SliceSchedule:
         return total
 
     def advance(self, elapsed: float, filled: Decimal, open_amount: Decimal, outside_cap: bool) -> None:
+        """
+        Close every window whose end is at or before elapsed.
+
+        A resting order is placed size, so it can cover only as much budget as it actually
+        occupies. It is applied to the earliest closed windows and does not shield later ones.
+        SKIP drops the unplaced part of a window that was outside the cap at any time it was
+        the active window, including windows closed together in this call.
+        """
         filled = Decimal(str(filled))
         open_amount = Decimal(str(open_amount))
+        if outside_cap and self._closed < len(self.amounts):
+            self._blocked.add(self._closed)
         while self._closed < len(self.amounts):
             end = self.offsets[self._closed + 1] if self._closed + 1 < len(self.offsets) else self.duration
             if elapsed + 1e-9 < end:
                 break
+            if outside_cap:
+                self._blocked.add(self._closed)
             budget = self.amounts[self._closed]
-            filled_in_window = filled - self._filled_checkpoint
-            if filled_in_window < 0:
-                filled_in_window = Decimal("0")
-            shortfall = budget - filled_in_window
-            if shortfall < 0:
-                shortfall = Decimal("0")
-            unplaced = shortfall - open_amount
-            if unplaced < 0:
-                unplaced = Decimal("0")
-            if self.skip_unplaced and outside_cap and unplaced > 0:
+            available = filled + open_amount - self._assigned
+            if available < 0:
+                available = Decimal("0")
+            assigned = budget if available >= budget else available
+            unplaced = budget - assigned
+            if self.skip_unplaced and self._closed in self._blocked and unplaced > 0:
                 self.skipped += unplaced
-            self._filled_checkpoint = filled
+            self._assigned += assigned
             self._closed += 1

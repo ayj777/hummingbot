@@ -96,6 +96,36 @@ class RangeLadderTests(TestCase):
         self.assertEqual(Decimal("0.09"), cap_buy_price(Decimal("0.090019"), step, cap))
         self.assertLessEqual(cap_buy_price(Decimal("0.095"), step, cap), cap)
 
+    def test_band_with_no_tick_inside_it_is_rejected(self):
+        with self.assertRaises(ValueError):
+            build_range_ladder(
+                total_amount=Decimal("100"),
+                size_unit=SizeUnit.BASE,
+                price_low=Decimal("0.08001"),
+                price_high=Decimal("0.08005"),
+                levels=3,
+                distribution=LadderDistribution.LINEAR,
+                weight=Decimal("0"),
+                side=TradeType.BUY,
+                price_step=Decimal("0.0001"),
+                amount_step=Decimal("10"),
+                min_amount=Decimal("10"),
+            )
+        with self.assertRaises(ValueError):
+            build_range_ladder(
+                total_amount=Decimal("100"),
+                size_unit=SizeUnit.BASE,
+                price_low=Decimal("0.08001"),
+                price_high=Decimal("0.08005"),
+                levels=1,
+                distribution=LadderDistribution.LINEAR,
+                weight=Decimal("0"),
+                side=TradeType.SELL,
+                price_step=Decimal("0.0001"),
+                amount_step=Decimal("10"),
+                min_amount=Decimal("10"),
+            )
+
     def test_sell_price_rounds_up_and_never_crosses_below_the_floor(self):
         step = Decimal("0.00001")
         floor = Decimal("0.08")

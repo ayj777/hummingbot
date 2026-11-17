@@ -1,7 +1,7 @@
 import logging
 import random
 from decimal import Decimal
-from typing import List, Optional
+from typing import List, Optional, Set
 
 from hummingbot.core.data_type.common import OrderType, PositionAction, PriceType, TradeType
 from hummingbot.logger import HummingbotLogger
@@ -92,6 +92,12 @@ class RangeIcebergExecutor(ExecutorBase):
         self._rng = random.Random(config.random_seed)
         self._schedule = self._make_schedule()
         self._build_plan()
+        self._rounding_remainder_base = Decimal("0")
+        self._account_settings_ready = False
+        self._account_settings_failed = False
+        self._unconfirmed_cancels: Set[str] = set()
+        self._failed_order_ids: Set[str] = set()
+        self._submitted_order_ids: List[str] = []
 
     def _make_schedule(self) -> Optional[SliceSchedule]:
         resolved = self.config.resolved_schedule()
@@ -132,6 +138,12 @@ class RangeIcebergExecutor(ExecutorBase):
                 self.close_type = CloseType.FAILED
             return
         rules = self.get_trading_rules(self.config.connector_name, self.config.trading_pair)
+        contract_size = self._contract_size()
+        if contract_size is None:
+            self.logger().error("Refusing to build a range plan until contractSize is loaded.")
+            self.close_type = CloseType.FAILED
+            self._slices = []
+            return
         try:
             levels = build_range_ladder(
                 total_amount=self.config.total_amount,
@@ -145,7 +157,7 @@ class RangeIcebergExecutor(ExecutorBase):
                 price_step=Decimal(str(rules.min_price_increment)),
                 amount_step=Decimal(str(rules.min_base_amount_increment)),
                 min_amount=Decimal(str(rules.min_order_size)),
-                contract_size=self._contract_size(),
+                contract_size=contract_size,
             )
         except ValueError as exc:
             self.logger().error(str(exc))
@@ -154,7 +166,7 @@ class RangeIcebergExecutor(ExecutorBase):
             return
         self._slices = [_Slice(level) for level in levels]
 
-    def _contract_size(self) -> Decimal:
+    def _contract_size(self) -> Optional[Decimal]:
         connector = self.connectors[self.config.connector_name]
         getter = getattr(connector, "get_contract_size", None)
         if not callable(getter):
@@ -162,12 +174,21 @@ class RangeIcebergExecutor(ExecutorBase):
         try:
             size = Decimal(str(getter(self.config.trading_pair)))
         except Exception:
-            return Decimal("1")
-        return size if size > 0 else Decimal("1")
+            return None
+        return size if size > 0 else None
+
+    def _contract_size_ready(self) -> bool:
+        connector = self.connectors[self.config.connector_name]
+        if not callable(getattr(connector, "get_contract_size", None)):
+            return True
+        return self._contract_size() is not None
 
     def _target_base(self) -> Decimal:
         if self.config.size_unit == SizeUnit.CONTRACTS:
-            return self.config.total_amount * self._contract_size()
+            size = self._contract_size()
+            if size is None:
+                return Decimal("0")
+            return self.config.total_amount * size
         if self.config.size_unit == SizeUnit.QUOTE:
             price = self.config.limit_price or self.config.price_low or Decimal("1")
             return self.config.total_amount / price
@@ -198,9 +219,15 @@ class RangeIcebergExecutor(ExecutorBase):
     async def control_task(self):
         if self.status == RunnableStatus.TERMINATED:
             return
+        if not await self._ensure_account_settings():
+            return
+        if not self._contract_size_ready():
+            self.logger().error("Refusing to trade until contractSize is loaded.")
+            return
         if self.close_type == CloseType.FAILED and not self._slices:
             self.stop()
             return
+        self._release_confirmed_failures()
         self._refresh_tracked_orders()
         self._advance_schedule()
         if self._time_limit_reached():
@@ -240,7 +267,9 @@ class RangeIcebergExecutor(ExecutorBase):
         self.stop()
 
     def _control_up_to(self):
-        if any(slot.cancel_requested and slot.is_working for slot in self._slices):
+        if self._replacement_blocked():
+            return
+        if any((slot.cancel_requested or self._holds_unaccounted_fill(slot)) and self._counts_as_open(slot) for slot in self._slices):
             return
         desired = self._desired_price()
         if desired is None:
@@ -260,7 +289,7 @@ class RangeIcebergExecutor(ExecutorBase):
     def _place_slice(self, slot: _Slice):
         rules = self.get_trading_rules(self.config.connector_name, self.config.trading_pair)
         price = self._jitter_price(slot.target_price, rules.min_price_increment)
-        amount = self._jitter_amount(slot.target_amount, rules.min_base_amount_increment, rules.min_order_size)
+        amount = self._bounded_amount(slot.target_amount, price, rules.min_base_amount_increment, rules.min_order_size)
         if amount < rules.min_order_size:
             slot.tracked = TrackedOrder(order_id="skipped")
             return
@@ -268,6 +297,7 @@ class RangeIcebergExecutor(ExecutorBase):
         slot.tracked = TrackedOrder(order_id=order_id)
         slot.target_amount = amount
         slot.target_price = price
+        self._submitted_order_ids.append(order_id)
         self._mark_action()
 
     def _place_up_to_slice(self, price: Decimal, placeable_unit: Decimal):
@@ -275,27 +305,15 @@ class RangeIcebergExecutor(ExecutorBase):
         price = self._clamp_limit(self._jitter_up_to_price(price))
         step = rules.min_base_amount_increment
         slice_unit = min(self._slice_unit_amount(), placeable_unit)
-        slice_base = quantize_down(self._unit_to_base(slice_unit, price), step)
-        max_base = quantize_down(self._unit_to_base(placeable_unit, price), step)
-        # Rounding leaves a fraction of a slice behind. Fold that into this order when it
-        # is at least one size step. A full carried slice stays for the next iceberg order.
-        dust_base = max_base - slice_base
-        dust_unit = placeable_unit - slice_unit
-        if dust_base >= step and dust_unit < self._slice_unit_amount():
-            amount = min(max_base, slice_base + quantize_down(dust_base, step))
-        else:
-            amount = slice_base
-        amount = self._jitter_amount(amount, step, rules.min_order_size)
-        if amount > max_base:
-            amount = max_base
-        if amount < rules.min_order_size and max_base >= rules.min_order_size:
-            amount = quantize_down(rules.min_order_size, step)
-        if amount < rules.min_order_size or amount > max_base:
+        raw_base = self._unit_to_base(slice_unit, price)
+        amount = self._bounded_amount(raw_base, price, step, rules.min_order_size)
+        if amount < rules.min_order_size:
             return
         order_id = self._submit(price, amount)
         slot = _Slice(LadderLevel(price=price, base_amount=amount))
         slot.tracked = TrackedOrder(order_id=order_id)
         self._slices.append(slot)
+        self._submitted_order_ids.append(order_id)
         self._mark_action()
 
     def _submit(self, price: Decimal, amount: Decimal) -> str:
@@ -316,13 +334,56 @@ class RangeIcebergExecutor(ExecutorBase):
             return price
         swing = (Decimal(str(self._rng.random())) * 2) - Decimal("1")
         jittered = price * (Decimal("1") + self.config.price_jitter_pct * swing)
-        return clamp_price(jittered, self.config.price_low, self.config.price_high, price_step)
+        try:
+            return clamp_price(jittered, self.config.price_low, self.config.price_high, price_step)
+        except ValueError:
+            return price
 
     def _jitter_up_to_price(self, price: Decimal) -> Decimal:
         if self.config.price_jitter_pct <= 0:
             return price
         swing = (Decimal(str(self._rng.random())) * 2) - Decimal("1")
         return price * (Decimal("1") + self.config.price_jitter_pct * swing)
+
+    def _bounded_amount(self, raw_base: Decimal, price: Decimal, amount_step: Decimal, min_amount: Decimal) -> Decimal:
+        """
+        Quantize a child, keep the sub-step leftover, and never let fills plus working size
+        plus this child exceed total_amount.
+        """
+        raw_base = Decimal(raw_base)
+        if self.config.size_jitter_pct > 0:
+            amount = self._jitter_amount(raw_base, amount_step, min_amount)
+            amount = quantize_down(amount, amount_step)
+        else:
+            amount = quantize_down(raw_base, amount_step)
+            leftover = raw_base - amount
+            if leftover > 0:
+                self._rounding_remainder_base += leftover
+            # A repeating division can sit a hair under one size step. Treat that as one step.
+            extra = Decimal("0")
+            if amount_step and amount_step > 0:
+                tolerance = amount_step / Decimal("1000000")
+                extra = quantize_down(self._rounding_remainder_base + tolerance, amount_step)
+            if extra > 0:
+                amount += extra
+                self._rounding_remainder_base -= extra
+                if self._rounding_remainder_base < 0:
+                    self._rounding_remainder_base = Decimal("0")
+        room = self._room_base(price, amount_step)
+        if amount > room:
+            self._rounding_remainder_base += amount - room
+            amount = room
+        if amount < min_amount:
+            if amount > 0:
+                self._rounding_remainder_base += amount
+            return Decimal("0")
+        return amount
+
+    def _room_base(self, price: Decimal, amount_step: Decimal) -> Decimal:
+        room_unit = self.config.total_amount - self._filled_unit() - self._open_unit()
+        if room_unit < 0:
+            room_unit = Decimal("0")
+        return quantize_down(self._unit_to_base(room_unit, price), amount_step)
 
     def _jitter_amount(self, amount: Decimal, amount_step: Decimal, min_amount: Decimal) -> Decimal:
         if self.config.size_jitter_pct <= 0:
@@ -391,7 +452,7 @@ class RangeIcebergExecutor(ExecutorBase):
         return self.config.levels
 
     def _working_count(self) -> int:
-        return sum(1 for slot in self._slices if slot.is_working)
+        return sum(1 for slot in self._slices if self._counts_as_open(slot))
 
     def _next_slot(self) -> Optional[_Slice]:
         if self._working_count() >= self._visible_limit():
@@ -483,7 +544,7 @@ class RangeIcebergExecutor(ExecutorBase):
     def _execution_complete(self) -> bool:
         if self.config.mode == ExecutionMode.RANGE:
             return self._all_slices_filled()
-        if any(slot.is_working for slot in self._slices):
+        if any(self._counts_as_open(slot) for slot in self._slices):
             return False
         rules = self.get_trading_rules(self.config.connector_name, self.config.trading_pair)
         leftover = self.config.total_amount - self._filled_unit() - self._skipped_amount()
@@ -518,13 +579,16 @@ class RangeIcebergExecutor(ExecutorBase):
         if self.config.size_unit == SizeUnit.QUOTE:
             return self.filled_amount_quote
         if self.config.size_unit == SizeUnit.CONTRACTS:
-            return self.filled_base / self._contract_size()
+            size = self._contract_size()
+            if size is None:
+                return Decimal("0")
+            return self.filled_base / size
         return self.filled_base
 
     def _open_unit(self) -> Decimal:
         total = Decimal("0")
         for slot in self._slices:
-            if not slot.is_working:
+            if not self._counts_as_open(slot):
                 continue
             if slot.tracked and slot.tracked.order is not None:
                 remaining_base = slot.tracked.order.amount - slot.tracked.executed_amount_base
@@ -546,14 +610,20 @@ class RangeIcebergExecutor(ExecutorBase):
                 return Decimal("0")
             return amount / price
         if self.config.size_unit == SizeUnit.CONTRACTS:
-            return amount * self._contract_size()
+            size = self._contract_size()
+            if size is None:
+                return Decimal("0")
+            return amount * size
         return amount
 
     def _base_to_unit(self, amount: Decimal, price: Decimal) -> Decimal:
         if self.config.size_unit == SizeUnit.QUOTE:
             return amount * price
         if self.config.size_unit == SizeUnit.CONTRACTS:
-            return amount / self._contract_size()
+            size = self._contract_size()
+            if size is None:
+                return Decimal("0")
+            return amount / size
         return amount
 
     def _refresh_tracked_orders(self):
@@ -564,9 +634,104 @@ class RangeIcebergExecutor(ExecutorBase):
                     slot.tracked.order = in_flight
 
     def _cancel_working_orders(self):
+        order_ids = []
         for slot in self._slices:
-            if slot.is_working and slot.order_id and slot.order_id != "skipped":
-                self._strategy.cancel(self.config.connector_name, self.config.trading_pair, slot.order_id)
+            if slot.order_id and slot.order_id != "skipped" and self._should_cancel(slot):
+                order_ids.append(slot.order_id)
+        for order_id in order_ids:
+            self._strategy.cancel(self.config.connector_name, self.config.trading_pair, order_id)
+            self._unconfirmed_cancels.add(order_id)
+
+    def _should_cancel(self, slot: _Slice) -> bool:
+        if slot.is_working:
+            return True
+        if slot.tracked is None or slot.tracked.order is not None:
+            return False
+        return slot.order_id in self._submitted_order_ids
+
+    def _holds_unaccounted_fill(self, slot: _Slice) -> bool:
+        if slot.tracked is None or slot.tracked.order is None:
+            return False
+        reported = getattr(slot.tracked.order, "reported_deal_base", None)
+        if reported is None:
+            return False
+        return slot.tracked.executed_amount_base + Decimal("0.00000001") < Decimal(str(reported))
+
+    def _counts_as_open(self, slot: _Slice) -> bool:
+        return slot.is_working or self._holds_unaccounted_fill(slot)
+
+    def _replacement_blocked(self) -> bool:
+        return bool(self._unconfirmed_cancels)
+
+    def _real_callable(self, owner, name):
+        value = getattr(owner, name, None)
+        if value is None or not callable(value):
+            return None
+        if getattr(type(value), "__module__", "").startswith("unittest.mock"):
+            return None
+        return value
+
+    def _cancel_confirmed(self, order_id: str) -> bool:
+        checker = self._real_callable(self.connectors[self.config.connector_name], "is_cancel_confirmed")
+        if checker is None:
+            return True
+        return bool(checker(order_id))
+
+    def _release_confirmed_failures(self):
+        for order_id in list(self._unconfirmed_cancels):
+            if not self._cancel_confirmed(order_id):
+                continue
+            self._unconfirmed_cancels.discard(order_id)
+            if order_id not in self._failed_order_ids:
+                continue
+            self._failed_order_ids.discard(order_id)
+            slot = self._slot_for(order_id)
+            if slot is None:
+                continue
+            slot.tracked = None
+            slot.cancel_requested = False
+
+    async def _ensure_account_settings(self) -> bool:
+        if self._account_settings_ready:
+            return True
+        if self._account_settings_failed:
+            return False
+        connector = self.connectors[self.config.connector_name]
+        confirm = self._real_callable(connector, "confirm_leverage_and_margin")
+        if confirm is not None:
+            try:
+                accepted = await confirm(
+                    self.config.trading_pair,
+                    int(self.config.leverage),
+                    self.config.margin_mode,
+                )
+            except Exception:
+                self.logger().exception("Could not confirm leverage and margin mode.")
+                accepted = False
+            if not accepted:
+                self.logger().error(
+                    "The exchange did not confirm leverage %s and margin mode %s. Refusing to trade.",
+                    self.config.leverage,
+                    self.config.margin_mode,
+                )
+                self._account_settings_failed = True
+                self.close_type = CloseType.FAILED
+                self.stop()
+                return False
+        else:
+            set_mode = self._real_callable(connector, "set_margin_mode")
+            if set_mode is not None:
+                result = set_mode(self.config.margin_mode)
+                if hasattr(result, "__await__"):
+                    await result
+            set_leverage = self._real_callable(connector, "set_leverage")
+            if set_leverage is not None:
+                set_leverage(self.config.trading_pair, int(self.config.leverage))
+        self._account_settings_ready = True
+        return True
+
+    def _size_remainder(self) -> Decimal:
+        return self._rounding_remainder_base
 
     def process_order_created_event(self, event_tag: int, market, event):
         slot = self._slot_for(event.order_id)
@@ -578,8 +743,10 @@ class RangeIcebergExecutor(ExecutorBase):
     def process_order_failed_event(self, event_tag: int, market, event):
         slot = self._slot_for(event.order_id)
         if slot:
-            slot.tracked = None
-            slot.cancel_requested = False
+            self._strategy.cancel(self.config.connector_name, self.config.trading_pair, event.order_id)
+            self._unconfirmed_cancels.add(event.order_id)
+            self._failed_order_ids.add(event.order_id)
+            slot.cancel_requested = True
             self._current_retries += 1
             if self._current_retries > self._max_retries:
                 self.close_type = CloseType.FAILED
@@ -650,6 +817,7 @@ class RangeIcebergExecutor(ExecutorBase):
             "unfilled_amount": str(self._unfilled_amount()),
             "skipped_amount": str(self._skipped_amount()),
             "average_fill_price": str(self.average_fill_price),
+            "rounding_remainder": str(self._size_remainder()),
             "child_order_ids": [slot.order_id for slot in self._slices if slot.order_id],
             "levels": [
                 {

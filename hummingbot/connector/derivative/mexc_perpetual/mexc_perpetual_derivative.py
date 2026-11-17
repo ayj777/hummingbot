@@ -23,6 +23,7 @@ from hummingbot.connector.trading_rule import TradingRule
 from hummingbot.connector.utils import combine_to_hb_trading_pair
 from hummingbot.core.api_throttler.data_types import RateLimit
 from hummingbot.core.data_type.common import OrderType, PositionAction, PositionMode, PositionSide, TradeType
+from hummingbot.connector.client_order_tracker import ClientOrderTracker
 from hummingbot.core.data_type.in_flight_order import InFlightOrder, OrderState, OrderUpdate, TradeUpdate
 from hummingbot.core.data_type.order_book_tracker_data_source import OrderBookTrackerDataSource
 from hummingbot.core.data_type.trade_fee import TokenAmount, TradeFeeBase, TradeFeeSchema
@@ -37,6 +38,31 @@ s_decimal_0 = Decimal("0")
 class MarginMode:
     CROSS = "CROSS"
     ISOLATED = "ISOLATED"
+
+
+class UncertainOrderCreate(Exception):
+    """The exchange did not prove that this client id is absent. Keep the order in flight."""
+
+
+class MexcPerpetualOrderTracker(ClientOrderTracker):
+    """
+    Wait for deal messages on a full fill, then synthesize any quantity the order
+    payload already reported. A cancel records that quantity before the order is done.
+    """
+
+    async def _process_order_update(self, order_update: OrderUpdate):
+        tracked = self.fetch_order(order_update.client_order_id, order_update.exchange_order_id)
+        if tracked is not None and order_update.new_state == OrderState.FILLED and not tracked.is_done:
+            try:
+                await asyncio.wait_for(
+                    tracked.wait_until_completely_filled(),
+                    timeout=self.TRADE_FILLS_WAIT_TIMEOUT,
+                )
+            except asyncio.TimeoutError:
+                self._connector.synthesize_reported_fill(tracked)
+        elif tracked is not None and order_update.new_state == OrderState.CANCELED:
+            self._connector.synthesize_reported_fill(tracked)
+        await super()._process_order_update(order_update)
 
 
 class MexcPerpetualDerivative(PerpetualDerivativePyBase):
@@ -56,8 +82,15 @@ class MexcPerpetualDerivative(PerpetualDerivativePyBase):
         self._trading_required = trading_required
         self._trading_pairs = trading_pairs
         self._contract_sizes: Dict[str, Decimal] = {}
-        # Margin mode is sent as openType on each order. MEXC has no separate account-wide switch.
-        self._margin_mode = MarginMode.CROSS
+        self._position_ids: Dict[Tuple[str, PositionSide], int] = {}
+        # Margin mode is sent as openType on each order. Isolated is the default.
+        self._margin_mode = MarginMode.ISOLATED
+        # Stay false until GET position_mode succeeds. Orders are refused before that.
+        self._position_mode_confirmed = False
+        self._equity_gap: Dict[str, Decimal] = {}
+        self._cancel_requests = set()
+        self._creates_in_flight = set()
+        self._creates_finished = set()
         super().__init__(balance_asset_limit, rate_limits_share_pct)
 
     @property
@@ -123,7 +156,16 @@ class MexcPerpetualDerivative(PerpetualDerivativePyBase):
         return [PositionMode.ONEWAY, PositionMode.HEDGE]
 
     def get_contract_size(self, trading_pair: str) -> Decimal:
-        return self._contract_sizes.get(trading_pair, Decimal("1"))
+        try:
+            size = self._contract_sizes[trading_pair]
+        except KeyError as exc:
+            raise ValueError(f"contractSize for {trading_pair} is not loaded") from exc
+        if size <= s_decimal_0:
+            raise ValueError(f"contractSize for {trading_pair} is not loaded")
+        return size
+
+    def _create_order_tracker(self) -> MexcPerpetualOrderTracker:
+        return MexcPerpetualOrderTracker(connector=self)
 
     def get_buy_collateral_token(self, trading_pair: str) -> str:
         trading_rule = self._trading_rules.get(trading_pair)
@@ -143,9 +185,22 @@ class MexcPerpetualDerivative(PerpetualDerivativePyBase):
         return any(token in text for token in ("timestamp", "request time", "request-time", "recv-window", "recv_window"))
 
     def _is_order_not_found_during_status_update_error(self, status_update_exception: Exception) -> bool:
-        if isinstance(status_update_exception, ValueError):
+        if isinstance(status_update_exception, ValueError) and "not found" in str(status_update_exception).lower():
             return True
         return self._exception_contains_code(status_update_exception, CONSTANTS.ORDER_NOT_FOUND_ERROR_CODES)
+
+    def _is_maintenance_error(self, exception: Exception) -> bool:
+        return self._exception_contains_code(exception, CONSTANTS.MAINTENANCE_ERROR_CODES)
+
+    async def _handle_update_error_for_active_order(self, order: InFlightOrder, error: Exception):
+        if isinstance(error, (asyncio.TimeoutError, TimeoutError)) or self._is_maintenance_error(error):
+            self.logger().warning(
+                "Status update for %s failed without proving the order is gone: %s",
+                order.client_order_id,
+                error,
+            )
+            return
+        await super()._handle_update_error_for_active_order(order, error)
 
     def _is_order_not_found_during_cancelation_error(self, cancelation_exception: Exception) -> bool:
         return self._exception_contains_code(cancelation_exception, CONSTANTS.ORDER_NOT_FOUND_ERROR_CODES)
@@ -261,10 +316,17 @@ class MexcPerpetualDerivative(PerpetualDerivativePyBase):
         if isinstance(results, dict):
             results = [results]
         for item in results:
+            if not isinstance(item, dict):
+                continue
+            self._remember_reported_deal(tracked_order, item)
             error_code = int(item.get("errorCode") or 0)
+            if error_code == CONSTANTS.ORDER_CANNOT_CANCEL_ERROR_CODE:
+                await self._reconcile_uncancelable_order(tracked_order)
+                return False
             if error_code != 0:
                 raise IOError(f"Error: {error_code} - {item.get('errorMsg', '')}")
-        return True
+        accounted = await self._account_for_cancel_fills(tracked_order)
+        return accounted
 
     async def _place_order(
         self,
@@ -287,13 +349,26 @@ class MexcPerpetualDerivative(PerpetualDerivativePyBase):
             client_order_id=order_id,
             **kwargs,
         )
+        if not self._position_mode_confirmed:
+            raise IOError("Refusing to trade until the account position mode has been read.")
+        if order_id in self._cancel_requests:
+            raise RuntimeError(f"Order {order_id} was cancelled before it was sent")
         try:
             response = await self._api_post(
                 path_url=CONSTANTS.PLACE_ORDER_PATH,
                 data=data,
                 is_auth_required=True,
             )
-        except Exception:
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            if self._is_ambiguous_create_error(exc):
+                recovered = await self._recover_uncertain_order(trading_pair, order_id)
+                if recovered == "absent":
+                    raise
+                if recovered is not None:
+                    return recovered
+                raise UncertainOrderCreate(str(exc)) from exc
             recovered = await self._recover_order_by_client_id(trading_pair, order_id)
             if recovered is not None:
                 return recovered
@@ -317,14 +392,17 @@ class MexcPerpetualDerivative(PerpetualDerivativePyBase):
             leverage = self.get_leverage(trading_pair)
         data: Dict[str, Any] = {
             "symbol": symbol,
-            "price": self._price_string(price, order_type),
-            "vol": self._decimal_str(self._base_amount_to_contracts(trading_pair, amount)),
+            "price": self._json_number(self._price_string(price, order_type)),
+            "vol": self._json_number(self._base_amount_to_contracts(trading_pair, amount)),
             "leverage": int(leverage),
             "side": self._exchange_side(trade_type, position_action),
             "type": self._execution_type_code(order_type, kwargs.get("time_in_force")),
             "openType": self._open_type(),
             "positionMode": self._position_mode_code(kwargs.get("position_mode")),
         }
+        position_id = self._position_id_for_order(trading_pair, trade_type, position_action, kwargs.get("reduce_only"))
+        if position_id is not None:
+            data["positionId"] = position_id
         if client_order_id:
             data["externalOid"] = client_order_id
         reduce_only = kwargs.get("reduce_only")
@@ -388,11 +466,11 @@ class MexcPerpetualDerivative(PerpetualDerivativePyBase):
         symbol = await self.exchange_symbol_associated_to_pair(trading_pair)
         data: Dict[str, Any] = {
             "symbol": symbol,
-            "vol": self._decimal_str(self._base_amount_to_contracts(trading_pair, amount)),
+            "vol": self._json_number(self._base_amount_to_contracts(trading_pair, amount)),
             "leverage": int(kwargs.get("leverage", self.get_leverage(trading_pair))),
             "side": self._exchange_side(trade_type, position_action),
             "openType": self._open_type(),
-            "triggerPrice": self._decimal_str(trigger_price),
+            "triggerPrice": self._json_number(trigger_price),
             "triggerType": int(trigger_type),
             "executeCycle": int(execute_cycle),
             "orderType": self._execution_type_code(order_type, kwargs.get("time_in_force")),
@@ -400,7 +478,7 @@ class MexcPerpetualDerivative(PerpetualDerivativePyBase):
             "positionMode": self._position_mode_code(kwargs.get("position_mode")),
         }
         if price is not None and order_type is not OrderType.MARKET:
-            data["price"] = self._decimal_str(price)
+            data["price"] = self._json_number(price)
         if kwargs.get("reduce_only"):
             data["reduceOnly"] = True
         if kwargs.get("price_protect") is not None:
@@ -419,12 +497,11 @@ class MexcPerpetualDerivative(PerpetualDerivativePyBase):
         """
         if len(orders) > CONSTANTS.BATCH_ORDER_MAX:
             raise ValueError(f"Cancel plan orders accepts at most {CONSTANTS.BATCH_ORDER_MAX} orders.")
-        payload = {
-            "orders": [
-                {"symbol": item["symbol"], "orderId": self._normalize_order_id(item["order_id"])}
-                for item in orders
-            ]
-        }
+        # The parameter table names this list `orders`. The published example is the bare array.
+        payload = [
+            {"symbol": item["symbol"], "orderId": self._normalize_order_id(item["order_id"])}
+            for item in orders
+        ]
         return await self._api_post(
             path_url=CONSTANTS.PLAN_ORDER_CANCEL_PATH,
             data=payload,
@@ -491,8 +568,8 @@ class MexcPerpetualDerivative(PerpetualDerivativePyBase):
             data={
                 "symbol": await self.exchange_symbol_associated_to_pair(trading_pair),
                 "orderId": self._normalize_order_id(order_id),
-                "triggerPrice": self._decimal_str(trigger_price),
-                "price": self._decimal_str(price),
+                "triggerPrice": self._json_number(trigger_price),
+                "price": self._json_number(price),
                 "orderType": int(order_type),
                 "triggerType": int(trigger_type),
                 "trend": int(trend),
@@ -549,7 +626,7 @@ class MexcPerpetualDerivative(PerpetualDerivativePyBase):
             raise ValueError("A position stop order needs a stop loss price or a take profit price.")
         data: Dict[str, Any] = {
             "positionId": self._normalize_order_id(position_id),
-            "vol": self._decimal_str(self._base_amount_to_contracts(trading_pair, amount)),
+            "vol": self._json_number(self._base_amount_to_contracts(trading_pair, amount)),
             "lossTrend": int(loss_trend),
             "profitTrend": int(profit_trend),
         }
@@ -568,9 +645,9 @@ class MexcPerpetualDerivative(PerpetualDerivativePyBase):
         if kwargs.get("profit_loss_vol_type"):
             data["profitLossVolType"] = kwargs["profit_loss_vol_type"]
         if kwargs.get("take_profit_order_price") is not None:
-            data["takeProfitOrderPrice"] = self._decimal_str(Decimal(str(kwargs["take_profit_order_price"])))
+            data["takeProfitOrderPrice"] = self._json_number(kwargs["take_profit_order_price"])
         if kwargs.get("stop_loss_order_price") is not None:
-            data["stopLossOrderPrice"] = self._decimal_str(Decimal(str(kwargs["stop_loss_order_price"])))
+            data["stopLossOrderPrice"] = self._json_number(kwargs["stop_loss_order_price"])
         response = await self._api_post(
             path_url=CONSTANTS.STOP_ORDER_PLACE_PATH,
             data=data,
@@ -581,9 +658,10 @@ class MexcPerpetualDerivative(PerpetualDerivativePyBase):
     async def cancel_stop_orders(self, stop_plan_order_ids: List[str]) -> Dict[str, Any]:
         if len(stop_plan_order_ids) > CONSTANTS.BATCH_ORDER_MAX:
             raise ValueError(f"Cancel stop orders accepts at most {CONSTANTS.BATCH_ORDER_MAX} orders.")
+        # The parameter table names this list `orders`. The published example is the bare array.
         return await self._api_post(
             path_url=CONSTANTS.STOP_ORDER_CANCEL_PATH,
-            data={"orders": [{"stopPlanOrderId": self._normalize_order_id(order_id)} for order_id in stop_plan_order_ids]},
+            data=[{"stopPlanOrderId": self._normalize_order_id(order_id)} for order_id in stop_plan_order_ids],
             is_auth_required=True,
         )
 
@@ -668,21 +746,304 @@ class MexcPerpetualDerivative(PerpetualDerivativePyBase):
             return None
         return str(order_data["orderId"]), self.current_timestamp
 
+    def cancel(self, trading_pair: str, client_order_id: str):
+        self._cancel_requests.add(client_order_id)
+        return super().cancel(trading_pair, client_order_id)
+
+    async def _create_order(
+        self,
+        trade_type: TradeType,
+        order_id: str,
+        trading_pair: str,
+        amount: Decimal,
+        order_type: OrderType,
+        price: Optional[Decimal] = None,
+        position_action: PositionAction = PositionAction.NIL,
+        **kwargs,
+    ):
+        self._creates_in_flight.add(order_id)
+        try:
+            await super()._create_order(
+                trade_type,
+                order_id,
+                trading_pair,
+                amount,
+                order_type,
+                price,
+                position_action=position_action,
+                **kwargs,
+            )
+        finally:
+            self._creates_in_flight.discard(order_id)
+            self._creates_finished.add(order_id)
+
+    async def _execute_cancel(self, trading_pair: str, order_id: str):
+        self._cancel_requests.add(order_id)
+        spins = 0
+        while order_id in self._cancel_requests and spins < 200:
+            tracked = self._order_tracker.fetch_tracked_order(order_id)
+            if tracked is not None and (
+                tracked.current_state in (OrderState.CANCELED, OrderState.FAILED)
+                or (tracked.is_done and tracked.is_filled)
+            ):
+                self._cancel_requests.discard(order_id)
+                return order_id
+            if tracked is None:
+                if order_id in self._creates_in_flight or order_id not in self._creates_finished:
+                    await self._sleep(0.01)
+                    spins += 1
+                    continue
+                self._cancel_requests.discard(order_id)
+                return order_id
+            result = await self._execute_order_cancel(tracked)
+            await self._sleep(0)
+            if tracked.current_state in (OrderState.CANCELED, OrderState.FAILED) or (
+                tracked.is_done and tracked.is_filled
+            ):
+                self._cancel_requests.discard(order_id)
+                return result or order_id
+            if result is None:
+                self._cancel_requests.discard(order_id)
+                return None
+            spins += 1
+        return None
+
+    async def _place_order_and_process_update(self, order: InFlightOrder, **kwargs) -> str:
+        kwargs = dict(kwargs)
+        kwargs.pop("position_action", None)
+        exchange_order_id, update_timestamp = await self._place_order(
+            order_id=order.client_order_id,
+            trading_pair=order.trading_pair,
+            amount=order.amount,
+            trade_type=order.trade_type,
+            order_type=order.order_type,
+            price=order.price,
+            position_action=order.position,
+            **kwargs,
+        )
+        if order.client_order_id in self._cancel_requests:
+            if order.exchange_order_id is None:
+                order.update_exchange_order_id(str(exchange_order_id))
+            await self._execute_order_cancel(order)
+            return str(exchange_order_id)
+        self._order_tracker.process_order_update(
+            OrderUpdate(
+                client_order_id=order.client_order_id,
+                exchange_order_id=str(exchange_order_id),
+                trading_pair=order.trading_pair,
+                update_timestamp=update_timestamp,
+                new_state=OrderState.OPEN,
+            )
+        )
+        return str(exchange_order_id)
+
+    def _on_order_failure(self, order_id: str, trading_pair: str, amount: Decimal, trade_type: TradeType,
+                          order_type: OrderType, price: Optional[Decimal], exception: Exception, **kwargs):
+        if isinstance(exception, UncertainOrderCreate):
+            self.logger().warning(
+                "Order %s was not confirmed after the create call. Keeping client id %s in flight.",
+                trading_pair,
+                order_id,
+            )
+            return
+        super()._on_order_failure(
+            order_id=order_id,
+            trading_pair=trading_pair,
+            amount=amount,
+            trade_type=trade_type,
+            order_type=order_type,
+            price=price,
+            exception=exception,
+            **kwargs,
+        )
+
+    def _is_ambiguous_create_error(self, exception: Exception) -> bool:
+        if isinstance(exception, (asyncio.TimeoutError, TimeoutError)):
+            return True
+        if self._is_maintenance_error(exception):
+            return True
+        text = str(exception).lower()
+        if "http status is" in text:
+            return False
+        return any(token in text for token in ("timeout", "connection", "network", "server disconnected"))
+
+    async def _recover_uncertain_order(self, trading_pair: str, client_order_id: str):
+        absent = 0
+        for _attempt in range(3):
+            try:
+                order_data = await self._request_order_by_client_id(trading_pair, client_order_id)
+            except Exception as exc:
+                if self._is_order_not_found_during_status_update_error(exc):
+                    absent += 1
+                    if absent >= 3:
+                        return "absent"
+                    continue
+                if self._is_ambiguous_create_error(exc) or self._is_maintenance_error(exc):
+                    continue
+                return None
+            else:
+                if order_data and order_data.get("orderId") not in (None, ""):
+                    return str(order_data["orderId"]), self.current_timestamp
+        return None
+
+    async def _account_for_cancel_fills(self, order: InFlightOrder) -> bool:
+        try:
+            order_data = await self._request_order_by_client_id(order.trading_pair, order.client_order_id)
+        except Exception as exc:
+            self.logger().warning(
+                "Cancel of %s succeeded but the order fill could not be read: %s",
+                order.client_order_id,
+                exc,
+            )
+            return False
+        self._remember_reported_deal(order, order_data)
+        await self._apply_deal_details(order)
+        self.synthesize_reported_fill(order)
+        return True
+
+    async def _reconcile_uncancelable_order(self, order: InFlightOrder):
+        try:
+            order_data = await self._request_order_by_client_id(order.trading_pair, order.client_order_id)
+        except Exception:
+            self.logger().warning("Cancel error 2041 for %s and the order could not be read.", order.client_order_id)
+            return
+        self._remember_reported_deal(order, order_data)
+        await self._apply_deal_details(order)
+        self.synthesize_reported_fill(order)
+        state = self._order_state_from_payload(order_data)
+        if state in (OrderState.FILLED, OrderState.CANCELED, OrderState.FAILED):
+            self._order_tracker.process_order_update(
+                OrderUpdate(
+                    trading_pair=order.trading_pair,
+                    update_timestamp=self.current_timestamp,
+                    new_state=state,
+                    client_order_id=order.client_order_id,
+                    exchange_order_id=str(order_data.get("orderId") or order.exchange_order_id or ""),
+                )
+            )
+
+    async def _apply_deal_details(self, order: InFlightOrder):
+        if order.exchange_order_id in (None, ""):
+            return
+        reported = getattr(order, "reported_deal_base", None)
+        if reported is not None and Decimal(str(reported)) <= s_decimal_0:
+            return
+        try:
+            updates = await self._all_trade_updates_for_order(order)
+        except Exception as exc:
+            self.logger().debug("Deal details for %s were not available: %s", order.client_order_id, exc)
+            return
+        self._drop_synthetic_fill(order)
+        for update in updates:
+            self._order_tracker.process_trade_update(update)
+
+    def _remember_reported_deal(self, order: InFlightOrder, payload: Dict[str, Any]):
+        if not isinstance(payload, dict) or payload.get("dealVol") in (None, ""):
+            return
+        try:
+            contracts = Decimal(str(payload.get("dealVol") or "0"))
+            base = contracts * self.get_contract_size(order.trading_pair)
+        except Exception:
+            return
+        previous = getattr(order, "reported_deal_base", None)
+        if previous is None or base > Decimal(str(previous)):
+            order.reported_deal_base = base
+        average = payload.get("dealAvgPrice")
+        if average not in (None, "", 0, "0", "0.0"):
+            order.reported_deal_price = Decimal(str(average))
+
+    def synthesize_reported_fill(self, order: InFlightOrder):
+        reported = getattr(order, "reported_deal_base", None)
+        if reported is None:
+            return
+        self._drop_synthetic_fill(order)
+        gap = Decimal(str(reported)) - order.executed_amount_base
+        if gap <= Decimal("0.00000001"):
+            return
+        price = getattr(order, "reported_deal_price", None) or order.price
+        if price is None:
+            return
+        price = Decimal(str(price))
+        if price <= s_decimal_0:
+            price = order.price
+        fee = TradeFeeBase.new_perpetual_fee(
+            fee_schema=self.trade_fee_schema(),
+            position_action=getattr(order, "position", PositionAction.NIL),
+            percent_token=self.get_buy_collateral_token(order.trading_pair),
+            flat_fees=[],
+        )
+        self._order_tracker.process_trade_update(
+            TradeUpdate(
+                trade_id=f"mexc-reported-deal-{order.client_order_id}",
+                client_order_id=order.client_order_id,
+                exchange_order_id=str(order.exchange_order_id or ""),
+                trading_pair=order.trading_pair,
+                fill_timestamp=self.current_timestamp or 0,
+                fill_price=price,
+                fill_base_amount=gap,
+                fill_quote_amount=price * gap,
+                fee=fee,
+            )
+        )
+
+    def _drop_synthetic_fill(self, order: InFlightOrder):
+        trade_id = f"mexc-reported-deal-{order.client_order_id}"
+        fill = order.order_fills.pop(trade_id, None)
+        if fill is None:
+            return
+        order.executed_amount_base -= fill.fill_base_amount
+        order.executed_amount_quote -= fill.fill_quote_amount
+        if order.executed_amount_base < s_decimal_0:
+            order.executed_amount_base = s_decimal_0
+        if order.executed_amount_quote < s_decimal_0:
+            order.executed_amount_quote = s_decimal_0
+
+    def _apply_balance_row(self, balance_data: Dict[str, Any], from_rest: bool):
+        asset = balance_data.get("currency")
+        if not asset:
+            return
+        available = Decimal(str(balance_data.get("availableBalance") or "0"))
+        frozen = Decimal(str(balance_data.get("frozenBalance") or "0"))
+        margin = Decimal(str(balance_data.get("positionMargin") or "0"))
+        cash = available + frozen + margin
+        self._account_available_balances[asset] = available
+        explicit_unrealized = None
+        for field in ("unrealized", "unrealizedPnl", "unRealizedPnl", "unProfit"):
+            if balance_data.get(field) not in (None, ""):
+                explicit_unrealized = Decimal(str(balance_data[field]))
+                break
+        if from_rest and balance_data.get("equity") is not None:
+            equity = Decimal(str(balance_data["equity"]))
+            self._equity_gap[asset] = equity - cash
+            self._account_balances[asset] = equity
+            return
+        if explicit_unrealized is not None:
+            self._equity_gap[asset] = explicit_unrealized
+        gap = self._equity_gap.get(asset, s_decimal_0)
+        self._account_balances[asset] = cash + gap
+
+    def _position_id_for_order(
+        self,
+        trading_pair: str,
+        trade_type: TradeType,
+        position_action: PositionAction,
+        reduce_only: Optional[bool],
+    ) -> Optional[int]:
+        closing = position_action is PositionAction.CLOSE or bool(reduce_only)
+        if not closing:
+            return None
+        if trade_type is TradeType.SELL:
+            side = PositionSide.LONG
+        else:
+            side = PositionSide.SHORT
+        return self._position_ids.get((trading_pair, side))
+
     async def _update_balances(self):
         response = await self._api_get(path_url=CONSTANTS.ASSETS_PATH, is_auth_required=True)
         self._account_available_balances.clear()
         self._account_balances.clear()
         for balance_data in response.get("data") or []:
-            asset = balance_data["currency"]
-            available = Decimal(str(balance_data.get("availableBalance") or "0"))
-            if balance_data.get("equity") is not None:
-                total = Decimal(str(balance_data["equity"]))
-            else:
-                frozen = Decimal(str(balance_data.get("frozenBalance") or "0"))
-                margin = Decimal(str(balance_data.get("positionMargin") or "0"))
-                total = available + frozen + margin
-            self._account_available_balances[asset] = available
-            self._account_balances[asset] = total
+            self._apply_balance_row(balance_data, from_rest=True)
 
     async def _update_positions(self):
         response = await self._api_get(path_url=CONSTANTS.OPEN_POSITIONS_PATH, is_auth_required=True)
@@ -718,6 +1079,10 @@ class MexcPerpetualDerivative(PerpetualDerivativePyBase):
     async def _request_order_status(self, tracked_order: InFlightOrder) -> OrderUpdate:
         try:
             order_data = await self._request_order_status_data(tracked_order)
+            self._remember_reported_deal(tracked_order, order_data)
+            if self._order_state_from_payload(order_data) == OrderState.CANCELED:
+                await self._apply_deal_details(tracked_order)
+                self.synthesize_reported_fill(tracked_order)
             return self._order_update_from_rest(order_data, tracked_order)
         except IOError as exception:
             if self._is_request_exception_related_to_time_synchronizer(exception):
@@ -784,24 +1149,85 @@ class MexcPerpetualDerivative(PerpetualDerivativePyBase):
 
     async def _set_trading_pair_leverage(self, trading_pair: str, leverage: int) -> Tuple[bool, str]:
         symbol = await self.exchange_symbol_associated_to_pair(trading_pair)
-        position_types = [CONSTANTS.POSITION_TYPE_LONG]
-        if self.position_mode is PositionMode.HEDGE:
-            position_types.append(CONSTANTS.POSITION_TYPE_SHORT)
+        position_ids = [
+            (side, position_id)
+            for (pair, side), position_id in self._position_ids.items()
+            if pair == trading_pair
+        ]
         try:
-            for position_type in position_types:
-                await self._api_post(
-                    path_url=CONSTANTS.CHANGE_LEVERAGE_PATH,
-                    data={
-                        "symbol": symbol,
-                        "leverage": int(leverage),
-                        "openType": self._open_type(),
-                        "positionType": position_type,
-                    },
-                    is_auth_required=True,
-                )
+            if position_ids:
+                for _side, position_id in position_ids:
+                    await self._api_post(
+                        path_url=CONSTANTS.CHANGE_LEVERAGE_PATH,
+                        data={
+                            "positionId": position_id,
+                            "leverage": int(leverage),
+                            "openType": self._open_type(),
+                        },
+                        is_auth_required=True,
+                    )
+            else:
+                position_types = [CONSTANTS.POSITION_TYPE_LONG]
+                if self.position_mode is PositionMode.HEDGE:
+                    position_types.append(CONSTANTS.POSITION_TYPE_SHORT)
+                for position_type in position_types:
+                    await self._api_post(
+                        path_url=CONSTANTS.CHANGE_LEVERAGE_PATH,
+                        data={
+                            "symbol": symbol,
+                            "leverage": int(leverage),
+                            "openType": self._open_type(),
+                            "positionType": position_type,
+                        },
+                        is_auth_required=True,
+                    )
         except Exception as exception:
             return False, str(exception)
         return True, ""
+
+    async def confirm_leverage_and_margin(self, trading_pair: str, leverage: int, margin_mode: str) -> bool:
+        """
+        Apply leverage and isolated or cross margin and return whether the exchange accepted them.
+        Local state changes only after the exchange call succeeds.
+        """
+        if not self._position_mode_confirmed:
+            self.logger().warning("Cannot confirm leverage before the account position mode is read.")
+            return False
+        mode = str(getattr(margin_mode, "value", margin_mode))
+        if mode not in (MarginMode.CROSS, MarginMode.ISOLATED):
+            self.logger().error(f"Unsupported margin mode {margin_mode}")
+            return False
+        previous_mode = self._margin_mode
+        self._margin_mode = mode
+        success, message = await self._set_trading_pair_leverage(trading_pair, int(leverage))
+        if not success:
+            self._margin_mode = previous_mode
+            self.logger().warning(f"Exchange rejected leverage {leverage} {mode} for {trading_pair}: {message}")
+            return False
+        self._perpetual_trading.set_leverage(trading_pair, int(leverage))
+        self.logger().info(f"Confirmed {mode} leverage {leverage} for {trading_pair}.")
+        return True
+
+    async def _initialize_position_mode(self):
+        async with self._set_position_mode_lock:
+            try:
+                mode = await self._fetch_account_position_mode()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                self._position_mode_confirmed = False
+                self.logger().warning(
+                    "Could not read the account position mode. Refusing to trade until it is read.",
+                    exc_info=True,
+                )
+                return
+            if mode is None:
+                self._position_mode_confirmed = False
+                self.logger().warning("The account position mode was empty. Refusing to trade.")
+                return
+            self._perpetual_trading.set_position_mode(mode)
+            self._position_mode_confirmed = True
+            self.logger().info(f"Position mode initialized to {mode} from the exchange.")
 
     async def _fetch_last_fee_payment(self, trading_pair: str) -> Tuple[float, Decimal, Decimal]:
         symbol = await self.exchange_symbol_associated_to_pair(trading_pair)
@@ -845,6 +1271,7 @@ class MexcPerpetualDerivative(PerpetualDerivativePyBase):
         tracked_order = self._order_tracker.all_updatable_orders.get(client_order_id)
         if tracked_order is None:
             return
+        self._remember_reported_deal(tracked_order, order_msg)
         order_update = OrderUpdate(
             trading_pair=tracked_order.trading_pair,
             update_timestamp=self.current_timestamp,
@@ -859,7 +1286,10 @@ class MexcPerpetualDerivative(PerpetualDerivativePyBase):
         tracked_order = self._order_tracker.all_fillable_orders.get(client_order_id)
         if tracked_order is None:
             return
+        self._drop_synthetic_fill(tracked_order)
         self._order_tracker.process_trade_update(self._parse_trade_update(trade_msg, tracked_order))
+        if tracked_order.current_state in (OrderState.FILLED, OrderState.CANCELED):
+            self.synthesize_reported_fill(tracked_order)
 
     async def _process_account_position_event(self, position_msg: Any):
         entries = position_msg if isinstance(position_msg, list) else [position_msg]
@@ -882,14 +1312,7 @@ class MexcPerpetualDerivative(PerpetualDerivativePyBase):
             self._perpetual_trading.set_position(pos_key, position)
 
     def _process_wallet_event_message(self, wallet_msg: Dict[str, Any]):
-        asset = wallet_msg.get("currency")
-        if not asset:
-            return
-        available = Decimal(str(wallet_msg.get("availableBalance") or "0"))
-        frozen = Decimal(str(wallet_msg.get("frozenBalance") or "0"))
-        margin = Decimal(str(wallet_msg.get("positionMargin") or "0"))
-        self._account_available_balances[asset] = available
-        self._account_balances[asset] = available + frozen + margin
+        self._apply_balance_row(wallet_msg, from_rest=False)
 
     async def _make_trading_pairs_request(self) -> Any:
         response = await self._api_get(path_url=self.trading_pairs_request_path)
@@ -958,7 +1381,11 @@ class MexcPerpetualDerivative(PerpetualDerivativePyBase):
         state = int(raw_position.get("state") or 1)
         side = self._position_side(raw_position.get("positionType"))
         pos_key = self._perpetual_trading.position_key(trading_pair, side)
+        position_id = raw_position.get("positionId")
+        if position_id not in (None, "", 0, "0"):
+            self._position_ids[(trading_pair, side)] = self._normalize_order_id(position_id)
         if contracts == s_decimal_0 or state == 3:
+            self._position_ids.pop((trading_pair, side), None)
             return None
         amount = contracts * self.get_contract_size(trading_pair)
         if side is PositionSide.SHORT:
@@ -979,7 +1406,7 @@ class MexcPerpetualDerivative(PerpetualDerivativePyBase):
         contract_size = self.get_contract_size(tracked_order.trading_pair)
         fill_price = Decimal(str(trade_msg["price"]))
         fill_base_amount = Decimal(str(trade_msg["vol"])) * contract_size
-        fee_amount = abs(Decimal(str(trade_msg.get("fee") or "0")))
+        fee_amount = Decimal(str(trade_msg.get("fee") or "0"))
         fee_asset = trade_msg.get("feeCurrency") or self.get_buy_collateral_token(tracked_order.trading_pair)
         flat_fees = [] if fee_amount == s_decimal_0 else [TokenAmount(amount=fee_amount, token=fee_asset)]
         position_action = getattr(tracked_order, "position", PositionAction.NIL)
@@ -1049,16 +1476,16 @@ class MexcPerpetualDerivative(PerpetualDerivativePyBase):
         stop_loss = kwargs.get("stop_loss_price")
         take_profit = kwargs.get("take_profit_price")
         if stop_loss is not None:
-            data["stopLossPrice"] = MexcPerpetualDerivative._decimal_str(Decimal(str(stop_loss)))
+            data["stopLossPrice"] = MexcPerpetualDerivative._json_number(stop_loss)
             data["lossTrend"] = int(kwargs.get("loss_trend") or CONSTANTS.TRIGGER_PRICE_LATEST)
         if take_profit is not None:
-            data["takeProfitPrice"] = MexcPerpetualDerivative._decimal_str(Decimal(str(take_profit)))
+            data["takeProfitPrice"] = MexcPerpetualDerivative._json_number(take_profit)
             data["profitTrend"] = int(kwargs.get("profit_trend") or CONSTANTS.TRIGGER_PRICE_LATEST)
 
     @staticmethod
     def _put_optional_price(data: Dict[str, Any], field: str, price: Optional[Decimal]):
         if price is not None:
-            data[field] = MexcPerpetualDerivative._decimal_str(Decimal(str(price)))
+            data[field] = MexcPerpetualDerivative._json_number(price)
 
     @staticmethod
     def _put_stop_change_fields(
@@ -1098,8 +1525,6 @@ class MexcPerpetualDerivative(PerpetualDerivativePyBase):
 
     def _base_amount_to_contracts(self, trading_pair: str, amount: Decimal) -> Decimal:
         contract_size = self.get_contract_size(trading_pair)
-        if contract_size <= s_decimal_0:
-            contract_size = Decimal("1")
         contracts = amount / contract_size
         trading_rule = self._trading_rules.get(trading_pair)
         if trading_rule is not None and trading_rule.min_base_amount_increment > s_decimal_0:
@@ -1112,6 +1537,17 @@ class MexcPerpetualDerivative(PerpetualDerivativePyBase):
         if order_type is OrderType.MARKET and (price is None or price.is_nan()):
             return "0"
         return self._decimal_str(price)
+
+    @staticmethod
+    def _json_number(value: Any):
+        """
+        JSON number, matching the futures docs examples (vol 5, price 109777.5).
+        Whole values stay integers so 10 is not encoded as 10.0.
+        """
+        number = Decimal(str(value))
+        if number == number.to_integral_value():
+            return int(number)
+        return float(number)
 
     @staticmethod
     def _decimal_str(value: Decimal) -> str:
@@ -1130,12 +1566,39 @@ class MexcPerpetualDerivative(PerpetualDerivativePyBase):
         return PositionSide.LONG if int(position_type or 1) == CONSTANTS.POSITION_TYPE_LONG else PositionSide.SHORT
 
     @staticmethod
-    def _funding_records(response: Dict[str, Any]) -> List[Dict[str, Any]]:
-        data = response.get("data")
+    def parse_funding_response(response: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        The field table describes resultList rows. The only sample body on that page is a
+        funding-rate object. Both shapes are recognized. A rate snapshot is not a payment.
+        """
+        data = response.get("data") if isinstance(response, dict) else None
+        records: List[Dict[str, Any]] = []
         if isinstance(data, dict):
-            records = data.get("resultList") or data.get("result") or []
+            listed = data.get("resultList")
+            if listed is None:
+                listed = data.get("result")
+            if isinstance(listed, list):
+                records = [item for item in listed if isinstance(item, dict)]
+            elif MexcPerpetualDerivative._is_funding_payment(data):
+                records = [data]
+            elif data.get("fundingRate") is not None or data.get("nextSettleTime") is not None:
+                rate = data.get("fundingRate", data.get("rate"))
+                return {
+                    "kind": "rate_snapshot",
+                    "records": [],
+                    "payment": None,
+                    "rate": Decimal(str(rate)) if rate is not None else None,
+                    "next_settle_time": data.get("nextSettleTime"),
+                    "symbol": data.get("symbol"),
+                }
         elif isinstance(data, list):
-            records = data
-        else:
-            records = []
-        return records
+            records = [item for item in data if isinstance(item, dict)]
+        return {"kind": "records", "records": records, "payment": None, "rate": None}
+
+    @staticmethod
+    def _is_funding_payment(data: Dict[str, Any]) -> bool:
+        return any(key in data for key in ("funding", "fundingFee", "settleTime"))
+
+    @staticmethod
+    def _funding_records(response: Dict[str, Any]) -> List[Dict[str, Any]]:
+        return MexcPerpetualDerivative.parse_funding_response(response)["records"]
