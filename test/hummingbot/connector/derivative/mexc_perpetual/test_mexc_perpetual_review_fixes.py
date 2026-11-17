@@ -174,6 +174,102 @@ class MexcPerpetualReviewFixTests(IsolatedAsyncioWrapperTestCase):
         self.assertTrue(any("/order/get/" in path for path in calls))
         self.assertEqual(Decimal("100"), order.executed_amount_base)
 
+    async def test_canceled_client_read_does_not_beat_an_open_order_id_read(self):
+        order = self._track(Decimal("1000"))
+        order.current_state = OrderState.OPEN
+
+        async def get(path_url, **kwargs):
+            if "external" in path_url:
+                data = {
+                    "orderId": "ex-1",
+                    "externalOid": "oid-1",
+                    "state": 4,
+                    "dealVol": 0,
+                    "price": "0.07816",
+                    "vol": "100",
+                }
+            else:
+                data = {
+                    "orderId": "ex-1",
+                    "externalOid": "oid-1",
+                    "state": 2,
+                    "dealVol": 0,
+                    "price": "0.07816",
+                    "vol": "100",
+                }
+            return {"success": True, "code": 0, "data": data}
+
+        self.exchange._api_get = get
+        state = await self.exchange.resolve_unknown_order(self.trading_pair, "oid-1", "ex-1")
+        self.assertNotEqual(OrderState.CANCELED, state)
+        self.assertNotIn(state, (OrderState.CANCELED, OrderState.FAILED, OrderState.FILLED))
+        self.assertEqual(OrderState.OPEN, order.current_state)
+        self.assertEqual(Decimal("0"), order.executed_amount_base)
+
+    async def test_agreed_zero_size_cancel_is_final(self):
+        async def get(path_url, **kwargs):
+            return {
+                "success": True,
+                "code": 0,
+                "data": {
+                    "orderId": "ex-1",
+                    "externalOid": "oid-1",
+                    "state": 4,
+                    "dealVol": 0,
+                    "price": "0.07816",
+                    "vol": "100",
+                },
+            }
+
+        self.exchange._api_get = get
+        state = await self.exchange.resolve_unknown_order(self.trading_pair, "oid-1", "ex-1")
+        self.assertEqual(OrderState.CANCELED, state)
+
+    async def test_zero_size_cancel_with_a_failed_read_stays_unknown(self):
+        async def get(path_url, **kwargs):
+            if "external" in path_url:
+                raise IOError("http status is 500")
+            return {
+                "success": True,
+                "code": 0,
+                "data": {
+                    "orderId": "ex-1",
+                    "externalOid": "oid-1",
+                    "state": 4,
+                    "dealVol": 0,
+                    "price": "0.07816",
+                    "vol": "100",
+                },
+            }
+
+        self.exchange._api_get = get
+        state = await self.exchange.resolve_unknown_order(self.trading_pair, "oid-1", "ex-1")
+        self.assertIsNone(state)
+
+    async def test_order_not_exist_on_both_reads_is_confirmed_absent(self):
+        async def get(path_url, **kwargs):
+            raise IOError("Error: 2040 - order not exist")
+
+        self.exchange._api_get = get
+        state = await self.exchange.resolve_unknown_order(self.trading_pair, "oid-1", "ex-1")
+        self.assertEqual("confirmed_absent", state)
+
+    async def test_empty_result_on_both_reads_is_confirmed_absent(self):
+        async def get(path_url, **kwargs):
+            return {"success": True, "code": 0, "data": None}
+
+        self.exchange._api_get = get
+        state = await self.exchange.resolve_unknown_order(self.trading_pair, "oid-1", "ex-1")
+        self.assertEqual("confirmed_absent", state)
+
+    async def test_http_500_lookup_stays_unknown(self):
+        async def get(path_url, **kwargs):
+            raise IOError("http status is 500")
+
+        self.exchange._api_get = get
+        state = await self.exchange.resolve_unknown_order(self.trading_pair, "oid-1", "ex-1")
+        self.assertIsNone(state)
+
     async def test_cancel_push_records_deal_volume_before_the_order_is_done(self):
         order = self._track(Decimal("1000"))
         self.exchange._order_tracker.TRADE_FILLS_WAIT_TIMEOUT = 0.05

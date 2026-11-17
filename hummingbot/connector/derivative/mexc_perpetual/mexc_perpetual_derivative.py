@@ -1196,29 +1196,55 @@ class MexcPerpetualDerivative(PerpetualDerivativePyBase):
             raise ValueError(f"Order {exchange_order_id} not found")
         return data
 
+    async def _classify_order_read(self, request) -> Tuple[str, Optional[Dict[str, Any]]]:
+        try:
+            data = await request()
+        except Exception as exc:
+            if self._is_order_not_found_during_status_update_error(exc):
+                self.logger().info("Order lookup confirmed the order is absent: %s", exc)
+                return "absent", None
+            self.logger().warning("Order lookup failed: %s", exc)
+            return "failed", None
+        return "ok", data
+
     async def resolve_unknown_order(
         self,
         trading_pair: str,
         client_order_id: str,
         exchange_order_id: Optional[str] = None,
-    ) -> Optional[OrderState]:
+    ):
         """
-        Look the order up by client id and, if that misses, by exchange order id.
-        Apply the result to the tracked order. None means both lookups failed.
+        Look the order up by client id and by exchange order id.
+        A conflict, or a read that fails, stays unknown (None). confirmed_absent means
+        every read that was attempted reported the order does not exist.
         """
-        by_client = None
-        by_order_id = None
-        try:
-            by_client = await self._request_order_by_client_id(trading_pair, client_order_id)
-        except Exception as exc:
-            self.logger().warning("Client id lookup for %s failed: %s", client_order_id, exc)
+        client_kind, client_data = await self._classify_order_read(
+            lambda: self._request_order_by_client_id(trading_pair, client_order_id)
+        )
+        kinds = [client_kind]
+        payloads = [client_data] if client_kind == "ok" and client_data else []
+        order_data = None
         if exchange_order_id:
-            try:
-                by_order_id = await self._request_order_by_exchange_id(str(exchange_order_id))
-            except Exception as exc:
-                self.logger().warning("Order id lookup for %s failed: %s", exchange_order_id, exc)
-        data = self._prefer_order_payload(by_client, by_order_id)
-        if not data:
+            order_kind, order_data = await self._classify_order_read(
+                lambda: self._request_order_by_exchange_id(str(exchange_order_id))
+            )
+            kinds.append(order_kind)
+            if order_kind == "ok" and order_data:
+                payloads.append(order_data)
+        if payloads and self._payloads_conflict(client_data, order_data):
+            self.logger().warning(
+                "Order %s lookups conflict. Leaving the state unknown.",
+                client_order_id,
+            )
+            return None
+        if not payloads:
+            if kinds and all(kind == "absent" for kind in kinds):
+                self._cancel_requests.discard(client_order_id)
+                self._confirmed_absent.add(client_order_id)
+                return CONSTANTS.CONFIRMED_ABSENT
+            return None
+        data = self._prefer_order_payload(client_data, order_data)
+        if data is None or not self._reads_allow_terminal(payloads, kinds, data):
             return None
         order = self._find_order(client_order_id)
         if order is None and data.get("externalOid"):
@@ -1239,10 +1265,8 @@ class MexcPerpetualDerivative(PerpetualDerivativePyBase):
                     exchange_order_id=str(data.get("orderId") or order.exchange_order_id or ""),
                 )
             )
-        if state in (OrderState.CANCELED, OrderState.FAILED, OrderState.FILLED):
+        if state in (OrderState.CANCELED, OrderState.FILLED):
             self._cancel_requests.discard(client_order_id)
-        if state == OrderState.FAILED:
-            self._confirmed_absent.add(client_order_id)
         return state
 
     async def _get_last_traded_price(self, trading_pair: str) -> float:
@@ -1574,25 +1598,57 @@ class MexcPerpetualDerivative(PerpetualDerivativePyBase):
         )
 
     @staticmethod
+    def _payload_is_live(payload: Dict[str, Any]) -> bool:
+        state = int(payload.get("state") or 0)
+        return state not in (
+            CONSTANTS.ORDER_STATE_FILLED,
+            CONSTANTS.ORDER_STATE_CANCELED,
+            CONSTANTS.ORDER_STATE_INVALID,
+        )
+
+    @classmethod
+    def _payloads_conflict(cls, left: Optional[Dict[str, Any]], right: Optional[Dict[str, Any]]) -> bool:
+        if not left or not right:
+            return False
+        return int(left.get("state") or 0) != int(right.get("state") or 0)
+
+    @classmethod
+    def _reads_allow_terminal(cls, payloads: List[Dict[str, Any]], kinds: List[str], chosen: Dict[str, Any]) -> bool:
+        if any(cls._payload_is_live(item) for item in payloads):
+            return cls._order_state_from_payload(chosen) not in (
+                OrderState.CANCELED,
+                OrderState.FAILED,
+                OrderState.FILLED,
+            )
+        state = cls._order_state_from_payload(chosen)
+        deal = Decimal(str(chosen.get("dealVol") or "0"))
+        if state == OrderState.CANCELED and deal <= 0:
+            if any(kind == "failed" for kind in kinds):
+                return False
+            return all(
+                cls._order_state_from_payload(item) == OrderState.CANCELED
+                and Decimal(str(item.get("dealVol") or "0")) <= 0
+                for item in payloads
+            )
+        return True
+
+    @staticmethod
     def _prefer_order_payload(left: Optional[Dict[str, Any]], right: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        """
+        Prefer the order-id payload (right). A larger reported fill wins so a deal is not dropped.
+        Disagreeing states are a conflict and stay unresolved.
+        """
         if not left:
             return right
         if not right:
             return left
+        if int(left.get("state") or 0) != int(right.get("state") or 0):
+            return None
         left_deal = Decimal(str(left.get("dealVol") or "0"))
         right_deal = Decimal(str(right.get("dealVol") or "0"))
-        if right_deal > left_deal:
-            return right
-        terminal = {
-            CONSTANTS.ORDER_STATE_FILLED,
-            CONSTANTS.ORDER_STATE_CANCELED,
-            CONSTANTS.ORDER_STATE_INVALID,
-        }
-        left_state = int(left.get("state") or 0)
-        right_state = int(right.get("state") or 0)
-        if right_state in terminal and left_state not in terminal:
-            return right
-        return left
+        if left_deal != right_deal:
+            return right if right_deal > left_deal else left
+        return right
 
     @staticmethod
     def _order_state_from_payload(order_data: Dict[str, Any]) -> OrderState:

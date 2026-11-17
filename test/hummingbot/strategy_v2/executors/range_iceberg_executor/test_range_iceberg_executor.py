@@ -1006,14 +1006,125 @@ class RangeIcebergExecutorTests(IsolatedAsyncioWrapperTestCase):
         self.assertEqual(2, len(self.buy_ids))
         self.assertEqual(Decimal("1000"), self.buy_ids[1][1])
 
+        from hummingbot.connector.derivative.mexc_perpetual.mexc_perpetual_derivative import (
+            MexcPerpetualDerivative,
+        )
+        from bidict import bidict
+
+        exchange = MexcPerpetualDerivative(
+            mexc_perpetual_api_key="key",
+            mexc_perpetual_api_secret="secret",
+            trading_pairs=["AIOT-USDT"],
+            trading_required=True,
+        )
+        exchange._set_trading_pair_symbol_map(bidict({"AIOT_USDT": "AIOT-USDT"}))
+        exchange._set_current_timestamp(self.now)
+        read = {"kind": "absent"}
+
+        async def api_get(path_url, **kwargs):
+            if read["kind"] == "absent":
+                raise IOError("Error: 2040 - order not exist")
+            raise IOError("http status is 500")
+
+        exchange._api_get = api_get
+        self.connector.resolve_unknown_order = exchange.resolve_unknown_order
+        executor._unknown_order_ids.add("buy-1")
+        executor._unconfirmed_cancels.add("buy-1")
         executor.pause()
-        executor._unknown_order_ids.add("buy-2")
-        executor._unconfirmed_cancels.add("buy-2")
-        executor._failed_order_ids.add("buy-2")
-        state["value"] = OrderState.FAILED
         self._run(executor.resume())
         self.assertFalse(executor.get_custom_info()["paused"])
         self.assertFalse(executor.get_custom_info()["unknown_order_halt"])
+
+        read["kind"] = "http500"
+        executor._unknown_order_ids.add("buy-1")
+        executor._unconfirmed_cancels.add("buy-1")
+        executor.pause()
+        self._run(executor.resume())
+        info = executor.get_custom_info()
+        self.assertTrue(info["paused"])
+        self.assertTrue(info["unknown_order_halt"])
+        self.assertIn("buy-1", info["status_reason"])
+        self.assertEqual(2, len(self.buy_ids))
+
+    def test_conflicting_canceled_and_open_reads_do_not_buy_the_slice_again(self):
+        from hummingbot.core.event.events import MarketOrderFailureEvent
+        from hummingbot.connector.derivative.mexc_perpetual.mexc_perpetual_derivative import (
+            MexcPerpetualDerivative,
+        )
+        from bidict import bidict
+
+        self._book(Decimal("0.07815"), Decimal("0.07816"))
+        executor = self._up_to(total_amount=Decimal("1000"), slice_amount=Decimal("1000"))
+        executor._cancel_resolve_after_attempts = 1
+        executor._open_lookup_backoff_seconds = 10
+        executor._open_lookup_backoff_cap_seconds = 10
+        executor._open_lookup_cap = 3
+        self._run(executor.control_task())
+        order = self.orders["buy-1"]
+        order.exchange_order_id = "ex-1"
+        exchange = MexcPerpetualDerivative(
+            mexc_perpetual_api_key="key",
+            mexc_perpetual_api_secret="secret",
+            trading_pairs=["AIOT-USDT"],
+            trading_required=True,
+        )
+        exchange._set_trading_pair_symbol_map(bidict({"AIOT_USDT": "AIOT-USDT"}))
+        exchange._set_current_timestamp(self.now)
+        calls = {"n": 0}
+
+        async def api_get(path_url, **kwargs):
+            if "external" in path_url:
+                payload = {
+                    "orderId": "ex-1",
+                    "externalOid": "buy-1",
+                    "state": 4,
+                    "dealVol": 0,
+                    "price": "0.07816",
+                    "vol": "100",
+                }
+            else:
+                payload = {
+                    "orderId": "ex-1",
+                    "externalOid": "buy-1",
+                    "state": 2,
+                    "dealVol": 0,
+                    "price": "0.07816",
+                    "vol": "100",
+                }
+            return {"success": True, "code": 0, "data": payload}
+
+        exchange._api_get = api_get
+
+        async def resolve(trading_pair, client_order_id, exchange_order_id=None):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return OrderState.OPEN
+            return await exchange.resolve_unknown_order(
+                trading_pair,
+                client_order_id,
+                exchange_order_id or "ex-1",
+            )
+
+        self.connector.is_cancel_confirmed = lambda order_id: False
+        self.connector.resolve_unknown_order = resolve
+        executor.process_order_failed_event(
+            0,
+            None,
+            MarketOrderFailureEvent(self.now, "buy-1", OrderType.LIMIT),
+        )
+        self._run(executor.control_task())
+        self.assertEqual(1, len(self.buy_ids))
+        self.assertEqual(Decimal("1000"), self.buy_ids[0][1])
+        self.assertFalse(executor.get_custom_info()["paused"])
+        self.now += 10
+        self._run(executor.control_task())
+        info = executor.get_custom_info()
+        self.assertEqual(1, len(self.buy_ids))
+        self.assertTrue(info["paused"])
+        self.assertTrue(info["unknown_order_halt"])
+        self.assertIn("buy-1", info["status_reason"])
+        self.assertEqual(OrderState.OPEN, order.current_state)
+        self.assertEqual(Decimal("0"), order.executed_amount_base)
 
     def test_stop_cancels_a_child_that_is_not_tracked_yet(self):
         self._book(Decimal("0.07815"), Decimal("0.07816"))

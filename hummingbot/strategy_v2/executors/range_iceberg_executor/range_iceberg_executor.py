@@ -768,11 +768,12 @@ class RangeIcebergExecutor(ExecutorBase):
         self._lookup_started.add(order_id)
         state = await self._lookup_order_state(order_id)
         self._refresh_tracked_orders()
-        if state is None:
-            self._halt_for_unknown_order(order_id, "The order could not be read.")
+        if self._is_confirmed_absent(state) or state == OrderState.CANCELED:
+            self._resolved_terminal.add(order_id)
+            self._clear_open_retry(order_id)
             return True
-        if state in (OrderState.FILLED, OrderState.CANCELED, OrderState.FAILED):
-            if state == OrderState.FILLED and not self._known_fill_size(order_id):
+        if state == OrderState.FILLED:
+            if not self._known_fill_size(order_id):
                 self._halt_for_unknown_order(
                     order_id,
                     "The exchange says the order is filled but no size was recorded.",
@@ -780,6 +781,9 @@ class RangeIcebergExecutor(ExecutorBase):
                 return True
             self._resolved_terminal.add(order_id)
             self._clear_open_retry(order_id)
+            return True
+        if state is None or state == OrderState.FAILED:
+            self._halt_for_unknown_order(order_id, "The order state is unknown.")
             return True
         self._open_lookup_count[order_id] = self._open_lookup_count.get(order_id, 0) + 1
         self._open_lookup_started.setdefault(order_id, now)
@@ -816,10 +820,15 @@ class RangeIcebergExecutor(ExecutorBase):
             self._resolved_terminal.add(order_id)
             self._clear_open_retry(order_id)
 
+    def _is_confirmed_absent(self, state) -> bool:
+        return state == "confirmed_absent"
+
     def _lookup_clears_halt(self, order_id: str, state) -> bool:
+        if self._is_confirmed_absent(state):
+            return True
         if state == OrderState.FILLED:
             return self._known_fill_size(order_id)
-        return state in (OrderState.CANCELED, OrderState.FAILED)
+        return state == OrderState.CANCELED
 
     def _clear_open_retry(self, order_id: str):
         self._open_lookup_count.pop(order_id, None)
