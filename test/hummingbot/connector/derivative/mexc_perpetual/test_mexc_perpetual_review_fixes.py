@@ -1067,6 +1067,7 @@ class MexcPerpetualReviewFixTests(IsolatedAsyncioWrapperTestCase):
         self.assertEqual(CONSTANTS.OPEN_TYPE_ISOLATED, payload["openType"])
 
     async def test_leverage_change_sends_position_id_when_a_position_exists(self):
+        self.exchange._position_mode_confirmed = True
         await self._hold_hedge_position(PositionSide.LONG, 1, CONSTANTS.OPEN_TYPE_CROSS, 42, hold_vol="10")
         self.exchange._perpetual_trading.set_position_mode(PositionMode.ONEWAY)
         await self.exchange.set_margin_mode(MarginMode.ISOLATED)
@@ -1189,6 +1190,7 @@ class MexcPerpetualReviewFixTests(IsolatedAsyncioWrapperTestCase):
         self.assertEqual(6, captured[0]["leverage"])
 
     async def test_hedge_set_leverage_for_an_empty_long_does_not_send_the_short(self):
+        self.exchange._position_mode_confirmed = True
         self.exchange._perpetual_trading.set_position_mode(PositionMode.HEDGE)
         captured = []
 
@@ -1355,7 +1357,39 @@ class MexcPerpetualReviewFixTests(IsolatedAsyncioWrapperTestCase):
         self.assertEqual([], captured)
         self.assertIn("position side", self.exchange.leverage_confirmation_error())
 
+    async def test_side_less_leverage_raises_until_hedge_mode_is_read(self):
+        await self._hold_hedge_position(PositionSide.LONG, 2, CONSTANTS.OPEN_TYPE_ISOLATED, 101)
+        await self._hold_hedge_position(PositionSide.SHORT, 5, CONSTANTS.OPEN_TYPE_CROSS, 202, hold_vol="10")
+        # The read has not succeeded. The connector still defaults to one-way.
+        self.exchange._perpetual_trading.set_position_mode(PositionMode.ONEWAY)
+        self.exchange._position_mode_confirmed = False
+        captured = []
+
+        async def post(path_url, data=None, **kwargs):
+            captured.append(data)
+            return {"success": True, "code": 0}
+
+        self.exchange._api_post = post
+        with self.assertRaises(IOError) as unread:
+            await self.exchange._execute_set_leverage(self.trading_pair, 9)
+        self.assertIn("position mode", str(unread.exception))
+        self.assertEqual([], captured)
+        self.assertNotEqual(9, self.exchange.get_leverage(self.trading_pair))
+
+        self.exchange._position_mode_confirmed = True
+        self.exchange._perpetual_trading.set_position_mode(PositionMode.HEDGE)
+        with self.assertRaises(IOError) as side_less:
+            await self.exchange._execute_set_leverage(self.trading_pair, 9)
+        self.assertIn("position side", str(side_less.exception))
+        self.assertEqual([], captured)
+        self.assertNotEqual(9, self.exchange.get_leverage(self.trading_pair))
+
+        await self.exchange._execute_set_leverage(self.trading_pair, 2, PositionSide.LONG)
+        self.assertEqual([], captured)
+        self.assertEqual(2, self.exchange.get_leverage(self.trading_pair))
+
     async def test_explicit_margin_on_an_empty_hedge_side_sends_only_that_side(self):
+        self.exchange._position_mode_confirmed = True
         self.exchange._perpetual_trading.set_position_mode(PositionMode.HEDGE)
         captured = []
 

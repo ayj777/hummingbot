@@ -1720,7 +1720,7 @@ class MexcPerpetualDerivative(PerpetualDerivativePyBase):
     def set_leverage(self, trading_pair: str, leverage: int = 1, position_side: Optional[PositionSide] = None):
         """
         Set leverage for one pair. In hedge mode, pass position_side so the other side is left alone.
-        This path does not send openType.
+        This path does not send openType. The account position mode must already have been read.
         """
         safe_ensure_future(self._execute_set_leverage(trading_pair, leverage, position_side))
 
@@ -1740,7 +1740,15 @@ class MexcPerpetualDerivative(PerpetualDerivativePyBase):
             self._perpetual_trading.set_leverage(trading_pair, leverage)
             self._leverage_explicit = True
             self.logger().info(f"Leverage for {trading_pair} successfully set to {leverage}.")
-        elif msg.startswith("Refusing"):
+            return
+        # The stock set_leverage route awaits this method and treats a normal return as success.
+        # Hedge mode has no side on that route. Until the mode read succeeds the connector still
+        # looks one-way, so a side-less call could change every loaded side. Both refusals raise.
+        side_less_hedge = self.position_mode is PositionMode.HEDGE and position_side is None
+        if not self._position_mode_confirmed or side_less_hedge:
+            self.logger().error(msg)
+            raise IOError(msg)
+        if msg.startswith("Refusing"):
             self.logger().error(msg)
         else:
             self.logger().network(f"Error setting leverage {leverage} for {trading_pair}: {msg}")
@@ -1776,12 +1784,19 @@ class MexcPerpetualDerivative(PerpetualDerivativePyBase):
     ) -> Tuple[bool, str]:
         """
         Change leverage for the pair. openType is included only when margin_mode is set.
-        A named position_side is the only side that is read or changed. Hedge mode
-        requires that side, so one call cannot move the long and the short.
+        Nothing is sent until the account position mode has been read. Before that read
+        the connector still defaults to one-way, and a side-less call would change every
+        loaded side. A named position_side is the only side that is read or changed.
+        Hedge mode requires that side, so one call cannot move the long and the short.
         When margin_mode is omitted and this side's position is not loaded, the
         exchange is not called. When the loaded position already uses this leverage,
         and margin is not being changed, the exchange is not called either.
         """
+        if not self._position_mode_confirmed:
+            return False, (
+                f"Refusing to change leverage for {trading_pair} "
+                "until the account position mode has been read."
+            )
         symbol = await self.exchange_symbol_associated_to_pair(trading_pair)
         requested = None if margin_mode is None else self._coerce_margin_mode(margin_mode)
         if margin_mode is not None and requested is None:
