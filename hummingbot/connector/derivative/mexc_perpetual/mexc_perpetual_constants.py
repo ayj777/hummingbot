@@ -20,6 +20,9 @@ MARKET_ORDER_DEFAULT_LEVELS = 20
 # Feature is under maintenance / the futures system is under maintenance.
 MAINTENANCE_ERROR_CODES = {604, 801}
 ORDER_NOT_FOUND_ERROR_CODES = {2040}
+CONFIRMED_ABSENT = "confirmed_absent"
+# The order can no longer be canceled. That is what a fill looks like on the cancel endpoint.
+ORDER_CANNOT_CANCEL_ERROR_CODE = 2041
 
 # Order side: 1 open long, 2 close short, 3 open short, 4 close long.
 SIDE_OPEN_LONG = 1
@@ -81,8 +84,14 @@ CANCEL_ORDER_PATH = "/api/v1/private/order/cancel"
 CANCEL_BY_EXTERNAL_PATH = "/api/v1/private/order/cancel_with_external"
 ORDER_BY_EXTERNAL_PATH = "/api/v1/private/order/external/{symbol}/{external_oid}"
 ORDER_BY_EXTERNAL_LIMIT_ID = "/api/v1/private/order/external"
+ORDER_GET_PATH = "/api/v1/private/order/get/{order_id}"
+ORDER_GET_LIMIT_ID = "/api/v1/private/order/get"
 ORDER_DEALS_PATH = "/api/v1/private/order/deal_details/{order_id}"
 ORDER_DEALS_LIMIT_ID = "/api/v1/private/order/deal_details"
+OPEN_ORDERS_PATH = "/api/v1/private/order/list/open_orders"
+OPEN_ORDERS_LIMIT_ID = "/api/v1/private/order/list/open_orders"
+OPEN_ORDERS_PAGE_SIZE = 100
+OPEN_ORDERS_MAX_PAGES = 20
 ASSETS_PATH = "/api/v1/private/account/assets"
 OPEN_POSITIONS_PATH = "/api/v1/private/position/open_positions"
 CHANGE_LEVERAGE_PATH = "/api/v1/private/position/change_leverage"
@@ -186,7 +195,9 @@ RATE_LIMITS = [
     RateLimit(limit_id=STOP_ORDER_LIST_PATH, limit=20, time_interval=2),
     RateLimit(limit_id=CANCEL_BY_EXTERNAL_PATH, limit=20, time_interval=2),
     RateLimit(limit_id=ORDER_BY_EXTERNAL_LIMIT_ID, limit=20, time_interval=2),
+    RateLimit(limit_id=ORDER_GET_LIMIT_ID, limit=20, time_interval=2),
     RateLimit(limit_id=ORDER_DEALS_LIMIT_ID, limit=20, time_interval=2),
+    RateLimit(limit_id=OPEN_ORDERS_LIMIT_ID, limit=20, time_interval=2),
     RateLimit(limit_id=ASSETS_PATH, limit=20, time_interval=2),
     RateLimit(limit_id=OPEN_POSITIONS_PATH, limit=20, time_interval=2),
     RateLimit(limit_id=CHANGE_LEVERAGE_PATH, limit=10, time_interval=10),

@@ -87,16 +87,26 @@ def floor_sell_price(price: Decimal, step: Decimal, floor: Decimal) -> Decimal:
 
 
 def clamp_price(price: Decimal, price_low: Decimal, price_high: Decimal, price_step: Decimal) -> Decimal:
+    """
+    Move price onto a tick that sits inside [price_low, price_high].
+
+    If rounding cannot find such a tick, raise. Callers fail the plan instead of trading
+    through the band.
+    """
+    if price < price_low:
+        price = price_low
+    if price > price_high:
+        price = price_high
     if price_step is None or price_step <= 0:
         quantized = price
     else:
         quantized = quantize_down(price, price_step)
         if quantized < price_low:
-            quantized = (price_low / price_step).to_integral_value(rounding=ROUND_CEILING) * price_step
-    if quantized < price_low:
-        quantized = price_low
-    if quantized > price_high:
-        quantized = quantize_down(price_high, price_step) if price_step and price_step > 0 else price_high
+            quantized = quantize_up(price_low, price_step)
+    if quantized < price_low or quantized > price_high:
+        raise ValueError(
+            f"No price tick falls inside [{price_low}, {price_high}] with step {price_step}."
+        )
     return quantized
 
 

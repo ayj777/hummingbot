@@ -38,6 +38,9 @@ class MexcPerpetualAPIOrderBookDataSource(PerpetualAPIOrderBookDataSource):
         self._ping_task: Optional[asyncio.Task] = None
         self._last_depth_version: Dict[str, int] = {}
         self._snapshot_output: Optional[asyncio.Queue] = None
+        self._diff_output: Optional[asyncio.Queue] = None
+        self._diffs_need_snapshot = False
+        self._snapshot_retry_task: Optional[asyncio.Task] = None
 
     async def get_last_traded_prices(self, trading_pairs: List[str], domain: Optional[str] = None) -> Dict[str, float]:
         return await self._connector.get_last_traded_prices(trading_pairs=trading_pairs)
@@ -182,18 +185,40 @@ class MexcPerpetualAPIOrderBookDataSource(PerpetualAPIOrderBookDataSource):
         data = raw_message.get("data") or {}
         symbol = raw_message.get("symbol") or data.get("symbol")
         trading_pair = await self._connector.trading_pair_associated_to_exchange_symbol(symbol)
+        if self._diffs_need_snapshot:
+            return
         begin = self._optional_int(data.get("begin"))
         end = self._optional_int(data.get("end", data.get("version")))
         last_version = self._last_depth_version.get(symbol)
+        if last_version is not None and end is not None and end <= last_version:
+            return
         if last_version is not None and begin is not None and begin > last_version + 1:
+            gap = begin - last_version - 1
             self.logger().warning(
                 f"Order book depth gap for {symbol}: local version {last_version}, update begins at {begin}."
             )
-            self._last_depth_version.pop(symbol, None)
-            await self._refresh_snapshot(trading_pair)
-            return
+            if gap < 1000 and await self._apply_depth_commits(trading_pair, symbol, message_queue, begin):
+                last_version = self._last_depth_version.get(symbol)
+                if last_version is not None and end is not None and end <= last_version:
+                    return
+                if last_version is not None and begin > last_version + 1:
+                    return
+            else:
+                self._last_depth_version.pop(symbol, None)
+                await self._refresh_snapshot(trading_pair)
+                return
         if end is not None:
             self._last_depth_version[symbol] = end
+        self._enqueue_depth_diff(trading_pair, end or 0, data, raw_message, message_queue)
+
+    def _enqueue_depth_diff(
+        self,
+        trading_pair: str,
+        update_id: int,
+        data: Dict[str, Any],
+        raw_message: Dict[str, Any],
+        message_queue: asyncio.Queue,
+    ):
         contract_size = self._connector.get_contract_size(trading_pair)
         timestamp = int(raw_message.get("ts") or data.get("ts") or 0) * 1e-3
         message_queue.put_nowait(
@@ -201,13 +226,46 @@ class MexcPerpetualAPIOrderBookDataSource(PerpetualAPIOrderBookDataSource):
                 OrderBookMessageType.DIFF,
                 {
                     "trading_pair": trading_pair,
-                    "update_id": end or 0,
+                    "update_id": update_id,
                     "bids": self._depth_rows(data.get("bids") or [], contract_size),
                     "asks": self._depth_rows(data.get("asks") or [], contract_size),
                 },
                 timestamp,
             )
         )
+
+    async def _apply_depth_commits(
+        self,
+        trading_pair: str,
+        symbol: str,
+        message_queue: asyncio.Queue,
+        target_begin: int,
+    ) -> bool:
+        try:
+            payload = await self._public_get(
+                path_url=CONSTANTS.DEPTH_COMMITS_PATH.format(symbol=symbol, limit=1000),
+                limit_id=CONSTANTS.DEPTH_COMMITS_LIMIT_ID,
+            )
+        except Exception:
+            self.logger().warning(f"Could not load depth commits for {symbol}.")
+            return False
+        commits = payload.get("data") or []
+        if not isinstance(commits, list):
+            return False
+        commits = sorted(commits, key=lambda item: int(item.get("version") or 0))
+        last_version = self._last_depth_version.get(symbol)
+        for commit in commits:
+            version = self._optional_int(commit.get("version"))
+            if version is None or last_version is None or version <= last_version:
+                continue
+            if version > last_version + 1:
+                return False
+            self._enqueue_depth_diff(trading_pair, version, commit, commit, message_queue)
+            self._last_depth_version[symbol] = version
+            last_version = version
+            if last_version + 1 >= target_begin:
+                return True
+        return last_version is not None and last_version + 1 >= target_begin
 
     async def _parse_order_book_snapshot_message(self, raw_message: Dict[str, Any], message_queue: asyncio.Queue):
         # Public depth pushes are incremental. REST snapshots are built in _order_book_snapshot.
@@ -238,6 +296,10 @@ class MexcPerpetualAPIOrderBookDataSource(PerpetualAPIOrderBookDataSource):
                 )
             )
 
+    async def listen_for_order_book_diffs(self, ev_loop: asyncio.AbstractEventLoop, output: asyncio.Queue):
+        self._diff_output = output
+        await super().listen_for_order_book_diffs(ev_loop, output)
+
     async def listen_for_order_book_snapshots(self, ev_loop: asyncio.AbstractEventLoop, output: asyncio.Queue):
         self._snapshot_output = output
         await super().listen_for_order_book_snapshots(ev_loop, output)
@@ -249,6 +311,9 @@ class MexcPerpetualAPIOrderBookDataSource(PerpetualAPIOrderBookDataSource):
                 ws = await self._connected_websocket_assistant()
                 self._ws_assistant = ws
                 await self._subscribe_channels(ws)
+                self._diffs_need_snapshot = True
+                self._last_depth_version.clear()
+                self._snapshot_retry_task = asyncio.create_task(self._retry_snapshots_until_ready())
                 self._ping_task = asyncio.create_task(self._send_interval_ping(ws))
                 await self._process_websocket_messages(websocket_assistant=ws)
             except asyncio.CancelledError:
@@ -262,6 +327,8 @@ class MexcPerpetualAPIOrderBookDataSource(PerpetualAPIOrderBookDataSource):
                 await self._sleep(5.0)
             finally:
                 await self._cancel_ping_task()
+                await self._cancel_snapshot_retry_task()
+                self._diffs_need_snapshot = True
                 self._last_depth_version.clear()
                 self._ws_assistant = None
                 await self._on_order_stream_interruption(websocket_assistant=ws)
@@ -277,10 +344,50 @@ class MexcPerpetualAPIOrderBookDataSource(PerpetualAPIOrderBookDataSource):
             self.logger().exception("Error sending interval ping")
 
     async def _refresh_snapshot(self, trading_pair: str):
-        if self._snapshot_output is None:
+        queue = self._diff_output or self._snapshot_output
+        if queue is None:
             return
         snapshot = await self._order_book_snapshot(trading_pair)
-        self._snapshot_output.put_nowait(snapshot)
+        queue.put_nowait(snapshot)
+        self._diffs_need_snapshot = False
+
+    async def _publish_fresh_snapshots(self) -> bool:
+        queue = self._diff_output or self._snapshot_output
+        if queue is None or not self._trading_pairs:
+            self._diffs_need_snapshot = True
+            return False
+        for trading_pair in list(self._trading_pairs):
+            try:
+                snapshot = await self._order_book_snapshot(trading_pair)
+            except Exception:
+                self.logger().exception(f"Could not snapshot {trading_pair} before applying diffs.")
+                self._diffs_need_snapshot = True
+                return False
+            queue.put_nowait(snapshot)
+        self._diffs_need_snapshot = False
+        return True
+
+    async def _retry_snapshots_until_ready(self):
+        while self._diffs_need_snapshot:
+            try:
+                if await self._publish_fresh_snapshots():
+                    return
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                self.logger().exception("Order book snapshot retry failed.")
+            await self._sleep(1.0)
+
+    async def _cancel_snapshot_retry_task(self):
+        task = self._snapshot_retry_task
+        self._snapshot_retry_task = None
+        if task is None:
+            return
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
 
     async def _public_get(
         self,
