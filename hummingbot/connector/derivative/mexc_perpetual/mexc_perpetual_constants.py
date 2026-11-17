@@ -76,6 +76,7 @@ FUNDING_RATE_PATH = "/api/v1/contract/funding_rate/{symbol}"
 FUNDING_RATE_LIMIT_ID = "/api/v1/contract/funding_rate"
 
 PLACE_ORDER_PATH = "/api/v1/private/order/create"
+BATCH_ORDER_PATH = "/api/v1/private/order/submit_batch"
 CANCEL_ORDER_PATH = "/api/v1/private/order/cancel"
 CANCEL_BY_EXTERNAL_PATH = "/api/v1/private/order/cancel_with_external"
 ORDER_BY_EXTERNAL_PATH = "/api/v1/private/order/external/{symbol}/{external_oid}"
@@ -88,6 +89,35 @@ CHANGE_LEVERAGE_PATH = "/api/v1/private/position/change_leverage"
 POSITION_MODE_PATH = "/api/v1/private/position/position_mode"
 CHANGE_POSITION_MODE_PATH = "/api/v1/private/position/change_position_mode"
 FUNDING_RECORDS_PATH = "/api/v1/private/position/funding_records"
+
+PLAN_ORDER_PLACE_PATH = "/api/v1/private/planorder/place/v2"
+PLAN_ORDER_CANCEL_PATH = "/api/v1/private/planorder/cancel"
+PLAN_ORDER_CANCEL_ALL_PATH = "/api/v1/private/planorder/cancel_all"
+PLAN_ORDER_CHANGE_PRICE_PATH = "/api/v1/private/planorder/change_price"
+PLAN_ORDER_CHANGE_STOP_PATH = "/api/v1/private/planorder/change_stop_order"
+PLAN_ORDER_LIST_PATH = "/api/v1/private/planorder/list/orders"
+
+STOP_ORDER_PLACE_PATH = "/api/v1/private/stoporder/place"
+STOP_ORDER_CANCEL_PATH = "/api/v1/private/stoporder/cancel"
+STOP_ORDER_CANCEL_ALL_PATH = "/api/v1/private/stoporder/cancel_all"
+STOP_ORDER_CHANGE_PRICE_PATH = "/api/v1/private/stoporder/change_price"
+STOP_ORDER_CHANGE_PLAN_PRICE_PATH = "/api/v1/private/stoporder/change_plan_price"
+STOP_ORDER_OPEN_PATH = "/api/v1/private/stoporder/open_orders"
+STOP_ORDER_LIST_PATH = "/api/v1/private/stoporder/list/orders"
+
+# Trigger price type: 1 latest, 2 fair, 3 index.
+TRIGGER_PRICE_LATEST = 1
+TRIGGER_PRICE_FAIR = 2
+TRIGGER_PRICE_INDEX = 3
+# Plan trigger: 1 price >= trigger, 2 price <= trigger.
+TRIGGER_TYPE_GTE = 1
+TRIGGER_TYPE_LTE = 2
+# Plan execute cycle: 1 is 24 hours, 2 is 7 days.
+EXECUTE_CYCLE_24H = 1
+EXECUTE_CYCLE_7D = 2
+BATCH_ORDER_MAX = 50
+# Self-trade prevention. 0 leaves both orders working.
+STP_MODE_NONE = 0
 
 WS_LOGIN_METHOD = "login"
 WS_PING_METHOD = "ping"
@@ -139,7 +169,21 @@ RATE_LIMITS = [
     RateLimit(limit_id=DEALS_LIMIT_ID, limit=20, time_interval=2),
     RateLimit(limit_id=FUNDING_RATE_LIMIT_ID, limit=20, time_interval=2),
     RateLimit(limit_id=PLACE_ORDER_PATH, limit=4, time_interval=2),
+    RateLimit(limit_id=BATCH_ORDER_PATH, limit=4, time_interval=2),
     RateLimit(limit_id=CANCEL_ORDER_PATH, limit=20, time_interval=2),
+    RateLimit(limit_id=PLAN_ORDER_PLACE_PATH, limit=4, time_interval=2),
+    RateLimit(limit_id=PLAN_ORDER_CANCEL_PATH, limit=20, time_interval=2),
+    RateLimit(limit_id=PLAN_ORDER_CANCEL_ALL_PATH, limit=20, time_interval=2),
+    RateLimit(limit_id=PLAN_ORDER_CHANGE_PRICE_PATH, limit=4, time_interval=2),
+    RateLimit(limit_id=PLAN_ORDER_CHANGE_STOP_PATH, limit=4, time_interval=2),
+    RateLimit(limit_id=PLAN_ORDER_LIST_PATH, limit=20, time_interval=2),
+    RateLimit(limit_id=STOP_ORDER_PLACE_PATH, limit=5, time_interval=2),
+    RateLimit(limit_id=STOP_ORDER_CANCEL_PATH, limit=20, time_interval=2),
+    RateLimit(limit_id=STOP_ORDER_CANCEL_ALL_PATH, limit=20, time_interval=2),
+    RateLimit(limit_id=STOP_ORDER_CHANGE_PRICE_PATH, limit=4, time_interval=2),
+    RateLimit(limit_id=STOP_ORDER_CHANGE_PLAN_PRICE_PATH, limit=4, time_interval=2),
+    RateLimit(limit_id=STOP_ORDER_OPEN_PATH, limit=20, time_interval=2),
+    RateLimit(limit_id=STOP_ORDER_LIST_PATH, limit=20, time_interval=2),
     RateLimit(limit_id=CANCEL_BY_EXTERNAL_PATH, limit=20, time_interval=2),
     RateLimit(limit_id=ORDER_BY_EXTERNAL_LIMIT_ID, limit=20, time_interval=2),
     RateLimit(limit_id=ORDER_DEALS_LIMIT_ID, limit=20, time_interval=2),

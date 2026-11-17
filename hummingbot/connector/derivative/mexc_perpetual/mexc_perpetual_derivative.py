@@ -1,5 +1,6 @@
 import asyncio
-from decimal import Decimal, ROUND_DOWN
+import time
+from decimal import ROUND_DOWN, Decimal
 from typing import Any, Dict, List, Optional, Tuple
 
 from bidict import bidict
@@ -276,20 +277,16 @@ class MexcPerpetualDerivative(PerpetualDerivativePyBase):
         position_action: PositionAction = PositionAction.NIL,
         **kwargs,
     ) -> Tuple[str, float]:
-        symbol = await self.exchange_symbol_associated_to_pair(trading_pair)
-        data = {
-            "symbol": symbol,
-            "price": self._price_string(price, order_type),
-            "vol": self._decimal_str(self._base_amount_to_contracts(trading_pair, amount)),
-            "leverage": int(self.get_leverage(trading_pair)),
-            "side": self._exchange_side(trade_type, position_action),
-            "type": CONSTANTS.ORDER_TYPE_MAP[order_type],
-            "openType": self._open_type(),
-            "externalOid": order_id,
-            "positionMode": CONSTANTS.POSITION_MODE_MAP[self.position_mode],
-        }
-        if self.position_mode is PositionMode.ONEWAY and position_action is PositionAction.CLOSE:
-            data["reduceOnly"] = True
+        data = await self._build_order_payload(
+            trading_pair=trading_pair,
+            amount=amount,
+            trade_type=trade_type,
+            order_type=order_type,
+            price=price,
+            position_action=position_action,
+            client_order_id=order_id,
+            **kwargs,
+        )
         try:
             response = await self._api_post(
                 path_url=CONSTANTS.PLACE_ORDER_PATH,
@@ -302,6 +299,361 @@ class MexcPerpetualDerivative(PerpetualDerivativePyBase):
                 return recovered
             raise
         return str(response["data"]["orderId"]), self.current_timestamp
+
+    async def _build_order_payload(
+        self,
+        trading_pair: str,
+        amount: Decimal,
+        trade_type: TradeType,
+        order_type: OrderType,
+        price: Decimal,
+        position_action: PositionAction,
+        client_order_id: Optional[str] = None,
+        **kwargs,
+    ) -> Dict[str, Any]:
+        symbol = await self.exchange_symbol_associated_to_pair(trading_pair)
+        leverage = kwargs.get("leverage")
+        if leverage is None:
+            leverage = self.get_leverage(trading_pair)
+        data: Dict[str, Any] = {
+            "symbol": symbol,
+            "price": self._price_string(price, order_type),
+            "vol": self._decimal_str(self._base_amount_to_contracts(trading_pair, amount)),
+            "leverage": int(leverage),
+            "side": self._exchange_side(trade_type, position_action),
+            "type": self._execution_type_code(order_type, kwargs.get("time_in_force")),
+            "openType": self._open_type(),
+            "positionMode": self._position_mode_code(kwargs.get("position_mode")),
+        }
+        if client_order_id:
+            data["externalOid"] = client_order_id
+        reduce_only = kwargs.get("reduce_only")
+        if reduce_only is None:
+            reduce_only = self.position_mode is PositionMode.ONEWAY and position_action is PositionAction.CLOSE
+        if reduce_only:
+            data["reduceOnly"] = True
+        self._attach_stop_prices(data, kwargs)
+        return data
+
+    async def place_batch_orders(self, orders: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """
+        POST /api/v1/private/order/submit_batch. MEXC allows this only for market maker accounts,
+        at most 50 orders, and counts it as 4 requests per 2 seconds.
+        """
+        if len(orders) > CONSTANTS.BATCH_ORDER_MAX:
+            raise ValueError(f"Batch place accepts at most {CONSTANTS.BATCH_ORDER_MAX} orders.")
+        payload = []
+        for order in orders:
+            body = await self._build_order_payload(
+                trading_pair=order["trading_pair"],
+                amount=Decimal(str(order["amount"])),
+                trade_type=order["trade_type"],
+                order_type=order["order_type"],
+                price=Decimal(str(order["price"])),
+                position_action=order.get("position_action", PositionAction.OPEN),
+                client_order_id=order.get("client_order_id"),
+                leverage=order.get("leverage"),
+                time_in_force=order.get("time_in_force"),
+                position_mode=order.get("position_mode"),
+                reduce_only=order.get("reduce_only"),
+            )
+            body["stpMode"] = int(order.get("stp_mode", CONSTANTS.STP_MODE_NONE))
+            payload.append(body)
+        response = await self._api_post(
+            path_url=CONSTANTS.BATCH_ORDER_PATH,
+            data=payload,
+            is_auth_required=True,
+        )
+        return response.get("data") or []
+
+    async def place_plan_order(
+        self,
+        trading_pair: str,
+        amount: Decimal,
+        trade_type: TradeType,
+        trigger_price: Decimal,
+        trigger_type: int,
+        order_type: OrderType = OrderType.LIMIT,
+        price: Optional[Decimal] = None,
+        position_action: PositionAction = PositionAction.OPEN,
+        trend: int = CONSTANTS.TRIGGER_PRICE_LATEST,
+        execute_cycle: int = CONSTANTS.EXECUTE_CYCLE_7D,
+        **kwargs,
+    ) -> str:
+        """
+        Standalone trigger order. POST /api/v1/private/planorder/place/v2.
+        trigger_type 1 fires at or above the trigger, 2 at or below.
+        trend and the optional loss_trend / profit_trend are 1 latest, 2 fair, 3 index.
+        """
+        symbol = await self.exchange_symbol_associated_to_pair(trading_pair)
+        data: Dict[str, Any] = {
+            "symbol": symbol,
+            "vol": self._decimal_str(self._base_amount_to_contracts(trading_pair, amount)),
+            "leverage": int(kwargs.get("leverage", self.get_leverage(trading_pair))),
+            "side": self._exchange_side(trade_type, position_action),
+            "openType": self._open_type(),
+            "triggerPrice": self._decimal_str(trigger_price),
+            "triggerType": int(trigger_type),
+            "executeCycle": int(execute_cycle),
+            "orderType": self._execution_type_code(order_type, kwargs.get("time_in_force")),
+            "trend": int(trend),
+            "positionMode": self._position_mode_code(kwargs.get("position_mode")),
+        }
+        if price is not None and order_type is not OrderType.MARKET:
+            data["price"] = self._decimal_str(price)
+        if kwargs.get("reduce_only"):
+            data["reduceOnly"] = True
+        if kwargs.get("price_protect") is not None:
+            data["priceProtect"] = int(kwargs["price_protect"])
+        self._attach_stop_prices(data, kwargs)
+        response = await self._api_post(
+            path_url=CONSTANTS.PLAN_ORDER_PLACE_PATH,
+            data=data,
+            is_auth_required=True,
+        )
+        return str(response.get("data"))
+
+    async def cancel_plan_orders(self, orders: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """
+        Cancel up to 50 plan orders. Each item needs symbol and order_id.
+        """
+        if len(orders) > CONSTANTS.BATCH_ORDER_MAX:
+            raise ValueError(f"Cancel plan orders accepts at most {CONSTANTS.BATCH_ORDER_MAX} orders.")
+        payload = {
+            "orders": [
+                {"symbol": item["symbol"], "orderId": self._normalize_order_id(item["order_id"])}
+                for item in orders
+            ]
+        }
+        return await self._api_post(
+            path_url=CONSTANTS.PLAN_ORDER_CANCEL_PATH,
+            data=payload,
+            is_auth_required=True,
+        )
+
+    async def cancel_all_plan_orders(self, trading_pair: Optional[str] = None) -> Dict[str, Any]:
+        data: Dict[str, Any] = {}
+        if trading_pair:
+            data["symbol"] = await self.exchange_symbol_associated_to_pair(trading_pair)
+        return await self._api_post(
+            path_url=CONSTANTS.PLAN_ORDER_CANCEL_ALL_PATH,
+            data=data or {},
+            is_auth_required=True,
+        )
+
+    async def list_plan_orders(
+        self,
+        trading_pair: Optional[str] = None,
+        states: str = "1",
+        start_time: Optional[int] = None,
+        end_time: Optional[int] = None,
+        page_num: int = 1,
+        page_size: int = 20,
+    ) -> Any:
+        """
+        Plan order list. states=1 is untriggered, which is the open set.
+        The endpoint requires a start and end time. The default window is the last 7 days.
+        """
+        now_ms = int(time.time() * 1000)
+        params: Dict[str, Any] = {
+            "states": states,
+            "start_time": int(start_time if start_time is not None else now_ms - 7 * 24 * 60 * 60 * 1000),
+            "end_time": int(end_time if end_time is not None else now_ms),
+            "page_num": page_num,
+            "page_size": page_size,
+        }
+        if trading_pair:
+            params["symbol"] = await self.exchange_symbol_associated_to_pair(trading_pair)
+        response = await self._api_get(
+            path_url=CONSTANTS.PLAN_ORDER_LIST_PATH,
+            params=params,
+            is_auth_required=True,
+        )
+        return response.get("data")
+
+    async def change_plan_order_price(
+        self,
+        trading_pair: str,
+        order_id: str,
+        trigger_price: Decimal,
+        price: Decimal,
+        order_type: int,
+        trigger_type: int,
+        trend: int = CONSTANTS.TRIGGER_PRICE_LATEST,
+        source: int = 2,
+    ) -> Dict[str, Any]:
+        """
+        POST /api/v1/private/planorder/change_price.
+        source 1 is the trade list and 2 is the order list.
+        """
+        return await self._api_post(
+            path_url=CONSTANTS.PLAN_ORDER_CHANGE_PRICE_PATH,
+            data={
+                "symbol": await self.exchange_symbol_associated_to_pair(trading_pair),
+                "orderId": self._normalize_order_id(order_id),
+                "triggerPrice": self._decimal_str(trigger_price),
+                "price": self._decimal_str(price),
+                "orderType": int(order_type),
+                "triggerType": int(trigger_type),
+                "trend": int(trend),
+                "from": int(source),
+            },
+            is_auth_required=True,
+        )
+
+    async def change_plan_order_stop(
+        self,
+        trading_pair: str,
+        order_id: str,
+        stop_loss_price: Optional[Decimal] = None,
+        take_profit_price: Optional[Decimal] = None,
+        loss_trend: Optional[int] = None,
+        profit_trend: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """
+        Change or clear the stop and take profit attached to a plan order.
+        Sending 0 for a price clears that side.
+        """
+        data: Dict[str, Any] = {
+            "symbol": await self.exchange_symbol_associated_to_pair(trading_pair),
+            "orderId": self._normalize_order_id(order_id),
+        }
+        self._put_optional_price(data, "stopLossPrice", stop_loss_price)
+        self._put_optional_price(data, "takeProfitPrice", take_profit_price)
+        if loss_trend is not None:
+            data["lossTrend"] = int(loss_trend)
+        if profit_trend is not None:
+            data["profitTrend"] = int(profit_trend)
+        return await self._api_post(
+            path_url=CONSTANTS.PLAN_ORDER_CHANGE_STOP_PATH,
+            data=data,
+            is_auth_required=True,
+        )
+
+    async def place_position_stop_order(
+        self,
+        trading_pair: str,
+        position_id: str,
+        amount: Decimal,
+        stop_loss_price: Optional[Decimal] = None,
+        take_profit_price: Optional[Decimal] = None,
+        loss_trend: int = CONSTANTS.TRIGGER_PRICE_LATEST,
+        profit_trend: int = CONSTANTS.TRIGGER_PRICE_LATEST,
+        **kwargs,
+    ) -> str:
+        """
+        Standalone TP/SL for an open position. POST /api/v1/private/stoporder/place.
+        Amount is base size and is converted to contracts.
+        """
+        if (stop_loss_price is None or stop_loss_price <= 0) and (take_profit_price is None or take_profit_price <= 0):
+            raise ValueError("A position stop order needs a stop loss price or a take profit price.")
+        data: Dict[str, Any] = {
+            "positionId": self._normalize_order_id(position_id),
+            "vol": self._decimal_str(self._base_amount_to_contracts(trading_pair, amount)),
+            "lossTrend": int(loss_trend),
+            "profitTrend": int(profit_trend),
+        }
+        self._put_optional_price(data, "stopLossPrice", stop_loss_price)
+        self._put_optional_price(data, "takeProfitPrice", take_profit_price)
+        for key, field in (
+            ("price_protect", "priceProtect"),
+            ("vol_type", "volType"),
+            ("take_profit_type", "takeProfitType"),
+            ("stop_loss_type", "stopLossType"),
+            ("take_profit_reverse", "takeProfitReverse"),
+            ("stop_loss_reverse", "stopLossReverse"),
+        ):
+            if kwargs.get(key) is not None:
+                data[field] = int(kwargs[key])
+        if kwargs.get("profit_loss_vol_type"):
+            data["profitLossVolType"] = kwargs["profit_loss_vol_type"]
+        if kwargs.get("take_profit_order_price") is not None:
+            data["takeProfitOrderPrice"] = self._decimal_str(Decimal(str(kwargs["take_profit_order_price"])))
+        if kwargs.get("stop_loss_order_price") is not None:
+            data["stopLossOrderPrice"] = self._decimal_str(Decimal(str(kwargs["stop_loss_order_price"])))
+        response = await self._api_post(
+            path_url=CONSTANTS.STOP_ORDER_PLACE_PATH,
+            data=data,
+            is_auth_required=True,
+        )
+        return str(response.get("data"))
+
+    async def cancel_stop_orders(self, stop_plan_order_ids: List[str]) -> Dict[str, Any]:
+        if len(stop_plan_order_ids) > CONSTANTS.BATCH_ORDER_MAX:
+            raise ValueError(f"Cancel stop orders accepts at most {CONSTANTS.BATCH_ORDER_MAX} orders.")
+        return await self._api_post(
+            path_url=CONSTANTS.STOP_ORDER_CANCEL_PATH,
+            data={"orders": [{"stopPlanOrderId": self._normalize_order_id(order_id)} for order_id in stop_plan_order_ids]},
+            is_auth_required=True,
+        )
+
+    async def cancel_all_stop_orders(
+        self,
+        trading_pair: Optional[str] = None,
+        position_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        data: Dict[str, Any] = {}
+        if position_id is not None:
+            data["positionId"] = self._normalize_order_id(position_id)
+        elif trading_pair:
+            data["symbol"] = await self.exchange_symbol_associated_to_pair(trading_pair)
+        return await self._api_post(
+            path_url=CONSTANTS.STOP_ORDER_CANCEL_ALL_PATH,
+            data=data or {},
+            is_auth_required=True,
+        )
+
+    async def list_open_stop_orders(self, trading_pair: Optional[str] = None) -> Any:
+        params: Dict[str, Any] = {}
+        if trading_pair:
+            params["symbol"] = await self.exchange_symbol_associated_to_pair(trading_pair)
+        response = await self._api_get(
+            path_url=CONSTANTS.STOP_ORDER_OPEN_PATH,
+            params=params or None,
+            is_auth_required=True,
+        )
+        return response.get("data")
+
+    async def change_stop_order_price(
+        self,
+        order_id: str,
+        stop_loss_price: Optional[Decimal] = None,
+        take_profit_price: Optional[Decimal] = None,
+        loss_trend: Optional[int] = None,
+        profit_trend: Optional[int] = None,
+        **kwargs,
+    ) -> Dict[str, Any]:
+        """
+        POST /api/v1/private/stoporder/change_price. order_id is the limit order id.
+        Empty or zero prices clear that side.
+        """
+        data: Dict[str, Any] = {"orderId": self._normalize_order_id(order_id)}
+        self._put_stop_change_fields(data, stop_loss_price, take_profit_price, loss_trend, profit_trend, kwargs)
+        return await self._api_post(
+            path_url=CONSTANTS.STOP_ORDER_CHANGE_PRICE_PATH,
+            data=data,
+            is_auth_required=True,
+        )
+
+    async def change_stop_plan_price(
+        self,
+        stop_plan_order_id: str,
+        stop_loss_price: Optional[Decimal] = None,
+        take_profit_price: Optional[Decimal] = None,
+        loss_trend: Optional[int] = None,
+        profit_trend: Optional[int] = None,
+        **kwargs,
+    ) -> Dict[str, Any]:
+        """
+        POST /api/v1/private/stoporder/change_plan_price. At least one price must be above zero.
+        """
+        data: Dict[str, Any] = {"stopPlanOrderId": self._normalize_order_id(stop_plan_order_id)}
+        self._put_stop_change_fields(data, stop_loss_price, take_profit_price, loss_trend, profit_trend, kwargs)
+        return await self._api_post(
+            path_url=CONSTANTS.STOP_ORDER_CHANGE_PLAN_PRICE_PATH,
+            data=data,
+            is_auth_required=True,
+        )
 
     async def _recover_order_by_client_id(self, trading_pair: str, client_order_id: str) -> Optional[Tuple[str, float]]:
         """
@@ -673,6 +1025,60 @@ class MexcPerpetualDerivative(PerpetualDerivativePyBase):
         if deal_vol > s_decimal_0:
             return OrderState.PARTIALLY_FILLED
         return OrderState.OPEN
+
+    @staticmethod
+    def _execution_type_code(order_type: OrderType, time_in_force: Optional[str]) -> int:
+        normalized = (time_in_force or "").upper()
+        if normalized == "FOK":
+            return CONSTANTS.ORDER_TYPE_FOK
+        if normalized == "IOC":
+            return CONSTANTS.ORDER_TYPE_IOC
+        if normalized == "POST_ONLY":
+            return CONSTANTS.ORDER_TYPE_POST_ONLY
+        return CONSTANTS.ORDER_TYPE_MAP[order_type]
+
+    def _position_mode_code(self, position_mode: Any) -> int:
+        if position_mode is None:
+            return CONSTANTS.POSITION_MODE_MAP[self.position_mode]
+        if isinstance(position_mode, PositionMode):
+            return CONSTANTS.POSITION_MODE_MAP[position_mode]
+        return int(position_mode)
+
+    @staticmethod
+    def _attach_stop_prices(data: Dict[str, Any], kwargs: Dict[str, Any]):
+        stop_loss = kwargs.get("stop_loss_price")
+        take_profit = kwargs.get("take_profit_price")
+        if stop_loss is not None:
+            data["stopLossPrice"] = MexcPerpetualDerivative._decimal_str(Decimal(str(stop_loss)))
+            data["lossTrend"] = int(kwargs.get("loss_trend") or CONSTANTS.TRIGGER_PRICE_LATEST)
+        if take_profit is not None:
+            data["takeProfitPrice"] = MexcPerpetualDerivative._decimal_str(Decimal(str(take_profit)))
+            data["profitTrend"] = int(kwargs.get("profit_trend") or CONSTANTS.TRIGGER_PRICE_LATEST)
+
+    @staticmethod
+    def _put_optional_price(data: Dict[str, Any], field: str, price: Optional[Decimal]):
+        if price is not None:
+            data[field] = MexcPerpetualDerivative._decimal_str(Decimal(str(price)))
+
+    @staticmethod
+    def _put_stop_change_fields(
+        data: Dict[str, Any],
+        stop_loss_price: Optional[Decimal],
+        take_profit_price: Optional[Decimal],
+        loss_trend: Optional[int],
+        profit_trend: Optional[int],
+        kwargs: Dict[str, Any],
+    ):
+        MexcPerpetualDerivative._put_optional_price(data, "stopLossPrice", stop_loss_price)
+        MexcPerpetualDerivative._put_optional_price(data, "takeProfitPrice", take_profit_price)
+        if loss_trend is not None:
+            data["lossTrend"] = int(loss_trend)
+        if profit_trend is not None:
+            data["profitTrend"] = int(profit_trend)
+        if kwargs.get("take_profit_reverse") is not None:
+            data["takeProfitReverse"] = int(kwargs["take_profit_reverse"])
+        if kwargs.get("stop_loss_reverse") is not None:
+            data["stopLossReverse"] = int(kwargs["stop_loss_reverse"])
 
     def _exchange_side(self, trade_type: TradeType, position_action: PositionAction) -> int:
         if trade_type is TradeType.BUY and position_action is PositionAction.OPEN:
