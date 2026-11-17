@@ -1,4 +1,6 @@
 import asyncio
+import hashlib
+import hmac
 import json
 import re
 from decimal import Decimal
@@ -316,8 +318,14 @@ class MexcPerpetualDerivativeTests(AbstractPerpetualDerivativeTests.PerpetualDer
             self.assertEqual(order.price, Decimal(request_data["price"]))
 
     def validate_order_cancelation_request(self, order: InFlightOrder, request_call: RequestCall):
-        request_data = json.loads(request_call.kwargs["data"])
-        self.assertEqual([int(order.exchange_order_id)], request_data["orderIds"])
+        raw = request_call.kwargs["data"]
+        expected = json.dumps([str(order.exchange_order_id)])
+        self.assertEqual(expected, raw)
+        self.assertIsInstance(json.loads(raw), list)
+        timestamp = request_call.kwargs["headers"]["Request-Time"]
+        signed = f"{self.api_key}{timestamp}{raw}"
+        signature = hmac.new(self.api_secret.encode("utf-8"), signed.encode("utf-8"), hashlib.sha256).hexdigest()
+        self.assertEqual(signature, request_call.kwargs["headers"]["Signature"])
 
     def validate_order_status_request(self, order: InFlightOrder, request_call: RequestCall):
         self.assertFalse(request_call.kwargs.get("params"))

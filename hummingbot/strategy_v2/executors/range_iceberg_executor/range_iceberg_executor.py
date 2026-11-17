@@ -97,6 +97,8 @@ class RangeIcebergExecutor(ExecutorBase):
         self._account_settings_ready = False
         self._account_settings_failed = False
         self._account_settings_error = ""
+        self._shutdown_pending = False
+        self._cancel_stop_error = ""
         self._unconfirmed_cancels: Set[str] = set()
         self._failed_order_ids: Set[str] = set()
         self._submitted_order_ids: List[str] = []
@@ -253,6 +255,9 @@ class RangeIcebergExecutor(ExecutorBase):
     async def control_task(self):
         if self.status == RunnableStatus.TERMINATED:
             return
+        if self._shutdown_pending:
+            await self._finish_shutdown()
+            return
         if not await self._ensure_account_settings():
             return
         if not self._contract_size_ready():
@@ -273,7 +278,6 @@ class RangeIcebergExecutor(ExecutorBase):
             self.early_stop(keep_position=False, close_type=CloseType.EXPIRED)
             return
         if self._execution_complete():
-            self._cancel_working_orders()
             self.close_execution_finished()
             return
         if self.status != RunnableStatus.RUNNING or self._paused:
@@ -295,13 +299,53 @@ class RangeIcebergExecutor(ExecutorBase):
     def early_stop(self, keep_position: bool = False, close_type: Optional[CloseType] = None):
         self.close_type = close_type or (CloseType.POSITION_HOLD if keep_position else CloseType.EARLY_STOP)
         self.close_timestamp = self._strategy.current_timestamp
-        self._cancel_working_orders()
-        self.stop()
+        self._begin_shutdown()
 
     def close_execution_finished(self):
         self.close_type = CloseType.COMPLETED
         self.close_timestamp = self._strategy.current_timestamp
+        self._begin_shutdown()
+
+    def _begin_shutdown(self):
+        """
+        Ask the exchange to cancel working orders, then stay up until those cancels
+        are confirmed. A stop that returns while the orders are still open hides the failure.
+        """
+        self._shutdown_pending = True
+        self._cancel_working_orders()
+        pending = self._unconfirmed_cancel_ids()
+        if not pending:
+            self._cancel_stop_error = ""
+            self.stop()
+            return
+        self._note_unconfirmed_cancels(pending)
+
+    def _unconfirmed_cancel_ids(self) -> List[str]:
+        return sorted(order_id for order_id in self._unconfirmed_cancels if not self._cancel_confirmed(order_id))
+
+    def _note_unconfirmed_cancels(self, pending: List[str]):
+        message = (
+            f"Cancel was not confirmed for {', '.join(pending)}. These orders may still be open."
+        )
+        if message != self._cancel_stop_error:
+            self._cancel_stop_error = message
+            self.logger().error(message)
+
+    async def _finish_shutdown(self):
+        await self._release_confirmed_failures()
+        pending = self._unconfirmed_cancel_ids()
+        if pending:
+            self._note_unconfirmed_cancels(pending)
+            return
+        self._cancel_stop_error = ""
+        self._shutdown_pending = False
         self.stop()
+
+    def _cancel_outstanding_orders(self):
+        self._cancel_working_orders()
+        pending = self._unconfirmed_cancel_ids()
+        if pending:
+            self._note_unconfirmed_cancels(pending)
 
     async def _control_up_to(self):
         if self._replacement_blocked():
@@ -1047,6 +1091,8 @@ class RangeIcebergExecutor(ExecutorBase):
     def _status_reason(self) -> str:
         if self._unknown_order_ids:
             return "unknown_order_halt: " + ", ".join(sorted(self._unknown_order_ids))
+        if self._cancel_stop_error:
+            return self._cancel_stop_error
         if self._account_settings_error:
             return self._account_settings_error
         if self._open_lookup_count:

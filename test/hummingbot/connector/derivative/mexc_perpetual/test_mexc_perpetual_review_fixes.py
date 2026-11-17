@@ -1,6 +1,9 @@
 import asyncio
+import hashlib
+import hmac
 import json
 import random
+import re
 from decimal import Decimal
 from test.isolated_asyncio_wrapper_test_case import IsolatedAsyncioWrapperTestCase
 from unittest.mock import AsyncMock
@@ -939,6 +942,148 @@ class MexcPerpetualReviewFixTests(IsolatedAsyncioWrapperTestCase):
         await asyncio.sleep(0.2)
         self.assertEqual(Decimal("100"), order.executed_amount_base)
         self.assertEqual(OrderState.FILLED, order.current_state)
+        self.assertTrue(self.exchange.is_cancel_confirmed("oid-1"))
+
+    async def test_cancel_2041_already_cancelled_is_done(self):
+        order = self._track(Decimal("100"))
+        captured = []
+
+        async def post(*args, **kwargs):
+            captured.append(kwargs.get("data"))
+            return {
+                "success": True,
+                "code": 0,
+                "data": [{"orderId": "877759993012810880", "errorCode": 2041, "errorMsg": "already cancelled"}],
+            }
+
+        async def get(path_url, **kwargs):
+            return {
+                "success": True,
+                "code": 0,
+                "data": {
+                    "orderId": "877759993012810880",
+                    "externalOid": "oid-1",
+                    "state": 4,
+                    "dealVol": "0",
+                    "dealAvgPrice": "0",
+                    "price": "0.07816",
+                    "vol": "10",
+                },
+            }
+
+        order.update_exchange_order_id("877759993012810880")
+        self.exchange._api_post = post
+        self.exchange._api_get = get
+        result = await self.exchange._place_cancel("oid-1", order)
+        await asyncio.sleep(0.2)
+        self.assertFalse(result)
+        self.assertEqual(["877759993012810880"], captured[0])
+        self.assertEqual(OrderState.CANCELED, order.current_state)
+        self.assertTrue(self.exchange.is_cancel_confirmed("oid-1"))
+
+    async def test_cancel_item_error_fails_and_leaves_the_order_open(self):
+        order = self._track(Decimal("100"))
+        order.update_exchange_order_id("877759993012810880")
+
+        async def post(*args, **kwargs):
+            return {
+                "success": True,
+                "code": 0,
+                "data": [{"orderId": "877759993012810880", "errorCode": 600, "errorMsg": "Parameter error"}],
+            }
+
+        self.exchange._api_post = post
+        with self.assertRaises(MexcResponseError) as caught:
+            await self.exchange._place_cancel("oid-1", order)
+        self.assertEqual(600, caught.exception.code)
+        self.assertNotEqual(OrderState.CANCELED, order.current_state)
+        self.assertFalse(self.exchange.is_cancel_confirmed("oid-1"))
+
+    def _raw_post(self, mock_api, path: str) -> tuple:
+        pattern = re.compile(f"^{re.escape(private_rest_url(path))}.*")
+        calls = []
+        for key, value in mock_api.requests.items():
+            if pattern.search(str(key[1])):
+                calls.extend(value)
+        self.assertTrue(calls)
+        call = calls[0]
+        return call.kwargs["data"], call.kwargs["headers"]
+
+    @aioresponses()
+    async def test_cancel_wire_body_is_a_signed_json_array(self, mock_api):
+        order = self._track(Decimal("100"))
+        order.update_exchange_order_id("877759993012810880")
+        mock_api.get(
+            re.compile(r".*/api/v1/contract/ping.*"),
+            body=json.dumps({"success": True, "code": 0, "data": 1700000000000}),
+            repeat=True,
+        )
+        mock_api.post(
+            re.compile(r".*/api/v1/private/order/cancel.*"),
+            body=json.dumps({
+                "success": True,
+                "code": 0,
+                "data": [{"orderId": "877759993012810880", "errorCode": 600, "errorMsg": "Parameter error"}],
+            }),
+        )
+        with self.assertRaises(MexcResponseError) as caught:
+            await self.exchange._place_cancel("oid-1", order)
+        self.assertEqual(600, caught.exception.code)
+        raw, headers = self._raw_post(mock_api, CONSTANTS.CANCEL_ORDER_PATH)
+        self.assertEqual('["877759993012810880"]', raw)
+        self.assertIsInstance(json.loads(raw), list)
+        signed = f"key{headers['Request-Time']}{raw}"
+        signature = hmac.new(b"secret", signed.encode("utf-8"), hashlib.sha256).hexdigest()
+        self.assertEqual(signature, headers["Signature"])
+        self.assertNotEqual(OrderState.CANCELED, order.current_state)
+
+    @aioresponses()
+    async def test_cancel_with_external_wire_body_is_a_signed_array_of_objects(self, mock_api):
+        order = self._track(Decimal("100"))
+        order.exchange_order_id = None
+        mock_api.get(
+            re.compile(r".*/api/v1/contract/ping.*"),
+            body=json.dumps({"success": True, "code": 0, "data": 1700000000000}),
+            repeat=True,
+        )
+        mock_api.post(
+            re.compile(r".*/api/v1/private/order/cancel_with_external.*"),
+            body=json.dumps({
+                "success": True,
+                "code": 0,
+                "data": [{"orderId": None, "errorCode": 0, "errorMsg": "success"}],
+            }),
+        )
+        client_path = CONSTANTS.ORDER_BY_EXTERNAL_PATH.format(symbol="AIOT_USDT", external_oid="oid-1")
+        mock_api.get(
+            re.compile(f"^{re.escape(private_rest_url(client_path))}.*"),
+            body=json.dumps({
+                "success": True,
+                "code": 0,
+                "data": {
+                    "orderId": "1",
+                    "externalOid": "oid-1",
+                    "state": 4,
+                    "dealVol": "0",
+                    "dealAvgPrice": "0",
+                    "price": "0.07816",
+                    "vol": "10",
+                },
+            }),
+        )
+        mock_api.get(
+            re.compile(r".*/api/v1/private/order/deal_details/.*"),
+            body=json.dumps({"success": True, "code": 0, "data": []}),
+            repeat=True,
+        )
+        await self.exchange._place_cancel("oid-1", order)
+        raw, headers = self._raw_post(mock_api, CONSTANTS.CANCEL_BY_EXTERNAL_PATH)
+        expected = json.dumps([{"symbol": "AIOT_USDT", "externalOid": "oid-1"}])
+        self.assertEqual(expected, raw)
+        self.assertIsInstance(json.loads(raw), list)
+        signed = f"key{headers['Request-Time']}{raw}"
+        signature = hmac.new(b"secret", signed.encode("utf-8"), hashlib.sha256).hexdigest()
+        self.assertEqual(signature, headers["Signature"])
 
     async def test_stop_cancels_an_order_that_is_still_being_created(self):
         self.exchange._position_mode_confirmed = True

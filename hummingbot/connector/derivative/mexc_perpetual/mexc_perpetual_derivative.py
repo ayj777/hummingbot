@@ -346,11 +346,23 @@ class MexcPerpetualDerivative(PerpetualDerivativePyBase):
                 percent_fee_token=contract.get("settleCoin") or "USDT",
             )
 
-    async def _place_cancel(self, order_id: str, tracked_order: InFlightOrder):
+    def _cancel_order_body(self, tracked_order: InFlightOrder):
+        """
+        POST /api/v1/private/order/cancel takes a bare JSON array of order id strings,
+        for example ["877759993012810880"], at most 50. An object with orderIds is
+        rejected as parameter error 600. Ids stay strings so a value above 2^53 is
+        not rounded. The same array text is what the request signature covers.
+        """
         if tracked_order.exchange_order_id:
+            return [str(tracked_order.exchange_order_id)]
+        return None
+
+    async def _place_cancel(self, order_id: str, tracked_order: InFlightOrder):
+        order_ids = self._cancel_order_body(tracked_order)
+        if order_ids is not None:
             response = await self._api_post(
                 path_url=CONSTANTS.CANCEL_ORDER_PATH,
-                data={"orderIds": [self._normalize_order_id(tracked_order.exchange_order_id)]},
+                data=order_ids,
                 is_auth_required=True,
             )
         else:
@@ -368,6 +380,8 @@ class MexcPerpetualDerivative(PerpetualDerivativePyBase):
                 continue
             error_code = int(item.get("errorCode") or 0)
             if error_code == CONSTANTS.ORDER_CANNOT_CANCEL_ERROR_CODE:
+                # Filled, or already cancelled. Read the order and mark that terminal
+                # state. Return False so a fill is not overwritten as a cancel.
                 await self._reconcile_uncancelable_order(tracked_order)
                 return False
             if error_code != 0:

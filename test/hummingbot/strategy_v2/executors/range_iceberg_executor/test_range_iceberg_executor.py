@@ -126,6 +126,31 @@ class RangeIcebergExecutorTests(IsolatedAsyncioWrapperTestCase):
         self.assertEqual(CloseType.EARLY_STOP, executor.close_type)
         self.assertEqual(RunnableStatus.TERMINATED, executor.status)
 
+    def test_stop_reports_a_cancel_that_is_still_open(self):
+        executor = self._executor()
+        self._run(executor.control_task())
+        confirmed = {"ok": False}
+
+        def checker(order_id):
+            return confirmed["ok"]
+
+        self.connector.is_cancel_confirmed = checker
+        executor.early_stop()
+        self.strategy.cancel.assert_called_with("mexc_perpetual", "AIOT-USDT", "buy-1")
+        self.assertEqual(RunnableStatus.RUNNING, executor.status)
+        reason = executor.get_custom_info()["status_reason"]
+        self.assertIn("buy-1", reason)
+        self.assertIn("may still be open", reason)
+        self.assertEqual(reason, executor.get_custom_info()["state"])
+        self._run(executor.control_task())
+        self.assertEqual(RunnableStatus.RUNNING, executor.status)
+        self.assertEqual(1, len(self.buy_ids))
+        self.assertIn("buy-1", executor.get_custom_info()["status_reason"])
+        confirmed["ok"] = True
+        self._run(executor.control_task())
+        self.assertEqual(RunnableStatus.TERMINATED, executor.status)
+        self.assertEqual("", executor.get_custom_info()["status_reason"])
+
     def test_expiry_cancels_the_working_slice(self):
         executor = self._executor(expiry_seconds=5)
         self._run(executor.control_task())
