@@ -106,6 +106,7 @@ class RangeIcebergExecutor(ExecutorBase):
         self._counted_fill_base: dict = {}
         self._counted_fill_quote: dict = {}
         self._seen_live_order_ids: Set[str] = set()
+        self._ground_truth_baseline: Optional[Decimal] = None
         self._cancel_attempt_count: dict = {}
         self._cancel_attempt_started: dict = {}
         self._unknown_order_ids: Set[str] = set()
@@ -259,6 +260,7 @@ class RangeIcebergExecutor(ExecutorBase):
         if self.close_type == CloseType.FAILED and not self._slices:
             self.stop()
             return
+        self._halt_on_unresolved_exchange_orders()
         await self._release_confirmed_failures()
         self._refresh_tracked_orders()
         self._advance_schedule()
@@ -276,7 +278,7 @@ class RangeIcebergExecutor(ExecutorBase):
         if self.status != RunnableStatus.RUNNING or self._paused:
             return
         if self.config.mode == ExecutionMode.UP_TO:
-            self._control_up_to()
+            await self._control_up_to()
             return
         if self._replacement_blocked():
             return
@@ -287,7 +289,7 @@ class RangeIcebergExecutor(ExecutorBase):
         slot = self._next_slot()
         if slot is None or not self._range_slot_released(slot):
             return
-        self._place_slice(slot)
+        await self._place_slice(slot)
 
     def early_stop(self, keep_position: bool = False, close_type: Optional[CloseType] = None):
         self.close_type = close_type or (CloseType.POSITION_HOLD if keep_position else CloseType.EARLY_STOP)
@@ -300,7 +302,7 @@ class RangeIcebergExecutor(ExecutorBase):
         self.close_timestamp = self._strategy.current_timestamp
         self.stop()
 
-    def _control_up_to(self):
+    async def _control_up_to(self):
         if self._replacement_blocked():
             return
         if any((slot.cancel_requested or self._holds_unaccounted_fill(slot)) and self._counts_as_open(slot) for slot in self._slices):
@@ -318,14 +320,17 @@ class RangeIcebergExecutor(ExecutorBase):
         placeable = self._placeable()
         if placeable <= 0:
             return
-        self._place_up_to_slice(desired, placeable)
+        await self._place_up_to_slice(desired, placeable)
 
-    def _place_slice(self, slot: _Slice):
+    async def _place_slice(self, slot: _Slice):
         rules = self.get_trading_rules(self.config.connector_name, self.config.trading_pair)
         price = self._jitter_price(slot.target_price, rules.min_price_increment)
         amount = self._bounded_amount(slot.target_amount, price, rules.min_base_amount_increment, rules.min_order_size)
         if amount < rules.min_order_size:
             slot.tracked = TrackedOrder(order_id="skipped")
+            return
+        amount = await self._cap_base_amount(amount)
+        if amount is None or amount < rules.min_order_size:
             return
         order_id = self._submit(price, amount)
         slot.tracked = TrackedOrder(order_id=order_id)
@@ -334,14 +339,15 @@ class RangeIcebergExecutor(ExecutorBase):
         self._submitted_order_ids.append(order_id)
         self._mark_action()
 
-    def _place_up_to_slice(self, price: Decimal, placeable_unit: Decimal):
+    async def _place_up_to_slice(self, price: Decimal, placeable_unit: Decimal):
         rules = self.get_trading_rules(self.config.connector_name, self.config.trading_pair)
         price = self._clamp_limit(self._jitter_up_to_price(price))
         step = rules.min_base_amount_increment
         slice_unit = min(self._slice_unit_amount(), placeable_unit)
         raw_base = self._unit_to_base(slice_unit, price)
         amount = self._bounded_amount(raw_base, price, step, rules.min_order_size)
-        if amount < rules.min_order_size:
+        amount = await self._cap_base_amount(amount)
+        if amount is None or amount < rules.min_order_size:
             return
         order_id = self._submit(price, amount)
         slot = _Slice(LadderLevel(price=price, base_amount=amount))
@@ -750,6 +756,8 @@ class RangeIcebergExecutor(ExecutorBase):
             self._accounted_quote_by_order[order_id] = quote
         self._accounted_fill_base = sum(self._accounted_fill_by_order.values(), Decimal("0"))
         self._accounted_fill_quote = sum(self._accounted_quote_by_order.values(), Decimal("0"))
+        # Safe: the fill was copied into the per-order tally above before the
+        # slice forgets the order. This does not tell the exchange the order is gone.
         slot.tracked = None
         slot.cancel_requested = False
 
@@ -849,6 +857,63 @@ class RangeIcebergExecutor(ExecutorBase):
         if state == OrderState.FILLED:
             return self._known_fill_size(order_id) or self._counted_fill_base.get(order_id, Decimal("0")) > 0
         return state == OrderState.CANCELED
+
+    def _halt_on_unresolved_exchange_orders(self):
+        connector = self.connectors[self.config.connector_name]
+        pending = self._real_callable(connector, "orders_awaiting_resolution")
+        if pending is None:
+            return
+        try:
+            ids = set(pending())
+        except Exception:
+            self.logger().exception("Could not read orders whose status is unknown.")
+            return
+        for order_id in ids.intersection(self._known_order_ids()):
+            if order_id not in self._unknown_order_ids:
+                self._halt_for_unknown_order(
+                    order_id,
+                    "The status poll could not prove this order is gone.",
+                )
+
+    def _known_order_ids(self) -> Set[str]:
+        ids = set(self._submitted_order_ids)
+        ids.update(self._unconfirmed_cancels)
+        ids.update(self._unknown_order_ids)
+        for slot in self._slices:
+            if slot.order_id and slot.order_id != "skipped":
+                ids.add(slot.order_id)
+        return ids
+
+    async def _cap_base_amount(self, amount: Decimal) -> Optional[Decimal]:
+        """
+        Cap a new child by the live position change and open orders.
+        None means the exchange read failed and the child must not be sent.
+        A connector without this read is left unchanged.
+        """
+        if amount <= 0:
+            return amount
+        connector = self.connectors[self.config.connector_name]
+        query = self._real_callable(connector, "ground_truth_exposure")
+        if query is None:
+            return amount
+        try:
+            position_base, open_base = await query(self.config.trading_pair, self.config.side)
+            position_base = Decimal(str(position_base))
+            open_base = Decimal(str(open_base))
+        except Exception:
+            self.logger().error("Could not read the exchange position and open orders. Not placing a child.")
+            return None
+        if self._ground_truth_baseline is None:
+            self._ground_truth_baseline = position_base
+        change = position_base - self._ground_truth_baseline
+        if change < 0:
+            change = Decimal("0")
+        room = self._target_base() - change - open_base
+        if room < 0:
+            room = Decimal("0")
+        if amount > room:
+            return room
+        return amount
 
     def _order_blocks_absent(self, order_id: str) -> bool:
         if order_id in self._seen_live_order_ids:

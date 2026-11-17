@@ -12,6 +12,7 @@ import hummingbot.connector.derivative.mexc_perpetual.mexc_perpetual_constants a
 from hummingbot.connector.derivative.mexc_perpetual.mexc_perpetual_derivative import (
     MarginMode,
     MexcPerpetualDerivative,
+    MexcResponseError,
 )
 from hummingbot.connector.derivative.mexc_perpetual.mexc_perpetual_web_utils import private_rest_url
 from hummingbot.connector.trading_rule import TradingRule
@@ -324,6 +325,48 @@ class MexcPerpetualReviewFixTests(IsolatedAsyncioWrapperTestCase):
         self.assertIsNone(later)
         self.assertEqual(OrderState.OPEN, order.current_state)
 
+    async def test_status_2040_does_not_fail_a_seen_order(self):
+        order = self._track(Decimal("1000"))
+        order.current_state = OrderState.OPEN
+        order.update_exchange_order_id("ex-1")
+        self.exchange.record_order_observation(
+            "oid-1",
+            self.trading_pair,
+            exchange_order_id="ex-1",
+            acked=True,
+        )
+        error = MexcResponseError(2040, "Order does not exist")
+        for _ in range(5):
+            await self.exchange._handle_update_error_for_active_order(order, error)
+        self.assertNotEqual(OrderState.FAILED, order.current_state)
+        self.assertIn("oid-1", self.exchange.in_flight_orders)
+        self.assertEqual(0, self.exchange._order_tracker._order_not_found_records.get("oid-1", 0))
+        self.assertIn("oid-1", self.exchange.orders_awaiting_resolution())
+
+    async def test_deal_reconcile_records_the_fill_in_order_memory(self):
+        order = self._track(Decimal("1000"))
+
+        async def get(path_url, **kwargs):
+            return {
+                "success": True,
+                "code": 0,
+                "data": [{
+                    "id": "9",
+                    "price": "0.07816",
+                    "vol": "34",
+                    "fee": "0",
+                    "feeCurrency": "USDT",
+                    "timestamp": 1_700_000_000_000,
+                    "orderId": "ex-1",
+                }],
+            }
+
+        self.exchange._api_get = get
+        await self.exchange._reconcile_exchange_deals(order)
+        base, _quote = self.exchange.counted_fill("oid-1")
+        self.assertEqual(Decimal("340"), base)
+        self.assertEqual(Decimal("340"), order.executed_amount_base)
+
     async def test_counted_quote_does_not_shrink_when_the_size_grows(self):
         self._track(Decimal("1000"))
 
@@ -425,9 +468,37 @@ class MexcPerpetualReviewFixTests(IsolatedAsyncioWrapperTestCase):
             previous_base = Decimal("0")
             for step in sequence:
                 kind = step[0]
-                client_read = step[1] if kind != "ws_order" and kind != "ws_deal" else None
+                client_read = step[1] if len(step) > 1 and kind not in ("ws_order", "ws_deal", "deal_reconcile") else None
                 order_read = step[2] if len(step) > 2 else None
-                if kind == "ws_order":
+                if kind == "status_error":
+                    from hummingbot.connector.derivative.mexc_perpetual.mexc_perpetual_derivative import (
+                        MexcResponseError,
+                    )
+                    await self.exchange._handle_update_error_for_active_order(
+                        order,
+                        MexcResponseError(2040, "Order does not exist"),
+                    )
+                    if (
+                        self.exchange.order_was_seen_live("oid-1")
+                        or "oid-1" in self.exchange._acked_client_ids
+                        or "oid-1" in self.exchange._submitted_client_ids
+                    ):
+                        self.assertNotEqual(OrderState.FAILED, order.current_state)
+                        self.assertEqual(0, self.exchange._order_tracker._order_not_found_records.get("oid-1", 0))
+                        self.assertIn("oid-1", self.exchange.orders_awaiting_resolution())
+                    state = None
+                elif kind == "deal_reconcile":
+                    fill = dict(step[1])
+                    reported = max(reported, Decimal(str(fill["vol"])) * Decimal("10"))
+                    seen_live = True
+
+                    async def deals(path_url, fill=fill, **kwargs):
+                        return {"success": True, "code": 0, "data": [fill]}
+
+                    self.exchange._api_get = deals
+                    await self.exchange._reconcile_exchange_deals(order)
+                    state = None
+                elif kind == "ws_order":
                     payload = dict(step[1])
                     payload["externalOid"] = "oid-1"
                     reported = max(reported, self._payload_fill_base(payload))
@@ -526,8 +597,8 @@ class MexcPerpetualReviewFixTests(IsolatedAsyncioWrapperTestCase):
     def _payload_fill_base(payload: dict) -> Decimal:
         if payload.get("dealVol") not in (None, ""):
             return Decimal(str(payload.get("dealVol") or "0")) * Decimal("10")
-        if payload.get("vol") not in (None, "") and payload.get("state") in (None, 3):
-            return Decimal("0")
+        if payload.get("id") not in (None, "") and payload.get("vol") not in (None, ""):
+            return Decimal(str(payload.get("vol") or "0")) * Decimal("10")
         return Decimal("0")
 
     @staticmethod
@@ -580,6 +651,8 @@ class MexcPerpetualReviewFixTests(IsolatedAsyncioWrapperTestCase):
         http_500 = IOError("Error executing request GET https://api.mexc.com/api/v1/private/order/get/2040. HTTP status is 500.")
         return [
             ("ws_order", {"state": 2, "dealVol": 0, "price": "0.07816", "vol": "100", "orderId": "ex-1"}),
+            ("status_error",),
+            ("deal_reconcile", {"id": "r-1", "price": "0.07816", "vol": "10", "fee": "0", "orderId": "ex-1", "timestamp": 1_700_000_000_000}),
             ("lookup", empty, empty),
             ("lookup", filled, opened),
             ("lookup", absent, absent),
@@ -592,7 +665,7 @@ class MexcPerpetualReviewFixTests(IsolatedAsyncioWrapperTestCase):
 
     def _random_read_sequence(self, rng: random.Random):
         steps = []
-        kinds = ("lookup", "ws_order", "ws_deal", "rest_status", "cancel_read")
+        kinds = ("lookup", "ws_order", "ws_deal", "rest_status", "cancel_read", "status_error", "deal_reconcile")
         for _ in range(6):
             kind = rng.choice(kinds)
             if kind == "lookup":
@@ -613,6 +686,17 @@ class MexcPerpetualReviewFixTests(IsolatedAsyncioWrapperTestCase):
                     "vol": rng.choice(["1", "10", "34"]),
                     "fee": "0",
                     "orderId": "ex-1",
+                }))
+            elif kind == "status_error":
+                steps.append((kind,))
+            elif kind == "deal_reconcile":
+                steps.append((kind, {
+                    "id": f"r-{rng.randrange(1000)}",
+                    "price": "0.07816",
+                    "vol": rng.choice(["1", "10"]),
+                    "fee": "0",
+                    "orderId": "ex-1",
+                    "timestamp": 1_700_000_000_000,
                 }))
             else:
                 first = self._random_read(rng)

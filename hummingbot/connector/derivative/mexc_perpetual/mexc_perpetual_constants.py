@@ -88,6 +88,8 @@ ORDER_GET_PATH = "/api/v1/private/order/get/{order_id}"
 ORDER_GET_LIMIT_ID = "/api/v1/private/order/get"
 ORDER_DEALS_PATH = "/api/v1/private/order/deal_details/{order_id}"
 ORDER_DEALS_LIMIT_ID = "/api/v1/private/order/deal_details"
+OPEN_ORDERS_PATH = "/api/v1/private/order/list/open_orders/{symbol}"
+OPEN_ORDERS_LIMIT_ID = "/api/v1/private/order/list/open_orders"
 ASSETS_PATH = "/api/v1/private/account/assets"
 OPEN_POSITIONS_PATH = "/api/v1/private/position/open_positions"
 CHANGE_LEVERAGE_PATH = "/api/v1/private/position/change_leverage"
@@ -193,6 +195,7 @@ RATE_LIMITS = [
     RateLimit(limit_id=ORDER_BY_EXTERNAL_LIMIT_ID, limit=20, time_interval=2),
     RateLimit(limit_id=ORDER_GET_LIMIT_ID, limit=20, time_interval=2),
     RateLimit(limit_id=ORDER_DEALS_LIMIT_ID, limit=20, time_interval=2),
+    RateLimit(limit_id=OPEN_ORDERS_LIMIT_ID, limit=20, time_interval=2),
     RateLimit(limit_id=ASSETS_PATH, limit=20, time_interval=2),
     RateLimit(limit_id=OPEN_POSITIONS_PATH, limit=20, time_interval=2),
     RateLimit(limit_id=CHANGE_LEVERAGE_PATH, limit=10, time_interval=10),

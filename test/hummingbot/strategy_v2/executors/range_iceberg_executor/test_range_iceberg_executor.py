@@ -1127,6 +1127,54 @@ class RangeIcebergExecutorTests(IsolatedAsyncioWrapperTestCase):
         self.assertEqual(OrderState.OPEN, order.current_state)
         self.assertEqual(Decimal("0"), order.executed_amount_base)
 
+    def test_status_poll_2040_halts_instead_of_buying_the_slice_again(self):
+        from hummingbot.core.event.events import MarketOrderFailureEvent
+
+        self._book(Decimal("0.07815"), Decimal("0.07816"))
+        executor = self._up_to(total_amount=Decimal("1000"), slice_amount=Decimal("1000"))
+        self._run(executor.control_task())
+        self.connector.orders_awaiting_resolution = lambda: {"buy-1"}
+        self.connector.is_cancel_confirmed = lambda order_id: True
+        executor.process_order_failed_event(
+            0,
+            None,
+            MarketOrderFailureEvent(self.now, "buy-1", OrderType.LIMIT),
+        )
+        self._run(executor.control_task())
+        self.assertEqual(1, len(self.buy_ids))
+        self.assertTrue(executor.get_custom_info()["paused"])
+        self.assertTrue(executor.get_custom_info()["unknown_order_halt"])
+        self.assertEqual(Decimal("0"), executor.filled_base)
+
+    def test_ground_truth_caps_the_child_and_stops_when_the_query_fails(self):
+        self._book(Decimal("0.07815"), Decimal("0.07816"))
+
+        async def exposure(trading_pair, side):
+            return (Decimal("0"), Decimal("200"))
+
+        self.connector.ground_truth_exposure = exposure
+        executor = self._up_to(total_amount=Decimal("1000"), slice_amount=Decimal("1000"))
+        self._run(executor.control_task())
+        self.assertEqual(Decimal("800"), self.buy_ids[0][1])
+
+        async def grown(trading_pair, side):
+            return (Decimal("800"), Decimal("0"))
+
+        self.connector.ground_truth_exposure = grown
+        self.orders["buy-1"].current_state = OrderState.CANCELED
+        self.orders["buy-1"].executed_amount_base = Decimal("0")
+        self._run(executor.control_task())
+        self.assertEqual(2, len(self.buy_ids))
+        self.assertEqual(Decimal("200"), self.buy_ids[1][1])
+
+        async def broken(trading_pair, side):
+            raise IOError("position read failed")
+
+        self.orders["buy-2"].current_state = OrderState.CANCELED
+        self.connector.ground_truth_exposure = broken
+        self._run(executor.control_task())
+        self.assertEqual(2, len(self.buy_ids))
+
     def test_websocket_open_then_empty_lookup_does_not_buy_again(self):
         import json
 
