@@ -1,0 +1,663 @@
+import logging
+import random
+from decimal import Decimal
+from typing import List, Optional
+
+from hummingbot.core.data_type.common import OrderType, PositionAction, PriceType, TradeType
+from hummingbot.logger import HummingbotLogger
+from hummingbot.strategy.strategy_v2_base import StrategyV2Base
+from hummingbot.strategy_v2.executors.executor_base import ExecutorBase
+from hummingbot.strategy_v2.executors.range_iceberg_executor.data_types import (
+    CapBehavior,
+    CatchUpPolicy,
+    ExecutionMode,
+    RangeIcebergExecutorConfig,
+    SizeUnit,
+)
+from hummingbot.strategy_v2.executors.range_iceberg_executor.ladder import (
+    LadderLevel,
+    build_range_ladder,
+    cap_buy_price,
+    clamp_price,
+    floor_sell_price,
+    quantize_down,
+)
+from hummingbot.strategy_v2.executors.time_schedule import SliceSchedule, release_timestamps
+from hummingbot.strategy_v2.models.base import RunnableStatus
+from hummingbot.strategy_v2.models.executors import CloseType, TrackedOrder
+
+
+class _Slice:
+    def __init__(self, level: LadderLevel):
+        self.target_price = level.price
+        self.target_amount = level.base_amount
+        self.tracked: Optional[TrackedOrder] = None
+        self.cancel_requested = False
+
+    @property
+    def order_id(self) -> Optional[str]:
+        return self.tracked.order_id if self.tracked else None
+
+    @property
+    def is_working(self) -> bool:
+        if self.tracked is None or self.order_id == "skipped":
+            return False
+        if self.tracked.order is not None and self.tracked.is_done:
+            return False
+        return True
+
+    @property
+    def is_filled(self) -> bool:
+        return bool(self.tracked and self.tracked.order and self.tracked.is_filled)
+
+
+class RangeIcebergExecutor(ExecutorBase):
+    """
+    Range ladder and up-to iceberg execution for any connector.
+
+    RANGE keeps every child inside [price_low, price_high]. UP_TO prices a buy at the
+    best ask, or a sell at the best bid, and never crosses limit_price. Iceberg shows
+    only a few slices and replaces each one after it fills. A duration releases the
+    total on the same start + index * interval clock as TWAP and cancels leftovers
+    when the clock ends.
+
+    Pausing freezes that clock, the duration, and expiry. Working orders stay. Time
+    spent paused is not counted, and resume continues from the frozen elapsed time.
+    """
+
+    _logger: Optional[HummingbotLogger] = None
+
+    @classmethod
+    def logger(cls) -> HummingbotLogger:
+        if cls._logger is None:
+            cls._logger = logging.getLogger(__name__)
+        return cls._logger
+
+    def __init__(self, strategy: StrategyV2Base, config: RangeIcebergExecutorConfig, update_interval: float = 1.0,
+                 max_retries: int = 10):
+        super().__init__(
+            strategy=strategy,
+            connectors=[config.connector_name],
+            config=config,
+            update_interval=update_interval,
+            max_retries=max_retries,
+        )
+        self.config: RangeIcebergExecutorConfig = config
+        self._slices: List[_Slice] = []
+        self._paused = False
+        self._pause_started: Optional[float] = None
+        self._paused_seconds = 0.0
+        self._started_at = self._strategy.current_timestamp
+        self._last_place_timestamp = Decimal("-1")
+        self._rng = random.Random(config.random_seed)
+        self._schedule = self._make_schedule()
+        self._build_plan()
+
+    def _make_schedule(self) -> Optional[SliceSchedule]:
+        resolved = self.config.resolved_schedule()
+        if resolved is None:
+            return None
+        count, interval = resolved
+        total = self.config.total_amount
+        share = total / Decimal(count)
+        amounts = []
+        remaining = total
+        for index in range(count):
+            piece = remaining if index == count - 1 else share
+            amounts.append(piece)
+            remaining -= piece
+        offsets = release_timestamps(0.0, count, interval)
+        if self.config.timing_jitter_pct > 0 and interval > 0:
+            jittered = []
+            duration = self.config.duration_seconds
+            for index, nominal in enumerate(offsets):
+                swing = (self._rng.random() * 2) - 1
+                delta = swing * float(self.config.timing_jitter_pct) * interval
+                low = 0.0 if index == 0 else jittered[-1]
+                jittered.append(min(max(low, nominal + delta), duration))
+            offsets = jittered
+        return SliceSchedule(
+            amounts=amounts,
+            offsets=offsets,
+            duration=self.config.duration_seconds,
+            skip_unplaced=self.config.catch_up == CatchUpPolicy.SKIP,
+        )
+
+    def _build_plan(self):
+        if self.config.mode == ExecutionMode.UP_TO:
+            self._slices = []
+            rules = self.get_trading_rules(self.config.connector_name, self.config.trading_pair)
+            if self._target_base() < Decimal(str(rules.min_order_size)):
+                self.logger().error("The up-to total is below the minimum order size.")
+                self.close_type = CloseType.FAILED
+            return
+        rules = self.get_trading_rules(self.config.connector_name, self.config.trading_pair)
+        try:
+            levels = build_range_ladder(
+                total_amount=self.config.total_amount,
+                size_unit=self.config.size_unit,
+                price_low=self.config.price_low,
+                price_high=self.config.price_high,
+                levels=self.config.levels,
+                distribution=self.config.distribution,
+                weight=self.config.weight,
+                side=self.config.side,
+                price_step=Decimal(str(rules.min_price_increment)),
+                amount_step=Decimal(str(rules.min_base_amount_increment)),
+                min_amount=Decimal(str(rules.min_order_size)),
+                contract_size=self._contract_size(),
+            )
+        except ValueError as exc:
+            self.logger().error(str(exc))
+            self.close_type = CloseType.FAILED
+            self._slices = []
+            return
+        self._slices = [_Slice(level) for level in levels]
+
+    def _contract_size(self) -> Decimal:
+        connector = self.connectors[self.config.connector_name]
+        getter = getattr(connector, "get_contract_size", None)
+        if not callable(getter):
+            return Decimal("1")
+        try:
+            size = Decimal(str(getter(self.config.trading_pair)))
+        except Exception:
+            return Decimal("1")
+        return size if size > 0 else Decimal("1")
+
+    def _target_base(self) -> Decimal:
+        if self.config.size_unit == SizeUnit.CONTRACTS:
+            return self.config.total_amount * self._contract_size()
+        if self.config.size_unit == SizeUnit.QUOTE:
+            price = self.config.limit_price or self.config.price_low or Decimal("1")
+            return self.config.total_amount / price
+        return self.config.total_amount
+
+    def pause(self):
+        if not self._paused:
+            self._pause_started = self._strategy.current_timestamp
+            self._paused = True
+
+    def resume(self):
+        if self._paused:
+            self._paused_seconds += self._strategy.current_timestamp - (self._pause_started or self._strategy.current_timestamp)
+            self._pause_started = None
+            self._paused = False
+
+    def _elapsed(self) -> float:
+        now = self._strategy.current_timestamp
+        paused = self._paused_seconds
+        if self._paused and self._pause_started is not None:
+            paused += now - self._pause_started
+        return max(0.0, now - self._started_at - paused)
+
+    async def validate_sufficient_balance(self):
+        # Limit orders are rejected by the exchange when margin is short. Retries cover that.
+        return
+
+    async def control_task(self):
+        if self.status == RunnableStatus.TERMINATED:
+            return
+        if self.close_type == CloseType.FAILED and not self._slices:
+            self.stop()
+            return
+        self._refresh_tracked_orders()
+        self._advance_schedule()
+        if self._time_limit_reached():
+            self._advance_schedule(force_end=True)
+            self.early_stop(keep_position=False, close_type=CloseType.TIME_LIMIT)
+            return
+        if self._expired():
+            self.early_stop(keep_position=False, close_type=CloseType.EXPIRED)
+            return
+        if self._execution_complete():
+            self._cancel_working_orders()
+            self.close_execution_finished()
+            return
+        if self.status != RunnableStatus.RUNNING or self._paused:
+            return
+        if self.config.mode == ExecutionMode.UP_TO:
+            self._control_up_to()
+            return
+        if self._slippage_blocks_new_orders():
+            return
+        if not self._rate_limit_allows_place():
+            return
+        slot = self._next_slot()
+        if slot is None or not self._range_slot_released(slot):
+            return
+        self._place_slice(slot)
+
+    def early_stop(self, keep_position: bool = False, close_type: Optional[CloseType] = None):
+        self.close_type = close_type or (CloseType.POSITION_HOLD if keep_position else CloseType.EARLY_STOP)
+        self.close_timestamp = self._strategy.current_timestamp
+        self._cancel_working_orders()
+        self.stop()
+
+    def close_execution_finished(self):
+        self.close_type = CloseType.COMPLETED
+        self.close_timestamp = self._strategy.current_timestamp
+        self.stop()
+
+    def _control_up_to(self):
+        if any(slot.cancel_requested and slot.is_working for slot in self._slices):
+            return
+        desired = self._desired_price()
+        if desired is None:
+            self._cancel_one_working()
+            return
+        if self._reprice_one(desired):
+            return
+        if not self._rate_limit_allows_place():
+            return
+        if self._working_count() >= self._visible_limit():
+            return
+        placeable = self._placeable()
+        if placeable <= 0:
+            return
+        self._place_up_to_slice(desired, placeable)
+
+    def _place_slice(self, slot: _Slice):
+        rules = self.get_trading_rules(self.config.connector_name, self.config.trading_pair)
+        price = self._jitter_price(slot.target_price, rules.min_price_increment)
+        amount = self._jitter_amount(slot.target_amount, rules.min_base_amount_increment, rules.min_order_size)
+        if amount < rules.min_order_size:
+            slot.tracked = TrackedOrder(order_id="skipped")
+            return
+        order_id = self._submit(price, amount)
+        slot.tracked = TrackedOrder(order_id=order_id)
+        slot.target_amount = amount
+        slot.target_price = price
+        self._mark_action()
+
+    def _place_up_to_slice(self, price: Decimal, placeable_unit: Decimal):
+        rules = self.get_trading_rules(self.config.connector_name, self.config.trading_pair)
+        price = self._clamp_limit(self._jitter_up_to_price(price))
+        step = rules.min_base_amount_increment
+        slice_unit = min(self._slice_unit_amount(), placeable_unit)
+        slice_base = quantize_down(self._unit_to_base(slice_unit, price), step)
+        max_base = quantize_down(self._unit_to_base(placeable_unit, price), step)
+        # Rounding leaves a fraction of a slice behind. Fold that into this order when it
+        # is at least one size step. A full carried slice stays for the next iceberg order.
+        dust_base = max_base - slice_base
+        dust_unit = placeable_unit - slice_unit
+        if dust_base >= step and dust_unit < self._slice_unit_amount():
+            amount = min(max_base, slice_base + quantize_down(dust_base, step))
+        else:
+            amount = slice_base
+        amount = self._jitter_amount(amount, step, rules.min_order_size)
+        if amount > max_base:
+            amount = max_base
+        if amount < rules.min_order_size and max_base >= rules.min_order_size:
+            amount = quantize_down(rules.min_order_size, step)
+        if amount < rules.min_order_size or amount > max_base:
+            return
+        order_id = self._submit(price, amount)
+        slot = _Slice(LadderLevel(price=price, base_amount=amount))
+        slot.tracked = TrackedOrder(order_id=order_id)
+        self._slices.append(slot)
+        self._mark_action()
+
+    def _submit(self, price: Decimal, amount: Decimal) -> str:
+        order_type = OrderType.LIMIT_MAKER if self.config.post_only else OrderType.LIMIT
+        position_action = PositionAction.CLOSE if self.config.reduce_only else PositionAction.OPEN
+        return self.place_order(
+            connector_name=self.config.connector_name,
+            trading_pair=self.config.trading_pair,
+            order_type=order_type,
+            side=self.config.side,
+            amount=amount,
+            price=price,
+            position_action=position_action,
+        )
+
+    def _jitter_price(self, price: Decimal, price_step: Decimal) -> Decimal:
+        if self.config.price_jitter_pct <= 0:
+            return price
+        swing = (Decimal(str(self._rng.random())) * 2) - Decimal("1")
+        jittered = price * (Decimal("1") + self.config.price_jitter_pct * swing)
+        return clamp_price(jittered, self.config.price_low, self.config.price_high, price_step)
+
+    def _jitter_up_to_price(self, price: Decimal) -> Decimal:
+        if self.config.price_jitter_pct <= 0:
+            return price
+        swing = (Decimal(str(self._rng.random())) * 2) - Decimal("1")
+        return price * (Decimal("1") + self.config.price_jitter_pct * swing)
+
+    def _jitter_amount(self, amount: Decimal, amount_step: Decimal, min_amount: Decimal) -> Decimal:
+        if self.config.size_jitter_pct <= 0:
+            return amount
+        swing = (Decimal(str(self._rng.random())) * 2) - Decimal("1")
+        jittered = quantize_down(amount * (Decimal("1") + self.config.size_jitter_pct * swing), amount_step)
+        if jittered < min_amount:
+            return amount
+        return jittered
+
+    def _desired_price(self) -> Optional[Decimal]:
+        rules = self.get_trading_rules(self.config.connector_name, self.config.trading_pair)
+        step = Decimal(str(rules.min_price_increment or 0))
+        cap = self.config.limit_price
+        ask = self.get_price(self.config.connector_name, self.config.trading_pair, PriceType.BestAsk)
+        bid = self.get_price(self.config.connector_name, self.config.trading_pair, PriceType.BestBid)
+        if self.config.side == TradeType.BUY:
+            if ask > cap:
+                if self.config.cap_behavior == CapBehavior.WAIT:
+                    return None
+                raw = cap
+            elif self.config.post_only:
+                raw = bid + step if step > 0 else bid
+                if step > 0 and raw >= ask:
+                    raw = bid
+            else:
+                raw = ask
+            price = cap_buy_price(raw, step, cap)
+            if self.config.post_only and price >= ask:
+                price = cap_buy_price(bid, step, cap)
+            return price
+        if bid < cap:
+            if self.config.cap_behavior == CapBehavior.WAIT:
+                return None
+            raw = cap
+        elif self.config.post_only:
+            raw = ask - step if step > 0 else ask
+            if step > 0 and raw <= bid:
+                raw = ask
+        else:
+            raw = bid
+        price = floor_sell_price(raw, step, cap)
+        if self.config.post_only and price <= bid:
+            price = floor_sell_price(bid + (step if step > 0 else Decimal("0")), step, cap)
+        return price
+
+    def _clamp_limit(self, price: Decimal) -> Decimal:
+        rules = self.get_trading_rules(self.config.connector_name, self.config.trading_pair)
+        step = Decimal(str(rules.min_price_increment or 0))
+        if self.config.side == TradeType.BUY:
+            return cap_buy_price(price, step, self.config.limit_price)
+        return floor_sell_price(price, step, self.config.limit_price)
+
+    def _slice_unit_amount(self) -> Decimal:
+        if self.config.slice_amount is not None:
+            return self.config.slice_amount
+        if self._schedule is not None:
+            return self.config.total_amount / Decimal(self._schedule.count)
+        return self.config.total_amount / Decimal(self.config.levels)
+
+    def _visible_limit(self) -> int:
+        if self.config.iceberg:
+            return self.config.visible_count
+        if self._schedule is not None:
+            return self._schedule.count
+        return self.config.levels
+
+    def _working_count(self) -> int:
+        return sum(1 for slot in self._slices if slot.is_working)
+
+    def _next_slot(self) -> Optional[_Slice]:
+        if self._working_count() >= self._visible_limit():
+            return None
+        return next((slot for slot in self._slices if slot.tracked is None), None)
+
+    def _range_slot_released(self, slot: _Slice) -> bool:
+        if self._schedule is None:
+            return True
+        return self._base_to_unit(slot.target_amount, slot.target_price) <= self._placeable()
+
+    def _reprice_one(self, desired: Decimal) -> bool:
+        rules = self.get_trading_rules(self.config.connector_name, self.config.trading_pair)
+        step = Decimal(str(rules.min_price_increment or 0))
+        pending = [
+            slot for slot in self._slices
+            if slot.is_working and not slot.cancel_requested and self._price_differs(self._slot_price(slot), desired, step)
+        ]
+        if not pending:
+            return False
+        if not self._rate_limit_allows_place():
+            return True
+        self._request_cancel(pending[0])
+        return True
+
+    def _cancel_one_working(self) -> bool:
+        if not self._rate_limit_allows_place():
+            return False
+        for slot in self._slices:
+            if slot.is_working and not slot.cancel_requested:
+                self._request_cancel(slot)
+                return True
+        return False
+
+    def _request_cancel(self, slot: _Slice):
+        if slot.order_id and slot.order_id != "skipped":
+            self._strategy.cancel(self.config.connector_name, self.config.trading_pair, slot.order_id)
+        slot.cancel_requested = True
+        self._mark_action()
+
+    def _slot_price(self, slot: _Slice) -> Decimal:
+        if slot.tracked and slot.tracked.order and slot.tracked.order.price is not None:
+            return slot.tracked.order.price
+        return slot.target_price
+
+    def _price_differs(self, left: Decimal, right: Decimal, step: Decimal) -> bool:
+        if step <= 0:
+            return left != right
+        return abs(left - right) >= step
+
+    def _rate_limit_allows_place(self) -> bool:
+        if self._last_place_timestamp < 0:
+            return True
+        elapsed = Decimal(str(self._strategy.current_timestamp)) - self._last_place_timestamp
+        return elapsed >= Decimal(str(self.config.min_order_interval))
+
+    def _mark_action(self):
+        self._last_place_timestamp = Decimal(str(self._strategy.current_timestamp))
+
+    def _slippage_blocks_new_orders(self) -> bool:
+        if self.config.max_slippage is None or self.config.mode == ExecutionMode.UP_TO:
+            return False
+        if self.config.side == TradeType.BUY:
+            market_price = self.get_price(self.config.connector_name, self.config.trading_pair, PriceType.BestAsk)
+            return market_price > self.config.price_high * (Decimal("1") + self.config.max_slippage)
+        market_price = self.get_price(self.config.connector_name, self.config.trading_pair, PriceType.BestBid)
+        return market_price < self.config.price_low * (Decimal("1") - self.config.max_slippage)
+
+    def _outside_cap(self) -> bool:
+        if self.config.mode == ExecutionMode.UP_TO:
+            limit = self.config.limit_price
+            if self.config.side == TradeType.BUY:
+                return self.get_price(self.config.connector_name, self.config.trading_pair, PriceType.BestAsk) > limit
+            return self.get_price(self.config.connector_name, self.config.trading_pair, PriceType.BestBid) < limit
+        if self.config.side == TradeType.BUY:
+            return self.get_price(self.config.connector_name, self.config.trading_pair, PriceType.BestAsk) > self.config.price_high
+        return self.get_price(self.config.connector_name, self.config.trading_pair, PriceType.BestBid) < self.config.price_low
+
+    def _expired(self) -> bool:
+        if self.config.expiry_seconds is None:
+            return False
+        return self._elapsed() >= self.config.expiry_seconds
+
+    def _time_limit_reached(self) -> bool:
+        if self.config.duration_seconds is None:
+            return False
+        return self._elapsed() + 1e-9 >= self.config.duration_seconds
+
+    def _execution_complete(self) -> bool:
+        if self.config.mode == ExecutionMode.RANGE:
+            return self._all_slices_filled()
+        if any(slot.is_working for slot in self._slices):
+            return False
+        rules = self.get_trading_rules(self.config.connector_name, self.config.trading_pair)
+        leftover = self.config.total_amount - self._filled_unit() - self._skipped_amount()
+        if leftover <= 0:
+            return self._filled_unit() > 0 or self._skipped_amount() >= self.config.total_amount
+        return self._unit_to_base(leftover, self.config.limit_price) < Decimal(str(rules.min_order_size))
+
+    def _all_slices_filled(self) -> bool:
+        if not self._slices:
+            return False
+        return all(slot.is_filled or (slot.order_id == "skipped") for slot in self._slices)
+
+    def _advance_schedule(self, force_end: bool = False):
+        if self._schedule is None:
+            return
+        elapsed = self.config.duration_seconds if force_end else self._elapsed()
+        self._schedule.advance(elapsed, self._filled_unit(), self._open_unit(), self._outside_cap())
+
+    def _placeable(self) -> Decimal:
+        if self._schedule is None:
+            opened = self.config.total_amount
+            skipped = Decimal("0")
+        else:
+            opened = self._schedule.opened(self._elapsed())
+            skipped = self._schedule.skipped
+        remaining = opened - skipped - self._filled_unit() - self._open_unit()
+        if remaining < 0:
+            return Decimal("0")
+        return remaining
+
+    def _filled_unit(self) -> Decimal:
+        if self.config.size_unit == SizeUnit.QUOTE:
+            return self.filled_amount_quote
+        if self.config.size_unit == SizeUnit.CONTRACTS:
+            return self.filled_base / self._contract_size()
+        return self.filled_base
+
+    def _open_unit(self) -> Decimal:
+        total = Decimal("0")
+        for slot in self._slices:
+            if not slot.is_working:
+                continue
+            if slot.tracked and slot.tracked.order is not None:
+                remaining_base = slot.tracked.order.amount - slot.tracked.executed_amount_base
+                if remaining_base < 0:
+                    remaining_base = Decimal("0")
+            else:
+                remaining_base = slot.target_amount
+            total += self._base_to_unit(remaining_base, slot.target_price)
+        return total
+
+    def _skipped_amount(self) -> Decimal:
+        if self._schedule is None:
+            return Decimal("0")
+        return self._schedule.skipped
+
+    def _unit_to_base(self, amount: Decimal, price: Decimal) -> Decimal:
+        if self.config.size_unit == SizeUnit.QUOTE:
+            if price <= 0:
+                return Decimal("0")
+            return amount / price
+        if self.config.size_unit == SizeUnit.CONTRACTS:
+            return amount * self._contract_size()
+        return amount
+
+    def _base_to_unit(self, amount: Decimal, price: Decimal) -> Decimal:
+        if self.config.size_unit == SizeUnit.QUOTE:
+            return amount * price
+        if self.config.size_unit == SizeUnit.CONTRACTS:
+            return amount / self._contract_size()
+        return amount
+
+    def _refresh_tracked_orders(self):
+        for slot in self._slices:
+            if slot.tracked and slot.tracked.order_id and slot.tracked.order_id != "skipped" and slot.tracked.order is None:
+                in_flight = self.get_in_flight_order(self.config.connector_name, slot.tracked.order_id)
+                if in_flight:
+                    slot.tracked.order = in_flight
+
+    def _cancel_working_orders(self):
+        for slot in self._slices:
+            if slot.is_working and slot.order_id and slot.order_id != "skipped":
+                self._strategy.cancel(self.config.connector_name, self.config.trading_pair, slot.order_id)
+
+    def process_order_created_event(self, event_tag: int, market, event):
+        slot = self._slot_for(event.order_id)
+        if slot and slot.tracked:
+            in_flight = self.get_in_flight_order(self.config.connector_name, event.order_id)
+            if in_flight:
+                slot.tracked.order = in_flight
+
+    def process_order_failed_event(self, event_tag: int, market, event):
+        slot = self._slot_for(event.order_id)
+        if slot:
+            slot.tracked = None
+            slot.cancel_requested = False
+            self._current_retries += 1
+            if self._current_retries > self._max_retries:
+                self.close_type = CloseType.FAILED
+                self.early_stop(close_type=CloseType.FAILED)
+
+    def process_order_completed_event(self, event_tag: int, market, event):
+        if self._execution_complete():
+            self.close_execution_finished()
+
+    def _slot_for(self, order_id: str) -> Optional[_Slice]:
+        return next((slot for slot in self._slices if slot.order_id == order_id), None)
+
+    @property
+    def filled_base(self) -> Decimal:
+        return sum((slot.tracked.executed_amount_base for slot in self._slices if slot.tracked), Decimal("0"))
+
+    @property
+    def filled_amount_quote(self) -> Decimal:
+        return sum((slot.tracked.executed_amount_quote for slot in self._slices if slot.tracked), Decimal("0"))
+
+    @property
+    def total_base(self) -> Decimal:
+        if self.config.mode == ExecutionMode.UP_TO:
+            return self._target_base()
+        return sum((slot.target_amount for slot in self._slices), Decimal("0"))
+
+    @property
+    def average_fill_price(self) -> Decimal:
+        filled = self.filled_base
+        if filled <= 0:
+            return Decimal("0")
+        return self.filled_amount_quote / filled
+
+    def get_cum_fees_quote(self) -> Decimal:
+        return sum((slot.tracked.cum_fees_quote for slot in self._slices if slot.tracked), Decimal("0"))
+
+    def get_net_pnl_quote(self) -> Decimal:
+        filled = self.filled_base
+        if filled <= 0:
+            return Decimal("0")
+        mark = self.get_price(self.config.connector_name, self.config.trading_pair, PriceType.MidPrice)
+        if self.config.side == TradeType.BUY:
+            return (mark - self.average_fill_price) * filled - self.cum_fees_quote
+        return (self.average_fill_price - mark) * filled - self.cum_fees_quote
+
+    def get_net_pnl_pct(self) -> Decimal:
+        quote = self.filled_amount_quote
+        if quote <= 0:
+            return Decimal("0")
+        return self.net_pnl_quote / quote
+
+    def _unfilled_amount(self) -> Decimal:
+        remainder = self.config.total_amount - self._filled_unit()
+        if remainder < 0:
+            return Decimal("0")
+        return remainder
+
+    def get_custom_info(self) -> dict:
+        return {
+            "side": self.config.side.name,
+            "mode": self.config.mode.value,
+            "paused": self._paused,
+            "filled_base": str(self.filled_base),
+            "filled_quote": str(self.filled_amount_quote),
+            "total_base": str(self.total_base),
+            "target_amount": str(self.config.total_amount),
+            "filled_amount": str(self._filled_unit()),
+            "unfilled_amount": str(self._unfilled_amount()),
+            "skipped_amount": str(self._skipped_amount()),
+            "average_fill_price": str(self.average_fill_price),
+            "child_order_ids": [slot.order_id for slot in self._slices if slot.order_id],
+            "levels": [
+                {
+                    "price": str(slot.target_price),
+                    "amount": str(slot.target_amount),
+                    "order_id": slot.order_id,
+                    "filled": slot.is_filled,
+                }
+                for slot in self._slices
+            ],
+        }
