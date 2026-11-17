@@ -25,6 +25,7 @@ class MexcPerpetualAdvancedOrderTests(IsolatedAsyncioWrapperTestCase):
         self.exchange._set_trading_pair_symbol_map(bidict({"AIOT_USDT": "AIOT-USDT"}))
         self.exchange._contract_sizes["AIOT-USDT"] = Decimal("10")
         self.exchange._position_mode_confirmed = True
+        self.exchange._margin_mode_explicit = True
         self.exchange._set_current_timestamp(1_700_000_000)
 
     def _regex(self, path: str):
@@ -99,7 +100,7 @@ class MexcPerpetualAdvancedOrderTests(IsolatedAsyncioWrapperTestCase):
         self.assertEqual("900", order_id)
         placed = self._payload(mock_api, CONSTANTS.PLAN_ORDER_PLACE_PATH)
         self.assertEqual(CONSTANTS.ORDER_TYPE_IOC, placed["orderType"])
-        self.assertEqual(CONSTANTS.SIDE_CLOSE_LONG, placed["side"])
+        self.assertEqual(CONSTANTS.SIDE_OPEN_SHORT, placed["side"])
         self.assertEqual(2, placed["vol"])
         self.assertTrue(placed["reduceOnly"])
 

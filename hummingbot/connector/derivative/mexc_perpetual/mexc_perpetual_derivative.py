@@ -467,19 +467,17 @@ class MexcPerpetualDerivative(PerpetualDerivativePyBase):
             "openType": self._order_open_type(trading_pair, trade_type, position_action),
             "positionMode": self._position_mode_code(kwargs.get("position_mode")),
         }
-        position_id = self._position_id_for_order(trading_pair, trade_type, position_action, kwargs.get("reduce_only"))
+        position_id = self._require_close_position_id(
+            trading_pair,
+            trade_type,
+            position_action,
+            kwargs.get("reduce_only"),
+        )
         if position_id is not None:
             data["positionId"] = position_id
         if client_order_id:
             data["externalOid"] = client_order_id
-        reduce_only = kwargs.get("reduce_only")
-        if self.position_mode is PositionMode.HEDGE:
-            # Hedge closes with side 2 or 4. reduceOnly is only valid in one-way mode.
-            reduce_only = False
-        elif reduce_only is None:
-            reduce_only = self.position_mode is PositionMode.ONEWAY and position_action is PositionAction.CLOSE
-        if reduce_only:
-            data["reduceOnly"] = True
+        self._apply_reduce_only(data, position_action, kwargs.get("reduce_only"))
         self._attach_stop_prices(data, kwargs)
         return data
 
@@ -547,10 +545,17 @@ class MexcPerpetualDerivative(PerpetualDerivativePyBase):
             "trend": int(trend),
             "positionMode": self._position_mode_code(kwargs.get("position_mode")),
         }
+        position_id = self._require_close_position_id(
+            trading_pair,
+            trade_type,
+            position_action,
+            kwargs.get("reduce_only"),
+        )
+        if position_id is not None:
+            data["positionId"] = position_id
         if price is not None and order_type is not OrderType.MARKET:
             data["price"] = self._json_number(price)
-        if kwargs.get("reduce_only"):
-            data["reduceOnly"] = True
+        self._apply_reduce_only(data, position_action, kwargs.get("reduce_only"))
         if kwargs.get("price_protect") is not None:
             data["priceProtect"] = int(kwargs["price_protect"])
         self._attach_stop_prices(data, kwargs)
@@ -1735,6 +1740,8 @@ class MexcPerpetualDerivative(PerpetualDerivativePyBase):
             self._perpetual_trading.set_leverage(trading_pair, leverage)
             self._leverage_explicit = True
             self.logger().info(f"Leverage for {trading_pair} successfully set to {leverage}.")
+        elif msg.startswith("Refusing"):
+            self.logger().error(msg)
         else:
             self.logger().network(f"Error setting leverage {leverage} for {trading_pair}: {msg}")
 
@@ -1769,10 +1776,11 @@ class MexcPerpetualDerivative(PerpetualDerivativePyBase):
     ) -> Tuple[bool, str]:
         """
         Change leverage for the pair. openType is included only when margin_mode is set.
-        A named position_side is the only side that is read or changed. Hedge mode can
-        hold a long and a short at different leverage, so one side must not move the other.
-        When that side's open position already uses this leverage, and margin is not being
-        changed, the exchange is not called.
+        A named position_side is the only side that is read or changed. Hedge mode
+        requires that side, so one call cannot move the long and the short.
+        When margin_mode is omitted and this side's position is not loaded, the
+        exchange is not called. When the loaded position already uses this leverage,
+        and margin is not being changed, the exchange is not called either.
         """
         symbol = await self.exchange_symbol_associated_to_pair(trading_pair)
         requested = None if margin_mode is None else self._coerce_margin_mode(margin_mode)
@@ -1781,8 +1789,17 @@ class MexcPerpetualDerivative(PerpetualDerivativePyBase):
         side = self._coerce_position_side(position_side)
         if position_side is not None and side is None:
             return False, f"Unsupported position side {position_side}"
+        if self.position_mode is PositionMode.HEDGE and side is None:
+            return False, (
+                f"Hedge mode requires a position side for {trading_pair}. Refusing to change leverage."
+            )
         try:
             for item in self._leverage_sides(trading_pair, side):
+                if requested is None and self._open_position(trading_pair, item) is None:
+                    return False, (
+                        f"Refusing to change leverage for {trading_pair} {item.name} "
+                        "until the open position is loaded. Refusing to trade."
+                    )
                 call, send_open_type = self._leverage_call_plan(trading_pair, item, leverage, requested)
                 if not call:
                     continue
@@ -1845,6 +1862,8 @@ class MexcPerpetualDerivative(PerpetualDerivativePyBase):
             self._margin_mode = previous_mode
             self._margin_mode_explicit = previous_explicit
             reason = self._margin_switch_rejection(trading_pair, side, requested, message)
+            if not reason and "Refusing to" in message:
+                reason = message
             if reason:
                 self._leverage_confirmation_error = reason
                 self.logger().error(reason)
@@ -2278,7 +2297,7 @@ class MexcPerpetualDerivative(PerpetualDerivativePyBase):
         if sides:
             return sides
         if self.position_mode is PositionMode.HEDGE:
-            return [PositionSide.LONG, PositionSide.SHORT]
+            return []
         return [PositionSide.LONG]
 
     def _leverage_call_plan(
@@ -2415,17 +2434,54 @@ class MexcPerpetualDerivative(PerpetualDerivativePyBase):
 
     def _order_open_type(self, trading_pair: str, trade_type: TradeType, position_action: PositionAction) -> int:
         """
-        Orders must send openType. When no margin mode was requested, use the open
-        position's mode for this pair and side so the order does not switch it.
+        Orders must send openType. An explicit margin mode uses that value.
+        Otherwise use the open position's mode for this pair and side.
+        An unread openType is refused. The connector default is not sent.
         """
+        side = self._order_position_side(trade_type, position_action)
         if self._margin_mode_explicit:
             return self._open_type()
-        mode = self._position_margin_modes.get((trading_pair, self._order_position_side(trade_type, position_action)))
+        mode = self._position_margin_modes.get((trading_pair, side))
         if mode == MarginMode.CROSS:
             return CONSTANTS.OPEN_TYPE_CROSS
         if mode == MarginMode.ISOLATED:
             return CONSTANTS.OPEN_TYPE_ISOLATED
-        return self._open_type()
+        raise IOError(f"Refusing to trade {trading_pair} {side.name} until its openType has been read.")
+
+    def _order_is_closing(self, position_action: PositionAction, reduce_only: Optional[bool]) -> bool:
+        return position_action is PositionAction.CLOSE or bool(reduce_only)
+
+    def _apply_reduce_only(self, data: Dict[str, Any], position_action: PositionAction, reduce_only: Optional[bool]):
+        """
+        Hedge closes with side 2 or 4 and does not send reduceOnly.
+        One-way closes with side 1 or 3 and sends reduceOnly.
+        """
+        if self.position_mode is PositionMode.HEDGE:
+            return
+        if self.position_mode is PositionMode.ONEWAY and self._order_is_closing(position_action, reduce_only):
+            data["reduceOnly"] = True
+            return
+        if reduce_only:
+            data["reduceOnly"] = True
+
+    def _require_close_position_id(
+        self,
+        trading_pair: str,
+        trade_type: TradeType,
+        position_action: PositionAction,
+        reduce_only: Optional[bool],
+    ) -> Optional[int]:
+        position_id = self._position_id_for_order(trading_pair, trade_type, position_action, reduce_only)
+        if (
+            self.position_mode is PositionMode.HEDGE
+            and self._order_is_closing(position_action, reduce_only)
+            and position_id is None
+        ):
+            side = self._order_position_side(trade_type, position_action)
+            raise IOError(
+                f"Refusing to close {trading_pair} {side.name} without its positionId. Refusing to trade."
+            )
+        return position_id
 
     def _open_type_code(self, mode: str) -> int:
         if mode == MarginMode.ISOLATED:
@@ -2435,6 +2491,16 @@ class MexcPerpetualDerivative(PerpetualDerivativePyBase):
         raise ValueError(f"Unsupported margin mode {mode}")
 
     def _exchange_side(self, trade_type: TradeType, position_action: PositionAction) -> int:
+        """
+        Hedge mode: 1 open long, 2 close short, 3 open short, 4 close long.
+        One-way mode: 1 buy and 3 sell. A one-way close uses that side plus reduceOnly.
+        """
+        if self.position_mode is not PositionMode.HEDGE:
+            if trade_type is TradeType.BUY:
+                return CONSTANTS.SIDE_OPEN_LONG
+            if trade_type is TradeType.SELL:
+                return CONSTANTS.SIDE_OPEN_SHORT
+            raise ValueError(f"Unsupported order side {trade_type} {position_action}")
         if trade_type is TradeType.BUY and position_action is PositionAction.OPEN:
             return CONSTANTS.SIDE_OPEN_LONG
         if trade_type is TradeType.BUY and position_action is PositionAction.CLOSE:
