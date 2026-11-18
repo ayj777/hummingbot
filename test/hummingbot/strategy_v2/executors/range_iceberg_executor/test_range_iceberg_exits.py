@@ -1170,28 +1170,138 @@ class RangeIcebergExitTests(IsolatedAsyncioWrapperTestCase):
         self.assertEqual(1, len(self._close_calls()))
         self.assertEqual(Decimal("0.09"), self._close_calls()[0][1][4])
 
-    def _install_exchange_stop(self, place_result="stop-1", cancel_result=None, place_error=None):
-        placed = []
-        cancelled = []
+    def _install_mexc_stop_book(self, *, fail_times=0, cancel_result=None):
+        """
+        MEXC stoporder/place rules the executor has to live with.
+
+        The new stop vol, plus other live stop vols, plus resting reduce-only
+        close limit vol, must be within the closable position. A place at the
+        same trigger price as a live stop returns that id and replaces its vol.
+        """
+        state = {
+            "stops": {},
+            "seq": 0,
+            "fail": fail_times,
+            "placed": [],
+            "cancelled": [],
+            "ids": [],
+        }
+
+        def closable_and_resting():
+            entry = Decimal("0")
+            closed = Decimal("0")
+            resting = Decimal("0")
+            checker = getattr(self.connector, "is_cancel_confirmed", None)
+            checker_is_real = (
+                checker is not None
+                and not getattr(type(checker), "__module__", "").startswith("unittest.mock")
+            )
+            for order_id, _amount, _price, order_type, action in self.buy_ids:
+                order = self.orders.get(order_id)
+                if order is None:
+                    continue
+                filled = Decimal(str(getattr(order, "executed_amount_base", 0) or 0))
+                if action == PositionAction.OPEN:
+                    entry += filled
+                    continue
+                if action != PositionAction.CLOSE:
+                    continue
+                closed += filled
+                if order_type != OrderType.LIMIT:
+                    continue
+                if order.current_state in (OrderState.CANCELED, OrderState.FILLED, OrderState.FAILED):
+                    continue
+                if checker_is_real and bool(checker(order_id)):
+                    continue
+                remaining = Decimal(str(order.amount or 0)) - filled
+                if remaining > 0:
+                    resting += remaining
+            closable = entry - closed
+            if closable < 0:
+                closable = Decimal("0")
+            return closable, resting
 
         async def place_stop(trading_pair, position_id, amount, stop_loss_price=None, **kwargs):
-            placed.append((str(position_id), amount, stop_loss_price, kwargs.get("vol_type")))
-            if place_error is not None and len(placed) <= place_error:
-                raise RuntimeError("stop rejected")
-            return place_result if not callable(place_result) else place_result(len(placed))
+            vol = Decimal(str(amount))
+            price = None if stop_loss_price is None else Decimal(str(stop_loss_price))
+            state["placed"].append((str(position_id), vol, price, kwargs.get("vol_type")))
+            if state["fail"] > 0:
+                state["fail"] -= 1
+                raise RuntimeError("closable quantity")
+            closable, resting = closable_and_resting()
+            same = None
+            others = Decimal("0")
+            for stop_id, stop in state["stops"].items():
+                if price is not None and stop["price"] == price and same is None:
+                    same = stop_id
+                else:
+                    others += stop["amount"]
+            if vol + others + resting > closable:
+                raise RuntimeError("closable quantity")
+            if same is not None:
+                state["stops"][same] = {"amount": vol, "price": price}
+                state["ids"].append(same)
+                return same
+            state["seq"] += 1
+            stop_id = f"stop-{state['seq']}"
+            state["stops"][stop_id] = {"amount": vol, "price": price}
+            state["ids"].append(stop_id)
+            return stop_id
 
         async def cancel_stop(order_ids):
-            cancelled.extend(list(order_ids))
+            ids = [str(order_id) for order_id in order_ids]
+            state["cancelled"].extend(ids)
             if isinstance(cancel_result, Exception):
                 raise cancel_result
             if callable(cancel_result):
-                return cancel_result(order_ids)
-            return {} if cancel_result is None else cancel_result
+                result = cancel_result(ids)
+                if hasattr(result, "__await__"):
+                    result = await result
+            else:
+                result = {} if cancel_result is None else cancel_result
+            text = str(result).lower()
+            fired = any(
+                marker in text
+                for marker in ("not found", "already triggered", "already executed", "already filled")
+            )
+            if fired or (isinstance(result, dict) and result.get("success") is False):
+                return result
+            rejected = set()
+            if isinstance(result, dict):
+                for key in ("rejected", "rejected_ids", "failed", "failed_ids"):
+                    for item in result.get(key) or []:
+                        rejected.add(str(item))
+            for stop_id in ids:
+                if stop_id not in rejected:
+                    state["stops"].pop(stop_id, None)
+            return result
 
+        previous_cancel = self.strategy.cancel.side_effect
+
+        def note_cancel(connector_name, trading_pair, order_id, *args, **kwargs):
+            checker = getattr(self.connector, "is_cancel_confirmed", None)
+            checker_is_real = (
+                checker is not None
+                and not getattr(type(checker), "__module__", "").startswith("unittest.mock")
+            )
+            order = self.orders.get(order_id)
+            if order is not None and (not checker_is_real or bool(checker(order_id))):
+                if order.current_state in (OrderState.OPEN, OrderState.PARTIALLY_FILLED):
+                    order.current_state = OrderState.CANCELED
+            if previous_cancel is not None:
+                return previous_cancel(connector_name, trading_pair, order_id, *args, **kwargs)
+            return None
+
+        self.strategy.cancel.side_effect = note_cancel
         self.connector.place_position_stop_order = place_stop
         self.connector.cancel_stop_orders = cancel_stop
         self.connector._position_id_for_order = lambda trading_pair, trade_type, position_action, reduce_only: 4242
-        return placed, cancelled
+        return state
+
+    def _install_exchange_stop(self, place_result="stop-1", cancel_result=None, place_error=None):
+        fail_times = place_error if isinstance(place_error, int) else 0
+        state = self._install_mexc_stop_book(fail_times=fail_times, cancel_result=cancel_result)
+        return state["placed"], state["cancelled"]
 
     def test_exchange_stop_is_a_backstop_and_is_cleared_before_the_software_stop(self):
         placed, cancelled = self._install_exchange_stop()
@@ -1245,20 +1355,15 @@ class RangeIcebergExitTests(IsolatedAsyncioWrapperTestCase):
         self.assertGreaterEqual(len(fired), 1)
 
     def test_exchange_stop_is_placed_before_the_take_profit_and_backs_off(self):
+        state = self._install_mexc_stop_book(fail_times=1)
         attempts = []
+        place_stop = self.connector.place_position_stop_order
 
-        async def place_stop(trading_pair, position_id, amount, stop_loss_price=None, **kwargs):
-            attempts.append((self.now, kwargs.get("vol_type"), amount))
-            if len(attempts) == 1:
-                raise RuntimeError("closable quantity")
-            return "stop-2"
+        async def place_and_stamp(*args, **kwargs):
+            attempts.append(self.now)
+            return await place_stop(*args, **kwargs)
 
-        async def cancel_stop(order_ids):
-            return {"success": True}
-
-        self.connector.place_position_stop_order = place_stop
-        self.connector.cancel_stop_orders = cancel_stop
-        self.connector._position_id_for_order = lambda trading_pair, trade_type, position_action, reduce_only: 4242
+        self.connector.place_position_stop_order = place_and_stamp
         executor = self._executor(
             take_profit={"percent": "0.10", "execution": "SINGLE", "order_type": "LIMIT"},
             stop_loss={"percent": "0.05", "execution": "SINGLE"},
@@ -1266,7 +1371,7 @@ class RangeIcebergExitTests(IsolatedAsyncioWrapperTestCase):
         self._open_entry(executor)
         self._run(executor.control_task())
         self.assertEqual(1, len(attempts))
-        self.assertEqual(1, attempts[0][1])
+        self.assertEqual(1, state["placed"][0][3])
         self.assertEqual([], self._close_calls())
         self.assertIn("Next try", executor.get_custom_info()["exchange_stop_error"])
         self.assertIsNone(executor.get_custom_info()["exchange_stop_order_id"])
@@ -1275,18 +1380,12 @@ class RangeIcebergExitTests(IsolatedAsyncioWrapperTestCase):
         self.now += 0.5
         self._run(executor.control_task())
         self.assertEqual(2, len(attempts))
-        self.assertEqual("stop-2", executor.get_custom_info()["exchange_stop_order_id"])
+        self.assertEqual("stop-1", executor.get_custom_info()["exchange_stop_order_id"])
         self.assertEqual("", executor.get_custom_info()["exchange_stop_error"])
         self.assertEqual(1, len(self._close_calls()))
-        self.assertGreater(attempts[1][0], attempts[0][0])
+        self.assertGreater(attempts[1], attempts[0])
 
     def test_exchange_stop_resize_keeps_the_old_id_until_cancel_is_confirmed(self):
-        ids = []
-
-        async def place_stop(trading_pair, position_id, amount, stop_loss_price=None, **kwargs):
-            ids.append(f"stop-{len(ids) + 1}")
-            return ids[-1]
-
         cancel_error = {"on": True}
 
         async def cancel_stop(order_ids):
@@ -1294,9 +1393,7 @@ class RangeIcebergExitTests(IsolatedAsyncioWrapperTestCase):
                 raise RuntimeError("cancel timed out")
             return {"success": True}
 
-        self.connector.place_position_stop_order = place_stop
-        self.connector.cancel_stop_orders = cancel_stop
-        self.connector._position_id_for_order = lambda trading_pair, trade_type, position_action, reduce_only: 4242
+        state = self._install_mexc_stop_book(cancel_result=cancel_stop)
         self._mid(Decimal("0.085"))
         executor = self._executor(
             exit_arming="ON_ANY_FILL",
@@ -1308,17 +1405,18 @@ class RangeIcebergExitTests(IsolatedAsyncioWrapperTestCase):
         order.executed_amount_quote = Decimal("3.2")
         order.current_state = OrderState.PARTIALLY_FILLED
         self._run(executor.control_task())
-        self.assertEqual(["stop-1"], ids)
+        self.assertEqual(["stop-1"], list(state["stops"]))
         self.assertEqual("stop-1", executor.get_custom_info()["exchange_stop_order_id"])
         order.executed_amount_base = Decimal("100")
         order.executed_amount_quote = Decimal("8")
         self._run(executor.control_task())
-        self.assertEqual(["stop-1"], ids)
+        self.assertEqual(["stop-1"], list(state["stops"]))
         self.assertEqual("stop-1", executor.get_custom_info()["exchange_stop_order_id"])
         self.assertIn("stop-1", executor.get_custom_info()["exchange_stop_error"])
         cancel_error["on"] = False
         self._run(executor.control_task())
-        self.assertEqual(["stop-1", "stop-2"], ids)
+        self.assertEqual(["stop-2"], list(state["stops"]))
+        self.assertEqual(Decimal("100"), state["stops"]["stop-2"]["amount"])
         self.assertEqual("stop-2", executor.get_custom_info()["exchange_stop_order_id"])
 
     def test_exchange_stop_is_cancelled_on_terminal_paths_except_keep_position(self):
@@ -1347,12 +1445,14 @@ class RangeIcebergExitTests(IsolatedAsyncioWrapperTestCase):
         failed = self._executor(stop_loss={"percent": "0.05", "execution": "SINGLE"})
         self._open_entry(failed)
         self._run(failed.control_task())
+        failed_id = failed.get_custom_info()["exchange_stop_order_id"]
         failed.early_stop(close_type=CloseType.FAILED)
         self._run(failed.control_task())
         self.assertEqual(CloseType.FAILED, failed.close_type)
         self.assertIsNone(failed.get_custom_info()["exchange_stop_order_id"])
         self.assertEqual(RunnableStatus.TERMINATED, failed.status)
-        self.assertGreaterEqual(cancelled.count("stop-1"), 2)
+        self.assertIn("stop-1", cancelled)
+        self.assertIn(failed_id, cancelled)
 
     def test_entry_retries_rest_the_limit_take_profit_on_the_filled_amount(self):
         executor = RangeIcebergExecutor(
@@ -1589,115 +1689,85 @@ class RangeIcebergExitTests(IsolatedAsyncioWrapperTestCase):
         self.assertEqual("RESTING", info["exit_state"])
 
     def test_growing_take_profit_resizes_the_stop_only_after_the_limit_is_gone(self):
-        events = []
-
-        async def place_stop(trading_pair, position_id, amount, stop_loss_price=None, **kwargs):
-            events.append(("place", amount))
-            if len(events) == 1:
-                return "stop-1"
-            return "stop-2"
-
-        async def cancel_stop(order_ids):
-            events.append(("cancel", list(order_ids)))
-            return {"success": True}
-
-        self.connector.place_position_stop_order = place_stop
-        self.connector.cancel_stop_orders = cancel_stop
-        self.connector._position_id_for_order = lambda trading_pair, trade_type, position_action, reduce_only: 4242
+        state = self._install_mexc_stop_book()
         self._mid(Decimal("0.085"))
         executor = self._executor(
             exit_arming="ON_ANY_FILL",
-            take_profit={"percent": "0.10", "execution": "SINGLE", "order_type": "LIMIT"},
-            stop_loss={"percent": "0.05", "execution": "SINGLE"},
+            take_profit={"price": "0.10", "execution": "SINGLE", "order_type": "LIMIT"},
+            stop_loss={"price": "0.07", "execution": "SINGLE"},
         )
         self._run(executor.control_task())
         order = self.orders[self.buy_ids[-1][0]]
-        order.executed_amount_base = Decimal("40")
-        order.executed_amount_quote = Decimal("3.2")
+        order.executed_amount_base = Decimal("50")
+        order.executed_amount_quote = Decimal("4")
         order.current_state = OrderState.PARTIALLY_FILLED
         self._run(executor.control_task())
-        self.assertEqual("stop-1", executor.get_custom_info()["exchange_stop_order_id"])
-        self.assertTrue(executor.get_custom_info()["has_exchange_stop"])
-        self.assertEqual(Decimal("40"), self._close_calls()[-1][1][2])
+        self.assertEqual({"stop-1": state["stops"]["stop-1"]}, state["stops"])
+        self.assertEqual(Decimal("50"), state["stops"]["stop-1"]["amount"])
+        self.assertEqual(Decimal("50"), self._close_calls()[-1][1][2])
         order.executed_amount_base = Decimal("100")
         order.executed_amount_quote = Decimal("8")
         order.current_state = OrderState.FILLED
         self._run(executor.control_task())
-        self.assertEqual([("place", Decimal("40")), ("place", Decimal("60"))], [item for item in events if item[0] == "place"])
-        self.assertEqual([], [item for item in events if item[0] == "cancel"])
-        self.assertEqual(["stop-1", "stop-2"], executor.get_custom_info()["exchange_stop_order_ids"])
-        self.assertEqual("stop-1", executor.get_custom_info()["exchange_stop_order_id"])
+        self.assertEqual(1, len(state["placed"]))
+        self.assertEqual([], state["cancelled"])
+        self.assertEqual(Decimal("50"), executor._exchange_stop_amount)
         self._run(executor.control_task())
-        self._run(executor.control_task())
-        placed_amounts = [item[1] for item in events if item[0] == "place"]
-        self.assertEqual([Decimal("40"), Decimal("60")], placed_amounts)
-        self.assertEqual([], [item for item in events if item[0] == "cancel"])
+        self.assertEqual([Decimal("50"), Decimal("100")], [item[1] for item in state["placed"]])
+        self.assertEqual(state["placed"][0][2], state["placed"][1][2])
+        self.assertEqual([], state["cancelled"])
+        self.assertEqual(["stop-1"], list(state["stops"]))
+        self.assertEqual(Decimal("100"), state["stops"]["stop-1"]["amount"])
         info = executor.get_custom_info()
-        self.assertEqual(["stop-1", "stop-2"], info["exchange_stop_order_ids"])
+        self.assertEqual(["stop-1"], info["exchange_stop_order_ids"])
         self.assertEqual("stop-1", info["exchange_stop_order_id"])
-        self.assertTrue(info["has_exchange_stop"])
         self.assertEqual("", info["exchange_stop_error"])
-        self.assertEqual(Decimal("100"), executor._exchange_stop_amount)
-        working = [slot for slot in executor._exit_slices if slot.is_working]
-        self.assertEqual(1, len(working))
-        self.assertEqual(Decimal("100"), working[0].tracked.order.amount)
+        self.assertEqual(Decimal("100"), self._close_calls()[-1][1][2])
+        self.assertEqual(OrderType.LIMIT, self._close_calls()[-1][1][3])
+        placed = len(state["placed"])
+        self._run(executor.control_task())
+        self._run(executor.control_task())
+        self.assertEqual(placed, len(state["placed"]))
+        open_closes = [
+            self.orders[order_id]
+            for order_id, _amount, _price, order_type, action in self.buy_ids
+            if action == PositionAction.CLOSE
+            and order_type == OrderType.LIMIT
+            and self.orders[order_id].current_state == OrderState.OPEN
+        ]
+        self.assertEqual(1, len(open_closes))
+        self.assertEqual(Decimal("100"), open_closes[0].amount)
 
-        failed_events = []
-
-        async def place_fail(trading_pair, position_id, amount, stop_loss_price=None, **kwargs):
-            failed_events.append(amount)
-            if len(failed_events) > 1:
-                raise RuntimeError("closable quantity")
-            return "stop-1"
-
-        async def cancel_fail(order_ids):
-            return {"success": True}
-
-        self.connector.place_position_stop_order = place_fail
-        self.connector.cancel_stop_orders = cancel_fail
+        failed = self._install_mexc_stop_book()
         other = self._executor(
             exit_arming="ON_ANY_FILL",
-            take_profit={"percent": "0.10", "execution": "SINGLE", "order_type": "LIMIT"},
-            stop_loss={"percent": "0.05", "execution": "SINGLE"},
+            take_profit={"price": "0.10", "execution": "SINGLE", "order_type": "LIMIT"},
+            stop_loss={"price": "0.07", "execution": "SINGLE"},
         )
         self._run(other.control_task())
         other_order = self.orders[self.buy_ids[-1][0]]
-        other_order.executed_amount_base = Decimal("40")
-        other_order.executed_amount_quote = Decimal("3.2")
+        other_order.executed_amount_base = Decimal("50")
+        other_order.executed_amount_quote = Decimal("4")
         other_order.current_state = OrderState.PARTIALLY_FILLED
         self._run(other.control_task())
+        failed["fail"] = 1
         other_order.executed_amount_base = Decimal("100")
         other_order.executed_amount_quote = Decimal("8")
         other_order.current_state = OrderState.FILLED
         self._run(other.control_task())
         self._run(other.control_task())
-        info = other.get_custom_info()
-        self.assertEqual("stop-1", info["exchange_stop_order_id"])
-        self.assertTrue(info["has_exchange_stop"])
-        self.assertIn("closable quantity", info["exchange_stop_error"])
-        self.assertEqual(Decimal("40"), self._close_calls()[-1][1][2])
-        places = len(failed_events)
+        self.assertEqual(Decimal("50"), failed["stops"]["stop-1"]["amount"])
+        self.assertEqual("stop-1", other.get_custom_info()["exchange_stop_order_id"])
+        self.assertIn("closable quantity", other.get_custom_info()["exchange_stop_error"])
+        self.assertEqual(Decimal("50"), self._close_calls()[-1][1][2])
+        places = len(failed["placed"])
         cancels = self.strategy.cancel.call_count
         self._run(other.control_task())
-        self.assertEqual(places, len(failed_events))
+        self.assertEqual(places, len(failed["placed"]))
         self.assertEqual(cancels, self.strategy.cancel.call_count)
-        self.assertEqual("stop-1", other.get_custom_info()["exchange_stop_order_id"])
 
     def test_percent_stop_grows_by_the_delta_without_a_coverage_gap(self):
-        placed = []
-        cancelled = []
-
-        async def place_stop(trading_pair, position_id, amount, stop_loss_price=None, **kwargs):
-            placed.append((amount, stop_loss_price))
-            return f"stop-{len(placed)}"
-
-        async def cancel_stop(order_ids):
-            cancelled.extend(list(order_ids))
-            return {"success": True}
-
-        self.connector.place_position_stop_order = place_stop
-        self.connector.cancel_stop_orders = cancel_stop
-        self.connector._position_id_for_order = lambda trading_pair, trade_type, position_action, reduce_only: 4242
+        state = self._install_mexc_stop_book()
         self._mid(Decimal("0.085"))
         executor = self._executor(
             exit_arming="ON_ANY_FILL",
@@ -1710,40 +1780,53 @@ class RangeIcebergExitTests(IsolatedAsyncioWrapperTestCase):
         order.executed_amount_quote = Decimal("4")
         order.current_state = OrderState.PARTIALLY_FILLED
         self._run(executor.control_task())
-        covered = [executor._exchange_stop_amount]
+        old_price = state["stops"]["stop-1"]["price"]
+        self.assertEqual(Decimal("50"), state["stops"]["stop-1"]["amount"])
         order.executed_amount_base = Decimal("100")
-        order.executed_amount_quote = Decimal("8")
+        order.executed_amount_quote = Decimal("9")
         order.current_state = OrderState.FILLED
-        for _ in range(3):
-            self._run(executor.control_task())
-            covered.append(executor._exchange_stop_amount)
+        self._mid(Decimal("0.092"))
+        self._run(executor.control_task())
+        self.assertEqual([], state["cancelled"])
+        self.assertEqual(Decimal("50"), executor._exchange_stop_amount)
+        self.assertEqual(old_price, state["stops"]["stop-1"]["price"])
+        self._run(executor.control_task())
+        self.assertEqual(["stop-1"], state["cancelled"])
+        self.assertEqual([Decimal("50"), Decimal("100")], [item[1] for item in state["placed"]])
+        self.assertNotEqual(old_price, state["placed"][1][2])
+        self.assertEqual(1, len(state["stops"]))
+        stop = next(iter(state["stops"].values()))
+        self.assertEqual(Decimal("100"), stop["amount"])
+        self.assertEqual(state["placed"][1][2], stop["price"])
         info = executor.get_custom_info()
-        self.assertEqual([Decimal("50"), Decimal("50")], [amount for amount, _price in placed])
-        self.assertEqual(placed[0][1], placed[1][1])
-        self.assertEqual([], cancelled)
-        self.assertEqual([Decimal("50"), Decimal("100"), Decimal("100"), Decimal("100")], covered)
-        self.assertEqual(["stop-1", "stop-2"], info["exchange_stop_order_ids"])
-        self.assertEqual("stop-1", info["exchange_stop_order_id"])
-        self.assertTrue(info["has_exchange_stop"])
+        self.assertEqual(1, len(info["exchange_stop_order_ids"]))
+        self.assertEqual(info["exchange_stop_order_ids"][0], info["exchange_stop_order_id"])
         self.assertEqual("", info["exchange_stop_error"])
-        working = [slot for slot in executor._exit_slices if slot.is_working]
-        self.assertEqual(1, len(working))
-        self.assertEqual(Decimal("100"), working[0].tracked.order.amount)
-        self.assertEqual(OrderType.LIMIT, working[0].tracked.order.order_type)
+        self.assertEqual(Decimal("100"), self._close_calls()[-1][1][2])
+        self.assertEqual(OrderType.LIMIT, self._close_calls()[-1][1][3])
+        placed = len(state["placed"])
+        self._run(executor.control_task())
+        self._run(executor.control_task())
+        self.assertEqual(placed, len(state["placed"]))
+        open_closes = [
+            self.orders[order_id]
+            for order_id, _amount, _price, order_type, action in self.buy_ids
+            if action == PositionAction.CLOSE
+            and order_type == OrderType.LIMIT
+            and self.orders[order_id].current_state == OrderState.OPEN
+        ]
+        self.assertEqual(1, len(open_closes))
+        self.assertEqual(Decimal("100"), open_closes[0].amount)
 
     def test_stop_loss_keeps_the_backstop_while_the_take_profit_cancel_is_unconfirmed(self):
         cancelled = []
-
-        async def place_stop(trading_pair, position_id, amount, stop_loss_price=None, **kwargs):
-            return "stop-1"
+        self._install_mexc_stop_book()
 
         async def cancel_stop(order_ids):
             cancelled.extend(list(order_ids))
             return {"success": True}
 
-        self.connector.place_position_stop_order = place_stop
         self.connector.cancel_stop_orders = cancel_stop
-        self.connector._position_id_for_order = lambda trading_pair, trade_type, position_action, reduce_only: 4242
         self.connector.is_cancel_confirmed = lambda order_id: False
         self._mid(Decimal("0.085"))
         executor = self._executor(
@@ -1853,6 +1936,8 @@ class RangeIcebergExitTests(IsolatedAsyncioWrapperTestCase):
         self._open_entry(executor)
         self._run(executor.control_task())
         executor._exchange_stop_amount = Decimal("40")
+        if executor._exchange_stops:
+            executor._exchange_stops[0]["amount"] = Decimal("40")
         self.connector.account_positions = {
             "aiot": SimpleNamespace(
                 trading_pair="AIOT-USDT",
@@ -1872,19 +1957,63 @@ class RangeIcebergExitTests(IsolatedAsyncioWrapperTestCase):
         self.assertNotEqual(CloseType.FAILED, executor.close_type)
         self.assertGreaterEqual(len(cancelled), 1)
 
+    def test_one_of_two_stops_firing_credits_only_that_stop(self):
+        state = self._install_mexc_stop_book()
+        self._mid(Decimal("0.085"))
+        executor = self._executor(stop_loss={"percent": "0.05", "execution": "SINGLE"})
+        self._open_entry(executor)
+        self._run(executor.control_task())
+        price = executor._exchange_stop_price
+        other_price = price + Decimal("0.001")
+        executor._exchange_stops = [
+            {"id": "stop-1", "amount": Decimal("50"), "price": price},
+            {"id": "stop-2", "amount": Decimal("50"), "price": other_price},
+        ]
+        executor._exchange_stop_order_id = "stop-1"
+        executor._exchange_stop_amount = Decimal("100")
+        executor._exchange_stop_price = price
+        state["stops"] = {
+            "stop-1": {"amount": Decimal("50"), "price": price},
+            "stop-2": {"amount": Decimal("50"), "price": other_price},
+        }
+        seen = {}
+
+        async def read_stop(order_id):
+            if str(order_id) == "stop-2":
+                return {"state": 3}
+            return {"state": 1}
+
+        async def cancel_stop(order_ids):
+            seen["ids"] = [str(order_id) for order_id in order_ids]
+            seen["tracked"] = list(executor.get_custom_info()["exchange_stop_order_ids"])
+            seen["open"] = executor.get_custom_info()["open_base"]
+            for stop_id in seen["ids"]:
+                state["stops"].pop(stop_id, None)
+            state["cancelled"].extend(seen["ids"])
+            return {"success": True}
+
+        self.connector.get_position_stop_order = read_stop
+        self.connector.cancel_stop_orders = cancel_stop
+        self._mid(Decimal("0.07"))
+        self._run(executor.control_task())
+        self.assertEqual(["stop-1"], seen["tracked"])
+        self.assertEqual(Decimal("50"), Decimal(seen["open"]))
+        self.assertEqual(["stop-1"], seen["ids"])
+        self.assertEqual(Decimal("50"), Decimal(executor.get_custom_info()["closed_base"]))
+        markets = [call for call in self._close_calls() if call[1][3] == OrderType.MARKET]
+        self.assertEqual(1, len(markets))
+        self.assertEqual(Decimal("50"), markets[0][1][2])
+        self.assertNotIn("stop-2", seen["ids"])
+
     def test_unconfirmed_stop_cancel_backs_off_then_closes_the_remainder(self):
         calls = []
-
-        async def place_stop(trading_pair, position_id, amount, stop_loss_price=None, **kwargs):
-            return "stop-1"
+        self._install_mexc_stop_book()
 
         async def cancel_stop(order_ids):
             calls.append(self.now)
             raise RuntimeError("cancel timed out")
 
-        self.connector.place_position_stop_order = place_stop
         self.connector.cancel_stop_orders = cancel_stop
-        self.connector._position_id_for_order = lambda trading_pair, trade_type, position_action, reduce_only: 4242
         self._mid(Decimal("0.085"))
         executor = self._executor(
             stop_loss_fallback_seconds=5,
@@ -1893,6 +2022,8 @@ class RangeIcebergExitTests(IsolatedAsyncioWrapperTestCase):
         self._open_entry(executor)
         self._run(executor.control_task())
         executor._exchange_stop_amount = Decimal("40")
+        if executor._exchange_stops:
+            executor._exchange_stops[0]["amount"] = Decimal("40")
         self._mid(Decimal("0.07"))
         for _ in range(8):
             self._run(executor.control_task())
@@ -1909,20 +2040,9 @@ class RangeIcebergExitTests(IsolatedAsyncioWrapperTestCase):
         self.assertTrue(executor.get_custom_info()["has_exchange_stop"])
 
     def test_rejected_stop_closes_replace_the_exchange_stop_before_failed(self):
-        placed = []
-        cancelled = []
-
-        async def place_stop(trading_pair, position_id, amount, stop_loss_price=None, **kwargs):
-            placed.append(f"stop-{len(placed) + 1}")
-            return placed[-1]
-
-        async def cancel_stop(order_ids):
-            cancelled.extend(list(order_ids))
-            return {"success": True}
-
-        self.connector.place_position_stop_order = place_stop
-        self.connector.cancel_stop_orders = cancel_stop
-        self.connector._position_id_for_order = lambda trading_pair, trade_type, position_action, reduce_only: 4242
+        state = self._install_mexc_stop_book()
+        placed = state["ids"]
+        cancelled = state["cancelled"]
         self._mid(Decimal("0.085"))
         executor = RangeIcebergExecutor(
             self.strategy,

@@ -278,8 +278,10 @@ class RangeIcebergExecutorConfig(ExecutorConfigBase):
     exchange stop before its own close. If those cancels stay open past
     stop_loss_fallback_seconds, the backstop stays and the software close is
     only the size not covered by the live stops and the unconfirmed take profit.
-    A larger position adds an exchange stop for the new size only. Every id is
-    listed in exchange_stop_order_ids. Resuming from custom_info restores an
+    A larger position at the same backstop price places the full open size and
+    keeps the id MEXC returns. A changed stop price cancels the old stops
+    before the new full-size place. Every id is listed in
+    exchange_stop_order_ids. Resuming from custom_info restores an
     exit_state of ARMED, RESTING, or CLOSING, re-posts a missing exit from
     open_base, and keeps the saved exchange stop ids. resume_entries false
     places no entry orders and sizes the restored open amount in base, even
