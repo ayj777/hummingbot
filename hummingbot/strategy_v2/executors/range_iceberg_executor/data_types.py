@@ -2,7 +2,7 @@ from decimal import Decimal
 from enum import Enum
 from typing import Literal, Optional, Union
 
-from pydantic import field_validator, model_validator
+from pydantic import BaseModel, field_validator, model_validator
 
 from hummingbot.core.data_type.common import TradeType
 from hummingbot.strategy_v2.executors.data_types import ExecutorConfigBase
@@ -62,6 +62,156 @@ class MarginMode(str, Enum):
     CROSS = "CROSS"
 
 
+class ExitExecution(str, Enum):
+    """How the filled position is closed once the trigger is reached."""
+
+    SINGLE = "SINGLE"
+    ICEBERG = "ICEBERG"
+
+
+class ExitOrderType(str, Enum):
+    """
+    Order type for a SINGLE take profit.
+
+    LIMIT rests one order at the trigger price. MARKET sends one order when the
+    trigger price is reached. A SINGLE stop loss is always a market order. Iceberg
+    exits do not use this value.
+    """
+
+    LIMIT = "LIMIT"
+    MARKET = "MARKET"
+
+
+class ExitArming(str, Enum):
+    """
+    When a configured exit becomes eligible.
+
+    ON_FULL_FILL waits until the entry has finished filling. ON_ANY_FILL arms as
+    soon as any amount is filled, so a partial fill can be protected. The exit
+    size is the filled amount, minus what the exit has already closed.
+    """
+
+    ON_FULL_FILL = "ON_FULL_FILL"
+    ON_ANY_FILL = "ON_ANY_FILL"
+
+
+class RangeIcebergExitConfig(BaseModel):
+    """
+    Optional close for the position this executor opens.
+
+    Set percent or price, not both. percent is a fraction of the average entry
+    price of the filled amount: 0.02 is 2 percent. For a long, take profit is
+    above that average and stop loss is below it. For a short, take profit is
+    below and stop loss is above. price is an absolute trigger and does not move
+    with the average.
+
+    SINGLE take profit places one limit order at the trigger, or one market order
+    when order_type is MARKET. SINGLE stop loss places one market order when the
+    trigger is reached.
+
+    ICEBERG closes with the same ladder, schedule, price jitter, and pre-jitter
+    reprice as the entry. slices is how many children to use. visible_count is how
+    many rest at once. interval spaces those children (seconds, or a string such
+    as 30s). Leave interval empty to release every slice as soon as the exit starts.
+    The exit clock starts when the exit triggers. It does not wait for the first
+    exit fill, and a pause after the trigger freezes it. Set limit_price for an
+    up-to close that does not cross that price, or set price_low and price_high
+    for a range ladder. Set one of those price styles. A cancelled range rung is
+    posted again for its unfilled remainder.
+
+    Take profit and stop loss are mutually exclusive. The first one that starts
+    sending close orders is the close. A take-profit limit that has not filled
+    yet is cancelled if the stop loss triggers, and the stop loss then runs to
+    completion. Once a stop-loss iceberg has started, a move back through the
+    take-profit price does not cancel it and does not start the take profit.
+    """
+
+    percent: Optional[Decimal] = None
+    price: Optional[Decimal] = None
+    execution: ExitExecution = ExitExecution.SINGLE
+    order_type: Optional[ExitOrderType] = None
+    slices: int = 1
+    visible_count: int = 1
+    interval: Optional[Union[float, str]] = None
+    limit_price: Optional[Decimal] = None
+    price_low: Optional[Decimal] = None
+    price_high: Optional[Decimal] = None
+
+    @field_validator("execution", mode="before")
+    @classmethod
+    def parse_execution(cls, value):
+        if isinstance(value, ExitExecution):
+            return value
+        text = str(getattr(value, "value", value)).upper()
+        if text not in (ExitExecution.SINGLE.value, ExitExecution.ICEBERG.value):
+            raise ValueError(f"execution ({value}) must be SINGLE or ICEBERG")
+        return ExitExecution(text)
+
+    @field_validator("order_type", mode="before")
+    @classmethod
+    def parse_order_type(cls, value):
+        if value is None or value == "":
+            return None
+        if isinstance(value, ExitOrderType):
+            return value
+        text = str(getattr(value, "value", value)).upper()
+        if text not in (ExitOrderType.LIMIT.value, ExitOrderType.MARKET.value):
+            raise ValueError(f"order_type ({value}) must be LIMIT or MARKET")
+        return ExitOrderType(text)
+
+    @property
+    def interval_seconds(self) -> Optional[float]:
+        if self.interval is None:
+            return None
+        return parse_duration(self.interval)
+
+    @model_validator(mode="after")
+    def validate_exit(self):
+        has_percent = self.percent is not None
+        has_price = self.price is not None
+        if has_percent == has_price:
+            raise ValueError("Set percent or price on an exit, not both and not neither")
+        if has_percent:
+            require_positive("percent", self.percent)
+            if self.percent >= 1:
+                raise ValueError(f"percent ({self.percent}) must be lower than 1")
+        if has_price:
+            require_positive("price", self.price)
+        require_at_least("slices", self.slices, 1)
+        require_at_least("visible_count", self.visible_count, 1)
+        if self.execution == ExitExecution.ICEBERG:
+            if self.visible_count > self.slices:
+                raise ValueError(
+                    f"visible_count ({self.visible_count}) must not exceed slices ({self.slices})"
+                )
+            has_range = self.price_low is not None or self.price_high is not None
+            has_limit = self.limit_price is not None
+            if has_range == has_limit:
+                raise ValueError(
+                    "An iceberg exit needs limit_price, or price_low and price_high, not both and not neither"
+                )
+            if has_limit:
+                require_positive("limit_price", self.limit_price)
+            else:
+                if self.price_low is None or self.price_high is None:
+                    raise ValueError("price_low and price_high are both required for an iceberg exit range")
+                require_positive("price_low", self.price_low)
+                require_positive("price_high", self.price_high)
+                if self.price_low > self.price_high:
+                    raise ValueError(
+                        f"price_low ({self.price_low}) must be less than or equal to price_high ({self.price_high})"
+                    )
+            if self.interval is not None:
+                try:
+                    seconds = parse_duration(self.interval)
+                except ValueError as exc:
+                    raise ValueError(
+                        f"interval ({self.interval}) must be seconds or a value like 30s, 1m"
+                    ) from exc
+                require_positive("interval", seconds)
+        return self
+
+
 class RangeIcebergExecutorConfig(ExecutorConfigBase):
     """
     Buy or sell a total size as a range ladder or as an up-to iceberg.
@@ -71,6 +221,12 @@ class RangeIcebergExecutorConfig(ExecutorConfigBase):
     only visible_count slices are shown. A duration releases that total on a clock and
     stops when the clock ends, even if size is left. The clock starts at the first fill
     unless schedule_start is SUBMIT, which starts it when the executor is created.
+
+    take_profit and stop_loss are optional and default to off. When either is set, the
+    filled position is closed with a single order or with another iceberg. See
+    RangeIcebergExitConfig. exit_arming chooses whether that close waits for a full fill.
+    An iceberg exit schedule starts when that exit triggers. It does not wait for a
+    first exit fill.
     """
 
     type: Literal["range_iceberg_executor"] = "range_iceberg_executor"
@@ -106,6 +262,9 @@ class RangeIcebergExecutorConfig(ExecutorConfigBase):
     leverage: int = 1
     margin_mode: Optional[MarginMode] = None
     random_seed: Optional[int] = None
+    take_profit: Optional[RangeIcebergExitConfig] = None
+    stop_loss: Optional[RangeIcebergExitConfig] = None
+    exit_arming: ExitArming = ExitArming.ON_FULL_FILL
 
     @field_validator("side", mode="before")
     @classmethod
@@ -123,6 +282,16 @@ class RangeIcebergExecutorConfig(ExecutorConfigBase):
         if text not in (ScheduleStart.FIRST_FILL.value, ScheduleStart.SUBMIT.value):
             raise ValueError(f"schedule_start ({value}) must be FIRST_FILL or SUBMIT")
         return ScheduleStart(text)
+
+    @field_validator("exit_arming", mode="before")
+    @classmethod
+    def parse_exit_arming(cls, value):
+        if isinstance(value, ExitArming):
+            return value
+        text = str(getattr(value, "value", value)).upper()
+        if text not in (ExitArming.ON_FULL_FILL.value, ExitArming.ON_ANY_FILL.value):
+            raise ValueError(f"exit_arming ({value}) must be ON_FULL_FILL or ON_ANY_FILL")
+        return ExitArming(text)
 
     @field_validator("margin_mode", mode="before")
     @classmethod
@@ -217,4 +386,39 @@ class RangeIcebergExecutorConfig(ExecutorConfigBase):
                 require_positive("schedule_interval", interval)
         elif self.schedule_slices is not None or self.schedule_interval is not None:
             raise ValueError("schedule_slices and schedule_interval need a duration")
+        if self.reduce_only and (self.take_profit is not None or self.stop_loss is not None):
+            raise ValueError(
+                "take_profit and stop_loss cannot be set when reduce_only is true, "
+                "because those exits close the position this executor opens"
+            )
+        self._prepare_exit("take_profit", self.take_profit, is_stop=False)
+        self._prepare_exit("stop_loss", self.stop_loss, is_stop=True)
+        if (
+            self.take_profit is not None
+            and self.stop_loss is not None
+            and self.take_profit.price is not None
+            and self.stop_loss.price is not None
+        ):
+            if self.side == TradeType.BUY and self.stop_loss.price >= self.take_profit.price:
+                raise ValueError(
+                    f"stop_loss price ({self.stop_loss.price}) must be lower than "
+                    f"take_profit price ({self.take_profit.price}) for a BUY side"
+                )
+            if self.side == TradeType.SELL and self.stop_loss.price <= self.take_profit.price:
+                raise ValueError(
+                    f"stop_loss price ({self.stop_loss.price}) must be higher than "
+                    f"take_profit price ({self.take_profit.price}) for a SELL side"
+                )
         return self
+
+    def _prepare_exit(self, field: str, exit_config: Optional[RangeIcebergExitConfig], is_stop: bool):
+        if exit_config is None or exit_config.execution != ExitExecution.SINGLE:
+            return
+        if is_stop:
+            if exit_config.order_type == ExitOrderType.LIMIT:
+                raise ValueError(
+                    f"{field} order_type (LIMIT) must be MARKET: a single stop loss is a market order"
+                )
+            exit_config.order_type = ExitOrderType.MARKET
+        elif exit_config.order_type is None:
+            exit_config.order_type = ExitOrderType.LIMIT

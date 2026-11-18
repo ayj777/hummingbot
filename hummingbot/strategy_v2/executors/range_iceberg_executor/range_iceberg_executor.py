@@ -14,7 +14,11 @@ from hummingbot.strategy_v2.executors.range_iceberg_executor.data_types import (
     CapBehavior,
     CatchUpPolicy,
     ExecutionMode,
+    ExitArming,
+    ExitExecution,
+    ExitOrderType,
     RangeIcebergExecutorConfig,
+    RangeIcebergExitConfig,
     ScheduleStart,
     SizeUnit,
 )
@@ -25,6 +29,7 @@ from hummingbot.strategy_v2.executors.range_iceberg_executor.ladder import (
     clamp_price,
     floor_sell_price,
     quantize_down,
+    quantize_up,
 )
 from hummingbot.strategy_v2.executors.time_schedule import SliceSchedule, release_timestamps
 from hummingbot.strategy_v2.models.base import RunnableStatus
@@ -38,6 +43,7 @@ class _Slice:
         self.pre_jitter_price: Optional[Decimal] = None
         self.tracked: Optional[TrackedOrder] = None
         self.cancel_requested = False
+        self.retired = False
 
     @property
     def order_id(self) -> Optional[str]:
@@ -45,6 +51,8 @@ class _Slice:
 
     @property
     def is_working(self) -> bool:
+        if self.retired:
+            return False
         if self.tracked is None or self.order_id == "skipped":
             return False
         if self.tracked.order is not None and self.tracked.is_done:
@@ -76,6 +84,36 @@ class RangeIcebergExecutor(ExecutorBase):
     Pausing freezes the schedule clock after it has started, and it still freezes
     expiry. Working orders stay. Time spent paused is not counted, and resume
     continues from the frozen elapsed time.
+    Pause stops new entry orders. An exit that already started keeps closing, and an
+    armed exit can still trigger. A pause after an exit trigger also freezes the
+    exit clock.
+
+    Optional take profit and stop loss close the filled position. They are off unless
+    the config sets them. A single take profit is one limit at the trigger, or one
+    market order. A single stop loss is one market order when the trigger is reached.
+    An iceberg exit reuses this executor's ladder, schedule, price jitter, pre-jitter
+    reprice, and cancelled-rung release. The opening quote cap and the hedge opening
+    cap stay on entry children. An exit is sized from the filled base, so those caps
+    do not shrink the close. Exit orders are not post only. A post-only reject
+    backoff therefore does not hold the close, and fees on a cleared exit order are
+    kept the same way entry fees are kept.
+
+    An iceberg exit schedule starts when that exit triggers. It does not wait for
+    the first exit fill. The entry rule that holds later rungs until a fill exists
+    only so that fill can start the entry clock. A close does not need it, so the
+    first exit window is open at the trigger and later windows count from then,
+    even while the first close order is still unfilled.
+
+    The exit is reduce-only: closing a long is a sell with position action CLOSE
+    (MEXC hedge side 4) and closing a short is a buy with position action CLOSE
+    (MEXC hedge side 2). Exit size never exceeds this executor's own filled amount,
+    net of what the exit has already closed.
+
+    Take profit and stop loss are mutually exclusive. A take-profit limit that has
+    not filled is cancelled if the stop loss triggers. Once a stop-loss iceberg has
+    sent its first close, it runs until the filled amount is closed. A later move
+    back through the take-profit price does not cancel that iceberg and does not
+    start the take profit.
     """
 
     _logger: Optional[HummingbotLogger] = None
@@ -152,6 +190,22 @@ class RangeIcebergExecutor(ExecutorBase):
         self._post_only_rejected_at: Optional[float] = None
         self._post_only_reject_bid: Optional[Decimal] = None
         self._post_only_reject_ask: Optional[Decimal] = None
+        self._exit_slices: List[_Slice] = []
+        self._exit_phase = "idle"
+        self._exit_active: Optional[str] = None
+        self._exit_trigger_price: Optional[Decimal] = None
+        self._exit_plan_ready = False
+        self._exit_plan_base = Decimal("0")
+        self._exit_slice_base = Decimal("0")
+        self._exit_schedule: Optional[SliceSchedule] = None
+        self._exit_schedule_state: Optional[dict] = None
+        self._exit_started_at: Optional[float] = None
+        self._exit_paused_seconds = 0.0
+        self._exit_range = False
+        self._exit_accounted_base: dict = {}
+        self._exit_accounted_quote: dict = {}
+        self._exit_order_ids: List[str] = []
+        self._exit_force_single = False
 
     def _make_schedule(self) -> Optional[SliceSchedule]:
         resolved = self.config.resolved_schedule()
@@ -167,21 +221,28 @@ class RangeIcebergExecutor(ExecutorBase):
             amounts.append(piece)
             remaining -= piece
         offsets = release_timestamps(0.0, count, interval)
-        if self.config.timing_jitter_pct > 0 and interval > 0:
-            jittered = []
-            duration = self.config.duration_seconds
-            for index, nominal in enumerate(offsets):
-                swing = (self._rng.random() * 2) - 1
-                delta = swing * float(self.config.timing_jitter_pct) * interval
-                low = 0.0 if index == 0 else jittered[-1]
-                jittered.append(min(max(low, nominal + delta), duration))
-            offsets = jittered
+        offsets = self._apply_timing_jitter(offsets, interval, self.config.duration_seconds)
         return SliceSchedule(
             amounts=amounts,
             offsets=offsets,
             duration=self.config.duration_seconds,
             skip_unplaced=self.config.catch_up == CatchUpPolicy.SKIP,
         )
+
+    def _apply_timing_jitter(self, offsets, interval: float, duration: float):
+        """
+        The same release-clock jitter the entry schedule uses. A zero jitter percent
+        returns the nominal offsets and does not draw random numbers.
+        """
+        if self.config.timing_jitter_pct <= 0 or interval <= 0:
+            return list(offsets)
+        jittered = []
+        for index, nominal in enumerate(offsets):
+            swing = (self._rng.random() * 2) - 1
+            delta = swing * float(self.config.timing_jitter_pct) * interval
+            low = 0.0 if index == 0 else jittered[-1]
+            jittered.append(min(max(low, nominal + delta), duration))
+        return jittered
 
     def _build_plan(self):
         if self.config.mode == ExecutionMode.UP_TO:
@@ -267,6 +328,8 @@ class RangeIcebergExecutor(ExecutorBase):
             self._paused_seconds += now - started
             if self._schedule_started_at is not None:
                 self._schedule_paused_seconds += max(0.0, now - max(started, self._schedule_started_at))
+            if self._exit_started_at is not None:
+                self._exit_paused_seconds += max(0.0, now - max(started, self._exit_started_at))
             self._pause_started = None
             self._paused = False
 
@@ -316,9 +379,17 @@ class RangeIcebergExecutor(ExecutorBase):
         if self._filled_unit() > 0:
             return True
         self._absorb_counted_fills()
-        if any(amount > 0 for amount in self._counted_fill_base.values()):
+        if any(
+            amount > 0
+            for order_id, amount in self._counted_fill_base.items()
+            if not self._is_exit_order(order_id)
+        ):
             return True
-        if any(amount > 0 for amount in self._accounted_fill_by_order.values()):
+        if any(
+            amount > 0
+            for order_id, amount in self._accounted_fill_by_order.items()
+            if not self._is_exit_order(order_id)
+        ):
             return True
         for slot in self._slices:
             order = slot.tracked.order if slot.tracked else None
@@ -413,6 +484,7 @@ class RangeIcebergExecutor(ExecutorBase):
             self._paused = bool(clock["paused"])
             pause_started = clock.get("pause_started")
             self._pause_started = None if pause_started is None else float(pause_started)
+        self._restore_exit_state(info)
 
     async def validate_sufficient_balance(self):
         # Limit orders are rejected by the exchange when margin is short. Retries cover that.
@@ -436,18 +508,35 @@ class RangeIcebergExecutor(ExecutorBase):
         await self._release_confirmed_failures()
         self._refresh_tracked_orders()
         self._release_cancelled_rungs()
+        self._release_cancelled_exit_rungs()
         self._capture_schedule_anchor()
+        if self._exit_phase == "done":
+            return
+        if self._exit_phase in ("cancelling_entry", "executing"):
+            await self._control_exit()
+            return
         self._advance_schedule()
-        if self._time_limit_reached():
+        if self._exit_active is None and self._time_limit_reached():
             self._advance_schedule(force_end=True)
             self.early_stop(keep_position=False, close_type=CloseType.TIME_LIMIT)
             return
-        if self._expired():
+        if self._exit_active is None and self._expired():
             self.early_stop(keep_position=False, close_type=CloseType.EXPIRED)
             return
+        if self._exit_phase == "armed":
+            await self._control_exit()
+            return
         if self._execution_complete():
+            if self._needs_exit_after_entry():
+                self._exit_phase = "armed"
+                await self._control_exit()
+                return
             self.close_execution_finished()
             return
+        if self._partial_exit_ready():
+            await self._control_exit()
+            if self._exit_phase in ("cancelling_entry", "executing", "done"):
+                return
         if self.status != RunnableStatus.RUNNING or self._paused:
             return
         if self.config.mode == ExecutionMode.UP_TO:
@@ -467,6 +556,12 @@ class RangeIcebergExecutor(ExecutorBase):
         await self._place_slice(slot)
 
     def early_stop(self, keep_position: bool = False, close_type: Optional[CloseType] = None):
+        """
+        Cancel entry and exit orders, then stop.
+
+        keep_position selects POSITION_HOLD instead of EARLY_STOP. It does not close
+        the filled position. That matches the behavior without take profit or stop loss.
+        """
         self.close_type = close_type or (CloseType.POSITION_HOLD if keep_position else CloseType.EARLY_STOP)
         self.close_timestamp = self._strategy.current_timestamp
         self._begin_shutdown()
@@ -592,43 +687,65 @@ class RangeIcebergExecutor(ExecutorBase):
             position_action=position_action,
         )
 
-    def _jitter_price(self, price: Decimal, price_step: Decimal) -> Decimal:
+    def _jitter_price(
+        self,
+        price: Decimal,
+        price_step: Decimal,
+        price_low: Optional[Decimal] = None,
+        price_high: Optional[Decimal] = None,
+    ) -> Decimal:
         if self.config.price_jitter_pct <= 0:
             return price
+        low = self.config.price_low if price_low is None else price_low
+        high = self.config.price_high if price_high is None else price_high
         swing = (Decimal(str(self._rng.random())) * 2) - Decimal("1")
         jittered = price * (Decimal("1") + self.config.price_jitter_pct * swing)
         try:
-            return clamp_price(jittered, self.config.price_low, self.config.price_high, price_step)
+            return clamp_price(jittered, low, high, price_step)
         except ValueError:
             return price
 
-    def _jitter_up_to_price(self, price: Decimal) -> Decimal:
+    def _jitter_up_to_price(
+        self,
+        price: Decimal,
+        side: Optional[TradeType] = None,
+        limit_price: Optional[Decimal] = None,
+        post_only: Optional[bool] = None,
+    ) -> Decimal:
         if self.config.price_jitter_pct <= 0:
             return price
         swing = (Decimal(str(self._rng.random())) * 2) - Decimal("1")
         jittered = price * (Decimal("1") + self.config.price_jitter_pct * swing)
-        clamped = self._clamp_limit(jittered)
-        if not self._jitter_respects_market(clamped):
+        clamped = self._clamp_limit(jittered, side=side, limit_price=limit_price)
+        if not self._jitter_respects_market(clamped, side=side, limit_price=limit_price, post_only=post_only):
             return price
         return clamped
 
-    def _jitter_respects_market(self, price: Decimal) -> bool:
+    def _jitter_respects_market(
+        self,
+        price: Decimal,
+        side: Optional[TradeType] = None,
+        limit_price: Optional[Decimal] = None,
+        post_only: Optional[bool] = None,
+    ) -> bool:
         """
         A buy cannot be pushed past the limit, and a post-only buy cannot reach the ask.
         A sell cannot be pushed through the limit, and a post-only sell cannot reach the bid.
         """
-        limit = self.config.limit_price
-        if self.config.side == TradeType.BUY:
+        side = self.config.side if side is None else side
+        limit = self.config.limit_price if limit_price is None else limit_price
+        post_only = self.config.post_only if post_only is None else post_only
+        if side == TradeType.BUY:
             if limit is not None and price > limit:
                 return False
-            if self.config.post_only:
+            if post_only:
                 ask = self.get_price(self.config.connector_name, self.config.trading_pair, PriceType.BestAsk)
                 if price >= ask:
                     return False
             return True
         if limit is not None and price < limit:
             return False
-        if self.config.post_only:
+        if post_only:
             bid = self.get_price(self.config.connector_name, self.config.trading_pair, PriceType.BestBid)
             if price <= bid:
                 return False
@@ -683,48 +800,64 @@ class RangeIcebergExecutor(ExecutorBase):
             return amount
         return jittered
 
-    def _desired_price(self) -> Optional[Decimal]:
+    def _desired_price(
+        self,
+        side: Optional[TradeType] = None,
+        limit_price: Optional[Decimal] = None,
+        cap_behavior: Optional[CapBehavior] = None,
+        post_only: Optional[bool] = None,
+    ) -> Optional[Decimal]:
+        side = self.config.side if side is None else side
+        cap = self.config.limit_price if limit_price is None else limit_price
+        cap_behavior = self.config.cap_behavior if cap_behavior is None else cap_behavior
+        post_only = self.config.post_only if post_only is None else post_only
         rules = self.get_trading_rules(self.config.connector_name, self.config.trading_pair)
         step = Decimal(str(rules.min_price_increment or 0))
-        cap = self.config.limit_price
         ask = self.get_price(self.config.connector_name, self.config.trading_pair, PriceType.BestAsk)
         bid = self.get_price(self.config.connector_name, self.config.trading_pair, PriceType.BestBid)
-        if self.config.side == TradeType.BUY:
+        if side == TradeType.BUY:
             if ask > cap:
-                if self.config.cap_behavior == CapBehavior.WAIT:
+                if cap_behavior == CapBehavior.WAIT:
                     return None
                 raw = cap
-            elif self.config.post_only:
+            elif post_only:
                 raw = bid + step if step > 0 else bid
                 if step > 0 and raw >= ask:
                     raw = bid
             else:
                 raw = ask
             price = cap_buy_price(raw, step, cap)
-            if self.config.post_only and price >= ask:
+            if post_only and price >= ask:
                 price = cap_buy_price(bid, step, cap)
             return price
         if bid < cap:
-            if self.config.cap_behavior == CapBehavior.WAIT:
+            if cap_behavior == CapBehavior.WAIT:
                 return None
             raw = cap
-        elif self.config.post_only:
+        elif post_only:
             raw = ask - step if step > 0 else ask
             if step > 0 and raw <= bid:
                 raw = ask
         else:
             raw = bid
         price = floor_sell_price(raw, step, cap)
-        if self.config.post_only and price <= bid:
+        if post_only and price <= bid:
             price = floor_sell_price(bid + (step if step > 0 else Decimal("0")), step, cap)
         return price
 
-    def _clamp_limit(self, price: Decimal) -> Decimal:
+    def _clamp_limit(
+        self,
+        price: Decimal,
+        side: Optional[TradeType] = None,
+        limit_price: Optional[Decimal] = None,
+    ) -> Decimal:
+        side = self.config.side if side is None else side
+        limit_price = self.config.limit_price if limit_price is None else limit_price
         rules = self.get_trading_rules(self.config.connector_name, self.config.trading_pair)
         step = Decimal(str(rules.min_price_increment or 0))
-        if self.config.side == TradeType.BUY:
-            return cap_buy_price(price, step, self.config.limit_price)
-        return floor_sell_price(price, step, self.config.limit_price)
+        if side == TradeType.BUY:
+            return cap_buy_price(price, step, limit_price)
+        return floor_sell_price(price, step, limit_price)
 
     def _slice_unit_amount(self) -> Decimal:
         if self.config.slice_amount is not None:
@@ -770,7 +903,15 @@ class RangeIcebergExecutor(ExecutorBase):
         self._request_cancel(pending[0])
         return True
 
-    def _keep_working_price(self, slot: _Slice, desired: Decimal, step: Decimal) -> bool:
+    def _keep_working_price(
+        self,
+        slot: _Slice,
+        desired: Decimal,
+        step: Decimal,
+        side: Optional[TradeType] = None,
+        post_only: Optional[bool] = None,
+        limit_price: Optional[Decimal] = None,
+    ) -> bool:
         """
         Leave an order whose pre-jitter target has not moved.
         Also leave a post-only order that is already the best price on its side
@@ -780,16 +921,33 @@ class RangeIcebergExecutor(ExecutorBase):
         reference = slot.pre_jitter_price if slot.pre_jitter_price is not None else self._slot_price(slot)
         if not self._price_differs(reference, desired, step):
             return True
-        return self._resting_on_own_best(self._slot_price(slot), desired, step)
+        return self._resting_on_own_best(
+            self._slot_price(slot),
+            desired,
+            step,
+            side=side,
+            post_only=post_only,
+            limit_price=limit_price,
+        )
 
-    def _resting_on_own_best(self, order_price: Decimal, desired: Decimal, step: Decimal) -> bool:
-        if not self.config.post_only:
+    def _resting_on_own_best(
+        self,
+        order_price: Decimal,
+        desired: Decimal,
+        step: Decimal,
+        side: Optional[TradeType] = None,
+        post_only: Optional[bool] = None,
+        limit_price: Optional[Decimal] = None,
+    ) -> bool:
+        side = self.config.side if side is None else side
+        post_only = self.config.post_only if post_only is None else post_only
+        limit = self.config.limit_price if limit_price is None else limit_price
+        if not post_only:
             return False
         bid = self.get_price(self.config.connector_name, self.config.trading_pair, PriceType.BestBid)
         ask = self.get_price(self.config.connector_name, self.config.trading_pair, PriceType.BestAsk)
-        limit = self.config.limit_price
         tick = step if step > 0 else Decimal("0")
-        if self.config.side == TradeType.BUY:
+        if side == TradeType.BUY:
             if order_price != bid or order_price >= ask:
                 return False
             if limit is not None and order_price > limit:
@@ -980,7 +1138,7 @@ class RangeIcebergExecutor(ExecutorBase):
         return amount
 
     def _refresh_tracked_orders(self):
-        for slot in self._slices:
+        for slot in list(self._slices) + list(self._exit_slices):
             if (
                 slot.tracked
                 and slot.tracked.order_id
@@ -993,7 +1151,7 @@ class RangeIcebergExecutor(ExecutorBase):
 
     def _cancel_working_orders(self):
         order_ids = []
-        for slot in self._slices:
+        for slot in list(self._slices) + list(self._exit_slices):
             if slot.order_id and slot.order_id != "skipped" and self._should_cancel(slot):
                 order_ids.append(slot.order_id)
         for order_id in order_ids:
@@ -1005,7 +1163,7 @@ class RangeIcebergExecutor(ExecutorBase):
             return True
         if slot.tracked is None or slot.tracked.order is not None:
             return False
-        return slot.order_id in self._submitted_order_ids
+        return slot.order_id in self._submitted_order_ids or slot.order_id in self._exit_order_ids
 
     def _holds_unaccounted_fill(self, slot: _Slice) -> bool:
         if slot.tracked is None or slot.tracked.order is None:
@@ -1053,6 +1211,7 @@ class RangeIcebergExecutor(ExecutorBase):
                 continue
             self._failed_order_ids.discard(order_id)
             self._remember_fill_before_clearing(order_id)
+        self._retire_confirmed_exit_cancels()
 
     def _remember_fill_before_clearing(self, order_id: str):
         slot = self._slot_for(order_id)
@@ -1103,6 +1262,36 @@ class RangeIcebergExecutor(ExecutorBase):
             if remainder < 0:
                 remainder = Decimal("0")
             self._remember_fill_before_clearing(slot.order_id)
+            slot.target_amount = remainder
+
+    def _release_cancelled_exit_rungs(self) -> None:
+        """
+        Same remainder release as an entry range rung, for an exit range ladder.
+
+        A close that the exchange cancelled still owns its unfilled size. Keep the
+        fill and the fee, then clear the rung so the remainder is posted again.
+        Up-to exit children are new slices, so they are left for the next place.
+        """
+        if not self._exit_range or self._shutdown_pending or self._exit_phase == "done":
+            return
+        for slot in self._exit_slices:
+            if slot.retired or slot.tracked is None or slot.order_id in (None, "skipped"):
+                continue
+            if slot.order_id in self._unconfirmed_cancels or slot.order_id in self._failed_order_ids:
+                continue
+            if slot.order_id in self._unknown_order_ids:
+                continue
+            order = slot.tracked.order
+            if order is None or not order.is_cancelled or order.is_filled:
+                continue
+            filled_base, _quote = self._exit_best_fill(slot.order_id)
+            remainder = slot.target_amount - filled_base
+            if remainder < 0:
+                remainder = Decimal("0")
+            self._retained_fees_quote += slot.tracked.cum_fees_quote
+            self._remember_exit_fill(slot)
+            slot.tracked = None
+            slot.cancel_requested = False
             slot.target_amount = remainder
 
     async def _escalate_unresolved_cancel(self, order_id: str) -> bool:
@@ -1223,9 +1412,10 @@ class RangeIcebergExecutor(ExecutorBase):
         ids = set(self._submitted_order_ids)
         ids.update(self._unconfirmed_cancels)
         ids.update(self._unknown_order_ids)
-        for slot in self._slices:
+        for slot in list(self._slices) + list(self._exit_slices):
             if slot.order_id and slot.order_id != "skipped":
                 ids.add(slot.order_id)
+        ids.update(self._exit_order_ids)
         return ids
 
     def _exposure_target_base(self, price: Optional[Decimal]) -> Decimal:
@@ -1614,7 +1804,7 @@ class RangeIcebergExecutor(ExecutorBase):
         return self._rounding_remainder_base
 
     def process_order_created_event(self, event_tag: int, market, event):
-        slot = self._slot_for(event.order_id)
+        slot = self._slot_for(event.order_id) or self._exit_slot_for(event.order_id)
         if slot and slot.tracked:
             in_flight = self.get_in_flight_order(self.config.connector_name, event.order_id)
             if in_flight:
@@ -1666,7 +1856,7 @@ class RangeIcebergExecutor(ExecutorBase):
         return True
 
     def process_order_failed_event(self, event_tag: int, market, event):
-        slot = self._slot_for(event.order_id)
+        slot = self._slot_for(event.order_id) or self._exit_slot_for(event.order_id)
         if slot:
             self._strategy.cancel(self.config.connector_name, self.config.trading_pair, event.order_id)
             self._unconfirmed_cancels.add(event.order_id)
@@ -1698,8 +1888,10 @@ class RangeIcebergExecutor(ExecutorBase):
         self._anchor_schedule(float(event.timestamp))
 
     def process_order_completed_event(self, event_tag: int, market, event):
+        if self._exit_slot_for(event.order_id) is not None or event.order_id in self._exit_order_ids:
+            return
         self._capture_schedule_anchor()
-        if self._execution_complete():
+        if self._execution_complete() and not self._needs_exit_after_entry():
             self.close_execution_finished()
 
     def _slot_for(self, order_id: str) -> Optional[_Slice]:
@@ -1724,6 +1916,8 @@ class RangeIcebergExecutor(ExecutorBase):
         base = Decimal("0")
         quote = Decimal("0")
         for order_id in order_ids:
+            if self._is_exit_order(order_id):
+                continue
             part_base, part_quote = self._best_fill(order_id)
             base += part_base
             quote += part_quote
@@ -1743,13 +1937,25 @@ class RangeIcebergExecutor(ExecutorBase):
         return self.filled_amount_quote / filled
 
     def get_cum_fees_quote(self) -> Decimal:
-        live = sum((slot.tracked.cum_fees_quote for slot in self._slices if slot.tracked), Decimal("0"))
+        slots = list(self._slices) + list(self._exit_slices)
+        live = sum((slot.tracked.cum_fees_quote for slot in slots if slot.tracked), Decimal("0"))
         return live + self._retained_fees_quote
 
     def get_net_pnl_quote(self) -> Decimal:
         filled = self.filled_base
         if filled <= 0:
             return Decimal("0")
+        if self._exit_filled_base() > 0:
+            remaining = self._position_base()
+            realized = self._realized_pnl_quote()
+            if remaining <= 0 or self.average_fill_price <= 0:
+                return realized
+            mark = self.get_price(self.config.connector_name, self.config.trading_pair, PriceType.MidPrice)
+            if self.config.side == TradeType.BUY:
+                unrealized = (mark - self.average_fill_price) * remaining
+            else:
+                unrealized = (self.average_fill_price - mark) * remaining
+            return realized + unrealized
         mark = self.get_price(self.config.connector_name, self.config.trading_pair, PriceType.MidPrice)
         if self.config.side == TradeType.BUY:
             return (mark - self.average_fill_price) * filled - self.cum_fees_quote
@@ -1790,6 +1996,17 @@ class RangeIcebergExecutor(ExecutorBase):
             "average_fill_price": str(self.average_fill_price),
             "rounding_remainder": str(self._size_remainder()),
             "child_order_ids": [slot.order_id for slot in self._slices if slot.order_id],
+            "take_profit": self._exit_config_view(self.config.take_profit),
+            "stop_loss": self._exit_config_view(self.config.stop_loss),
+            "exit_arming": self.config.exit_arming.value,
+            "take_profit_trigger_price": self._trigger_text("take_profit"),
+            "stop_loss_trigger_price": self._trigger_text("stop_loss"),
+            "exit_status": self._exit_phase,
+            "exit_active": self._exit_active,
+            "exit_filled_amount": str(self._exit_filled_base()),
+            "exit_average_price": str(self._exit_average_price()),
+            "realized_pnl_quote": str(self._realized_pnl_quote()),
+            "exit": self._exit_snapshot(),
             "levels": [
                 {
                     "price": str(slot.target_price),
@@ -1800,3 +2017,855 @@ class RangeIcebergExecutor(ExecutorBase):
                 for slot in self._slices
             ],
         }
+
+    def _exits_configured(self) -> bool:
+        return self.config.take_profit is not None or self.config.stop_loss is not None
+
+    def _needs_exit_after_entry(self) -> bool:
+        return self._exits_configured() and self.filled_base > 0 and self._exit_phase != "done"
+
+    def _partial_exit_ready(self) -> bool:
+        if self.config.exit_arming != ExitArming.ON_ANY_FILL or not self._exits_configured():
+            return False
+        if self.filled_base <= 0:
+            return False
+        return self._choose_exit() is not None
+
+    def _exit_config(self, kind: str) -> Optional[RangeIcebergExitConfig]:
+        if kind == "take_profit":
+            return self.config.take_profit
+        if kind == "stop_loss":
+            return self.config.stop_loss
+        return None
+
+    def _active_exit_config(self) -> Optional[RangeIcebergExitConfig]:
+        if self._exit_active is None:
+            return None
+        return self._exit_config(self._exit_active)
+
+    def _exit_side(self) -> TradeType:
+        """
+        Close the position the entry opened.
+
+        A long is closed with a sell. A short is closed with a buy. Combined with
+        position action CLOSE, the MEXC hedge mapping is side 4 for a long and side 2
+        for a short.
+        """
+        if self.config.side == TradeType.BUY:
+            return TradeType.SELL
+        return TradeType.BUY
+
+    def _reference_price(self) -> Decimal:
+        return Decimal(str(self.get_price(
+            self.config.connector_name, self.config.trading_pair, PriceType.MidPrice,
+        )))
+
+    def _trigger_price_for(self, kind: str) -> Optional[Decimal]:
+        cfg = self._exit_config(kind)
+        if cfg is None:
+            return None
+        if cfg.price is not None:
+            return cfg.price
+        average = self.average_fill_price
+        if average <= 0 or cfg.percent is None:
+            return None
+        long_entry = self.config.side == TradeType.BUY
+        if kind == "take_profit":
+            multiplier = Decimal("1") + cfg.percent if long_entry else Decimal("1") - cfg.percent
+        else:
+            multiplier = Decimal("1") - cfg.percent if long_entry else Decimal("1") + cfg.percent
+        return average * multiplier
+
+    def _reported_trigger(self, kind: str) -> Optional[Decimal]:
+        if self._exit_active == kind and self._exit_trigger_price is not None:
+            return self._exit_trigger_price
+        return self._trigger_price_for(kind)
+
+    def _trigger_text(self, kind: str):
+        price = self._reported_trigger(kind)
+        if price is None:
+            return None
+        return str(price)
+
+    def _price_reached(self, kind: str, trigger: Decimal, price: Decimal) -> bool:
+        long_entry = self.config.side == TradeType.BUY
+        if kind == "take_profit":
+            return price >= trigger if long_entry else price <= trigger
+        return price <= trigger if long_entry else price >= trigger
+
+    def _take_profit_wants_to_start(self, price: Decimal) -> bool:
+        cfg = self.config.take_profit
+        if cfg is None:
+            return False
+        trigger = self._trigger_price_for("take_profit")
+        if trigger is None:
+            return False
+        if cfg.execution == ExitExecution.SINGLE and cfg.order_type == ExitOrderType.LIMIT:
+            return True
+        return self._price_reached("take_profit", trigger, price)
+
+    def _stop_wants_to_start(self, price: Decimal) -> bool:
+        cfg = self.config.stop_loss
+        if cfg is None:
+            return False
+        trigger = self._trigger_price_for("stop_loss")
+        if trigger is None:
+            return False
+        return self._price_reached("stop_loss", trigger, price)
+
+    def _exit_has_fill(self) -> bool:
+        return self._exit_filled_base() > 0
+
+    def _take_profit_is_committed(self) -> bool:
+        """
+        A resting take-profit limit can still be replaced by the stop loss.
+        A take profit that has already filled, or a take-profit market or iceberg
+        that has sent an order, is the close and is not replaced.
+        """
+        if self._exit_active != "take_profit":
+            return False
+        cfg = self.config.take_profit
+        if cfg is None:
+            return True
+        if cfg.execution == ExitExecution.ICEBERG or cfg.order_type == ExitOrderType.MARKET:
+            return self._exit_has_live_order()
+        return self._exit_has_fill()
+
+    def _exit_has_live_order(self) -> bool:
+        return any(slot.order_id and slot.order_id != "skipped" and not slot.retired for slot in self._exit_slices)
+
+    def _choose_exit(self) -> Optional[str]:
+        """
+        Pick the exit that should be working.
+
+        A stop-loss iceberg that has started stays selected even if price returns
+        to the take-profit side. That close runs until the filled amount is closed.
+        """
+        if self._exit_active == "stop_loss":
+            return "stop_loss"
+        price = self._reference_price()
+        stop_hit = self._stop_wants_to_start(price)
+        if self._exit_active == "take_profit":
+            if stop_hit and not self._take_profit_is_committed():
+                return "stop_loss"
+            return "take_profit"
+        if stop_hit:
+            return "stop_loss"
+        if self._take_profit_wants_to_start(price):
+            return "take_profit"
+        return None
+
+    async def _control_exit(self):
+        if self._exit_phase == "done" or not self._exits_configured() or self.filled_base <= 0:
+            return
+        kind = self._choose_exit()
+        if kind is None:
+            if self._execution_complete() and self._exit_phase == "idle":
+                self._exit_phase = "armed"
+            return
+        self._activate_exit(kind)
+        if self._entry_blocks_exit() or self._exit_orders_block():
+            self._exit_phase = "cancelling_entry"
+            return
+        self._exit_phase = "executing"
+        await self._execute_exit()
+
+    def _activate_exit(self, kind: str):
+        if self._exit_active == kind and self._exit_phase in ("cancelling_entry", "executing"):
+            return
+        if self._exit_active is not None and self._exit_active != kind:
+            self._cancel_exit_orders()
+            self._exit_plan_ready = False
+            self._exit_schedule = None
+            self._exit_schedule_state = None
+            self._exit_force_single = False
+            self._exit_started_at = None
+            self._exit_paused_seconds = 0.0
+        self._exit_active = kind
+        if self._exit_started_at is None:
+            # The close clock starts at this trigger. A later fill does not move it.
+            self._exit_started_at = float(self._strategy.current_timestamp)
+        self._exit_trigger_price = self._trigger_price_for(kind)
+        self._cancel_entry_orders_for_exit()
+        self._exit_phase = "cancelling_entry" if self._entry_blocks_exit() or self._exit_orders_block() else "executing"
+
+    def _cancel_entry_orders_for_exit(self):
+        """An exit that starts while entry orders are still working cancels those orders first."""
+        for slot in self._slices:
+            if not slot.is_working or slot.cancel_requested:
+                continue
+            if not slot.order_id or slot.order_id == "skipped":
+                continue
+            self._strategy.cancel(self.config.connector_name, self.config.trading_pair, slot.order_id)
+            slot.cancel_requested = True
+            self._unconfirmed_cancels.add(slot.order_id)
+
+    def _cancel_exit_orders(self):
+        for slot in self._exit_slices:
+            if slot.retired or not slot.is_working or slot.cancel_requested:
+                continue
+            if not slot.order_id or slot.order_id == "skipped":
+                continue
+            self._strategy.cancel(self.config.connector_name, self.config.trading_pair, slot.order_id)
+            slot.cancel_requested = True
+            self._unconfirmed_cancels.add(slot.order_id)
+
+    def _entry_blocks_exit(self) -> bool:
+        for slot in self._slices:
+            if slot.retired or not slot.cancel_requested:
+                if self._counts_as_open(slot) and not slot.cancel_requested:
+                    return True
+                continue
+            if slot.order_id and slot.order_id in self._unconfirmed_cancels:
+                return True
+        return False
+
+    def _exit_orders_block(self) -> bool:
+        for slot in self._exit_slices:
+            if slot.retired or not slot.cancel_requested:
+                continue
+            if slot.order_id and slot.order_id in self._unconfirmed_cancels:
+                return True
+            if slot.is_working:
+                return True
+        return False
+
+    async def _execute_exit(self):
+        self._refresh_exit_orders()
+        if self._exit_done_closing():
+            if self._exit_filled_base() > 0 or self._position_base() <= 0:
+                self._finish_exit()
+            else:
+                self.close_execution_finished()
+            return
+        if self._active_is_single():
+            await self._execute_exit_single()
+            return
+        await self._execute_exit_iceberg()
+
+    def _active_is_single(self) -> bool:
+        cfg = self._active_exit_config()
+        if cfg is None:
+            return False
+        return cfg.execution == ExitExecution.SINGLE or self._exit_force_single
+
+    def _exit_done_closing(self) -> bool:
+        if self._exit_working():
+            return False
+        return self._position_base() < self._min_order_size()
+
+    def _finish_exit(self):
+        if self._exit_phase == "done":
+            return
+        self._exit_phase = "done"
+        if self._exit_active == "take_profit":
+            self.close_type = CloseType.TAKE_PROFIT
+        elif self._exit_active == "stop_loss":
+            self.close_type = CloseType.STOP_LOSS
+        self.close_timestamp = self._strategy.current_timestamp
+        self._begin_shutdown()
+
+    async def _execute_exit_single(self):
+        if self._exit_working():
+            return
+        if not self._rate_limit_allows_place():
+            return
+        amount = self._cap_exit_amount(self._position_base())
+        if amount <= 0:
+            return
+        cfg = self._active_exit_config()
+        market = self._exit_active == "stop_loss" or cfg is None or cfg.order_type == ExitOrderType.MARKET
+        if market:
+            order_type = OrderType.MARKET
+            price = Decimal("NaN")
+            shown = self._exit_trigger_price or Decimal("0")
+        else:
+            order_type = OrderType.LIMIT
+            price = self._quantize_exit_price(self._exit_trigger_price or self._reference_price())
+            shown = price
+        order_id = self._submit_exit(price, amount, order_type)
+        self._track_exit(shown, amount, order_id)
+
+    async def _execute_exit_iceberg(self):
+        self._ensure_exit_plan()
+        if self._exit_force_single:
+            await self._execute_exit_single()
+            return
+        if self._exit_range:
+            await self._place_next_exit_range_slice()
+        else:
+            await self._place_next_exit_up_to_slice()
+
+    def _ensure_exit_plan(self):
+        if self._exit_plan_ready:
+            return
+        cfg = self._active_exit_config()
+        if cfg is None:
+            self._exit_plan_ready = True
+            return
+        total = self._position_base()
+        self._exit_plan_base = total
+        count = max(1, int(cfg.slices))
+        self._exit_slice_base = total / Decimal(count) if count else total
+        if cfg.interval_seconds is not None:
+            self._exit_schedule = self._build_exit_schedule(total, count, cfg.interval_seconds)
+            if self._exit_schedule_state:
+                self._exit_schedule.restore_state(self._exit_schedule_state)
+                self._exit_schedule_state = None
+        else:
+            self._exit_schedule = None
+        if cfg.limit_price is not None:
+            self._exit_range = False
+            self._exit_plan_ready = True
+            return
+        rules = self.get_trading_rules(self.config.connector_name, self.config.trading_pair)
+        try:
+            levels = build_range_ladder(
+                total_amount=total,
+                size_unit=SizeUnit.BASE,
+                price_low=cfg.price_low,
+                price_high=cfg.price_high,
+                levels=count,
+                distribution=self.config.distribution,
+                weight=self.config.weight,
+                side=self._exit_side(),
+                price_step=Decimal(str(rules.min_price_increment)),
+                amount_step=Decimal(str(rules.min_base_amount_increment)),
+                min_amount=Decimal(str(rules.min_order_size)),
+                contract_size=Decimal("1"),
+            )
+        except ValueError as exc:
+            self.logger().error(str(exc))
+            self._exit_force_single = True
+            self._exit_plan_ready = True
+            return
+        self._exit_slices.extend(_Slice(level) for level in levels)
+        self._exit_range = True
+        self._exit_plan_ready = True
+
+    def _build_exit_schedule(self, total: Decimal, count: int, interval: float) -> SliceSchedule:
+        """
+        Release offsets measured from the exit trigger, not from the first exit fill.
+
+        The entry schedule can wait for a fill because that fill is what starts its
+        clock. This clock is already running, so offset 0 is open immediately.
+        """
+        share = total / Decimal(count)
+        amounts = []
+        remaining = total
+        for index in range(count):
+            piece = remaining if index == count - 1 else share
+            amounts.append(piece)
+            remaining -= piece
+        offsets = release_timestamps(0.0, count, interval)
+        duration = interval * count
+        offsets = self._apply_timing_jitter(offsets, interval, duration)
+        return SliceSchedule(amounts=amounts, offsets=offsets, duration=duration, skip_unplaced=False)
+
+    async def _place_next_exit_range_slice(self):
+        if self._exit_working_count() >= self._exit_visible_limit():
+            return
+        if any(slot.cancel_requested and slot.is_working for slot in self._exit_slices):
+            return
+        slot = next((item for item in self._exit_slices if item.tracked is None and not item.retired), None)
+        if slot is None:
+            await self._place_exit_remainder()
+            return
+        self._advance_exit_schedule()
+        if not self._exit_slice_released(slot):
+            return
+        if not self._rate_limit_allows_place():
+            return
+        rules = self.get_trading_rules(self.config.connector_name, self.config.trading_pair)
+        cfg = self._active_exit_config()
+        planned = slot.target_price
+        price = self._jitter_price(
+            planned,
+            rules.min_price_increment,
+            None if cfg is None else cfg.price_low,
+            None if cfg is None else cfg.price_high,
+        )
+        amount = self._cap_exit_amount(min(slot.target_amount, self._exit_placeable()))
+        if amount <= 0:
+            if slot.target_amount < self._min_order_size():
+                slot.tracked = TrackedOrder(order_id="skipped")
+            return
+        order_id = self._submit_exit(price, amount, OrderType.LIMIT)
+        slot.tracked = TrackedOrder(order_id=order_id)
+        slot.pre_jitter_price = planned
+        slot.target_amount = amount
+        slot.target_price = price
+        self._exit_order_ids.append(order_id)
+        self._mark_action()
+
+    async def _place_next_exit_up_to_slice(self):
+        cfg = self._active_exit_config()
+        if cfg is None or cfg.limit_price is None:
+            await self._place_exit_remainder()
+            return
+        if any(slot.cancel_requested and slot.is_working for slot in self._exit_slices):
+            return
+        self._advance_exit_schedule()
+        desired = self._desired_price(
+            side=self._exit_side(),
+            limit_price=cfg.limit_price,
+            cap_behavior=self.config.cap_behavior,
+            post_only=False,
+        )
+        if desired is None:
+            return
+        if self._reprice_exit(desired):
+            return
+        if self._exit_working_count() >= self._exit_visible_limit():
+            return
+        placeable = self._exit_placeable()
+        if placeable <= 0:
+            return
+        if not self._rate_limit_allows_place():
+            return
+        price = self._clamp_limit(
+            self._jitter_up_to_price(
+                desired,
+                side=self._exit_side(),
+                limit_price=cfg.limit_price,
+                post_only=False,
+            ),
+            side=self._exit_side(),
+            limit_price=cfg.limit_price,
+        )
+        if self._exit_placed_count() >= max(1, cfg.slices) - 1:
+            raw = min(placeable, self._exit_room_base())
+        else:
+            raw = min(self._exit_slice_base, placeable, self._exit_room_base())
+        amount = self._cap_exit_amount(raw)
+        if amount <= 0:
+            return
+        order_id = self._submit_exit(price, amount, OrderType.LIMIT)
+        self._track_exit(price, amount, order_id, pre_jitter_price=desired)
+
+    async def _place_exit_remainder(self):
+        if self._exit_working_count() > 0 or not self._rate_limit_allows_place():
+            return
+        amount = self._cap_exit_amount(self._position_base())
+        if amount <= 0:
+            return
+        price = self._exit_remainder_price()
+        order_id = self._submit_exit(price, amount, OrderType.LIMIT)
+        self._track_exit(price, amount, order_id)
+
+    def _exit_remainder_price(self) -> Decimal:
+        cfg = self._active_exit_config()
+        if cfg is not None and cfg.limit_price is not None:
+            desired = self._desired_price(
+                side=self._exit_side(),
+                limit_price=cfg.limit_price,
+                cap_behavior=self.config.cap_behavior,
+                post_only=False,
+            )
+            if desired is None:
+                return cfg.limit_price
+            return self._clamp_limit(desired, side=self._exit_side(), limit_price=cfg.limit_price)
+        if cfg is not None and cfg.price_high is not None and cfg.price_low is not None:
+            anchor = cfg.price_high if self._exit_side() == TradeType.SELL else cfg.price_low
+            return self._quantize_exit_price(anchor)
+        return self._quantize_exit_price(self._exit_trigger_price or self._reference_price())
+
+    def _reprice_exit(self, desired: Decimal) -> bool:
+        rules = self.get_trading_rules(self.config.connector_name, self.config.trading_pair)
+        step = Decimal(str(rules.min_price_increment or 0))
+        cfg = self._active_exit_config()
+        limit = None if cfg is None else cfg.limit_price
+        pending = [
+            slot for slot in self._exit_slices
+            if slot.is_working and not slot.cancel_requested
+            and not self._keep_working_price(
+                slot,
+                desired,
+                step,
+                side=self._exit_side(),
+                post_only=False,
+                limit_price=limit,
+            )
+        ]
+        if not pending:
+            return False
+        if not self._rate_limit_allows_place():
+            return True
+        slot = pending[0]
+        self._request_cancel(slot)
+        if slot.order_id:
+            self._unconfirmed_cancels.add(slot.order_id)
+        return True
+
+    def _advance_exit_schedule(self):
+        if self._exit_schedule is None:
+            return
+        self._exit_schedule.advance(
+            self._exit_elapsed(),
+            self._exit_filled_base(),
+            self._exit_open_base(),
+            False,
+        )
+
+    def _exit_slice_released(self, slot: _Slice) -> bool:
+        if self._exit_schedule is None:
+            return True
+        # A window can release a partial child. The order is then capped at placeable.
+        return self._exit_placeable() >= min(slot.target_amount, self._min_order_size())
+
+    def _exit_elapsed(self) -> float:
+        """
+        Time since the exit trigger, with pauses after that trigger removed.
+
+        This is not the entry first-fill anchor. The trigger itself starts the clock,
+        so a close schedule does not sit at zero until the first exit order fills.
+        """
+        if self._exit_started_at is None:
+            return 0.0
+        return self._elapsed_since(self._exit_started_at, self._exit_paused_seconds)
+
+    def _exit_placeable(self) -> Decimal:
+        if self._exit_schedule is None:
+            opened = self._exit_plan_base if self._exit_plan_base > 0 else self._position_base()
+            skipped = Decimal("0")
+        else:
+            opened = self._exit_schedule.opened(self._exit_elapsed())
+            skipped = self._exit_schedule.skipped
+        remaining = opened - skipped - self._exit_filled_base() - self._exit_open_base()
+        if remaining < 0:
+            return Decimal("0")
+        return remaining
+
+    def _exit_visible_limit(self) -> int:
+        cfg = self._active_exit_config()
+        if cfg is None or cfg.execution == ExitExecution.SINGLE:
+            return 1
+        return cfg.visible_count
+
+    def _exit_working_count(self) -> int:
+        return sum(1 for slot in self._exit_slices if slot.is_working)
+
+    def _exit_working(self) -> bool:
+        return self._exit_working_count() > 0
+
+    def _exit_placed_count(self) -> int:
+        return sum(
+            1 for slot in self._exit_slices
+            if slot.tracked is not None and slot.order_id != "skipped" and not slot.retired
+        )
+
+    def _submit_exit(self, price: Decimal, amount: Decimal, order_type: OrderType) -> str:
+        return self.place_order(
+            connector_name=self.config.connector_name,
+            trading_pair=self.config.trading_pair,
+            order_type=order_type,
+            side=self._exit_side(),
+            amount=amount,
+            price=price,
+            position_action=PositionAction.CLOSE,
+        )
+
+    def _track_exit(
+        self,
+        price: Decimal,
+        amount: Decimal,
+        order_id: str,
+        pre_jitter_price: Optional[Decimal] = None,
+    ):
+        shown = price if price == price else (self._exit_trigger_price or Decimal("0"))
+        slot = _Slice(LadderLevel(price=shown, base_amount=amount))
+        slot.pre_jitter_price = pre_jitter_price
+        slot.tracked = TrackedOrder(order_id=order_id)
+        self._exit_slices.append(slot)
+        self._exit_order_ids.append(order_id)
+        self._mark_action()
+
+    def _cap_exit_amount(self, raw: Decimal) -> Decimal:
+        """
+        Quantize a close and never let it exceed the still-open filled position.
+
+        The entry quote cap values a QUOTE budget at the child price, and the hedge
+        opening cap ignores close orders. Neither is applied here. A close is the
+        filled base this executor still holds, not another open.
+        """
+        step = self._amount_step()
+        room = self._exit_room_base()
+        amount = quantize_down(min(Decimal(raw), room), step)
+        if amount <= 0 or amount < self._min_order_size() or amount > room:
+            return Decimal("0")
+        return amount
+
+    def _quantize_exit_price(self, price: Decimal) -> Decimal:
+        step = self._price_step()
+        if self._exit_side() == TradeType.SELL:
+            quantized = quantize_up(price, step)
+        else:
+            quantized = quantize_down(price, step)
+        if quantized <= 0:
+            return quantize_down(price, step) if price > 0 else price
+        return quantized
+
+    def _min_order_size(self) -> Decimal:
+        rules = self.get_trading_rules(self.config.connector_name, self.config.trading_pair)
+        return Decimal(str(rules.min_order_size))
+
+    def _amount_step(self) -> Decimal:
+        rules = self.get_trading_rules(self.config.connector_name, self.config.trading_pair)
+        return Decimal(str(rules.min_base_amount_increment or 0))
+
+    def _price_step(self) -> Decimal:
+        rules = self.get_trading_rules(self.config.connector_name, self.config.trading_pair)
+        return Decimal(str(rules.min_price_increment or 0))
+
+    def _position_base(self) -> Decimal:
+        net = self.filled_base - self._exit_filled_base()
+        if net < 0:
+            return Decimal("0")
+        return net
+
+    def _exit_room_base(self) -> Decimal:
+        room = self._position_base() - self._exit_open_base()
+        if room < 0:
+            return Decimal("0")
+        return room
+
+    def _exit_open_base(self) -> Decimal:
+        total = Decimal("0")
+        for slot in self._exit_slices:
+            if not slot.is_working:
+                continue
+            if slot.tracked and slot.tracked.order is not None:
+                remaining = slot.tracked.order.amount - slot.tracked.executed_amount_base
+                if remaining < 0:
+                    remaining = Decimal("0")
+            else:
+                remaining = slot.target_amount
+            total += remaining
+        return total
+
+    def _exit_filled_base(self) -> Decimal:
+        return self._sum_exit_fills()[0]
+
+    def _exit_filled_quote(self) -> Decimal:
+        return self._sum_exit_fills()[1]
+
+    def _exit_average_price(self) -> Decimal:
+        base = self._exit_filled_base()
+        if base <= 0:
+            return Decimal("0")
+        return self._exit_filled_quote() / base
+
+    def _realized_pnl_quote(self) -> Decimal:
+        closed = self._exit_filled_base()
+        if closed <= 0 or self.average_fill_price <= 0:
+            return Decimal("0")
+        exit_price = self._exit_average_price()
+        if self.config.side == TradeType.BUY:
+            gross = (exit_price - self.average_fill_price) * closed
+        else:
+            gross = (self.average_fill_price - exit_price) * closed
+        return gross - self.get_cum_fees_quote()
+
+    def _sum_exit_fills(self):
+        order_ids = set(self._exit_accounted_base)
+        for slot in self._exit_slices:
+            if slot.order_id and slot.order_id != "skipped":
+                order_ids.add(slot.order_id)
+        base = Decimal("0")
+        quote = Decimal("0")
+        for order_id in order_ids:
+            part_base, part_quote = self._exit_best_fill(order_id)
+            base += part_base
+            quote += part_quote
+        return base, quote
+
+    def _exit_best_fill(self, order_id: str):
+        slot = self._exit_slot_for(order_id)
+        order = slot.tracked.order if slot and slot.tracked else None
+        if order is None:
+            order = self.get_in_flight_order(self.config.connector_name, order_id)
+        live_base = Decimal("0")
+        live_quote = Decimal("0")
+        if order is not None:
+            live_base = Decimal(str(order.executed_amount_base or 0))
+            live_quote = Decimal(str(order.executed_amount_quote or 0))
+        accounted_base = self._exit_accounted_base.get(order_id, Decimal("0"))
+        accounted_quote = self._exit_accounted_quote.get(order_id, Decimal("0"))
+        base = live_base if live_base >= accounted_base else accounted_base
+        if base == live_base and live_base > 0:
+            quote = live_quote
+        else:
+            quote = accounted_quote
+        if live_base == base and live_quote > quote:
+            quote = live_quote
+        return base, quote
+
+    def _exit_slot_for(self, order_id: str) -> Optional[_Slice]:
+        return next((slot for slot in self._exit_slices if slot.order_id == order_id), None)
+
+    def _is_exit_order(self, order_id: str) -> bool:
+        return order_id in self._exit_order_ids or self._exit_slot_for(order_id) is not None
+
+    def _refresh_exit_orders(self):
+        for slot in self._exit_slices:
+            if slot.retired or slot.tracked is None or not slot.tracked.order_id or slot.tracked.order_id == "skipped":
+                continue
+            if slot.tracked.order is None:
+                in_flight = self.get_in_flight_order(self.config.connector_name, slot.tracked.order_id)
+                if in_flight:
+                    slot.tracked.order = in_flight
+
+    def _retire_confirmed_exit_cancels(self):
+        for slot in self._exit_slices:
+            if slot.retired or not slot.cancel_requested:
+                continue
+            if slot.order_id and not self._cancel_confirmed(slot.order_id):
+                continue
+            self._remember_exit_fill(slot)
+            slot.retired = True
+
+    def _remember_exit_fill(self, slot: _Slice):
+        if not slot.order_id or slot.order_id == "skipped":
+            return
+        base, quote = self._exit_best_fill(slot.order_id)
+        previous = self._exit_accounted_base.get(slot.order_id, Decimal("0"))
+        previous_quote = self._exit_accounted_quote.get(slot.order_id, Decimal("0"))
+        if base > previous:
+            self._exit_accounted_base[slot.order_id] = base
+            self._exit_accounted_quote[slot.order_id] = quote
+        elif quote > previous_quote:
+            self._exit_accounted_quote[slot.order_id] = quote
+
+    def _exit_config_view(self, cfg: Optional[RangeIcebergExitConfig]):
+        if cfg is None:
+            return None
+        return {
+            "percent": None if cfg.percent is None else str(cfg.percent),
+            "price": None if cfg.price is None else str(cfg.price),
+            "execution": cfg.execution.value,
+            "order_type": None if cfg.order_type is None else cfg.order_type.value,
+            "slices": cfg.slices,
+            "visible_count": cfg.visible_count,
+            "interval": None if cfg.interval is None else str(cfg.interval),
+            "limit_price": None if cfg.limit_price is None else str(cfg.limit_price),
+            "price_low": None if cfg.price_low is None else str(cfg.price_low),
+            "price_high": None if cfg.price_high is None else str(cfg.price_high),
+        }
+
+    def _exit_snapshot(self) -> dict:
+        """
+        Exit progress stored in custom_info so restore_from_custom_info can continue
+        the same close after a restart.
+        """
+        order_ids = set(self._exit_order_ids)
+        order_ids.update(self._exit_accounted_base)
+        for slot in self._exit_slices:
+            if slot.order_id and slot.order_id != "skipped":
+                order_ids.add(slot.order_id)
+        filled_by_order = {}
+        for order_id in sorted(order_ids):
+            base, quote = self._exit_best_fill(order_id)
+            filled_by_order[order_id] = {"base": str(base), "quote": str(quote)}
+        return {
+            "active": self._exit_active,
+            "status": self._exit_phase,
+            "trigger_price": None if self._exit_trigger_price is None else str(self._exit_trigger_price),
+            "entry_filled_base": str(self.filled_base),
+            "entry_filled_quote": str(self.filled_amount_quote),
+            "filled_base": str(self._exit_filled_base()),
+            "filled_quote": str(self._exit_filled_quote()),
+            "average_price": str(self._exit_average_price()),
+            "realized_pnl_quote": str(self._realized_pnl_quote()),
+            "started_at": self._exit_started_at,
+            "paused_seconds": self._exit_paused_seconds,
+            "schedule": None if self._exit_schedule is None else self._exit_schedule.export_state(),
+            "order_ids": list(self._exit_order_ids),
+            "filled_by_order": filled_by_order,
+        }
+
+    def _restore_exit_state(self, custom_info: dict) -> None:
+        """
+        Reapply exit progress saved in get_custom_info()["exit"].
+
+        Entry slices are rebuilt from the config, the same as a new start. Restored
+        entry fills and exit fills size the remaining close, so a restart does not
+        close more than this executor's own filled position. A stop loss that had
+        already started stays the active exit. Live exit order ids are reattached
+        when the connector still has them. started_at is the trigger time. It is
+        not moved to the first exit fill.
+        """
+        if not isinstance(custom_info, dict):
+            return
+        blob = custom_info.get("exit")
+        if not isinstance(blob, dict):
+            return
+        status = str(blob.get("status") or "idle")
+        active = blob.get("active")
+        if active not in ("take_profit", "stop_loss"):
+            active = None
+        if status == "idle" and active is None and not blob.get("filled_by_order"):
+            return
+        if status not in ("idle", "armed", "cancelling_entry", "executing", "done"):
+            status = "idle"
+        self._exit_active = active
+        self._exit_phase = status
+        trigger = blob.get("trigger_price")
+        self._exit_trigger_price = None if trigger in (None, "") else Decimal(str(trigger))
+        entry_base = Decimal(str(blob.get("entry_filled_base") or "0"))
+        entry_quote = Decimal(str(blob.get("entry_filled_quote") or "0"))
+        if entry_base > 0:
+            self._accounted_fill_by_order["restored-entry"] = entry_base
+            self._accounted_quote_by_order["restored-entry"] = entry_quote
+            self._accounted_fill_base = sum(self._accounted_fill_by_order.values(), Decimal("0"))
+            self._accounted_fill_quote = sum(self._accounted_quote_by_order.values(), Decimal("0"))
+        filled_by_order = blob.get("filled_by_order") or {}
+        if isinstance(filled_by_order, dict):
+            for order_id, fills in filled_by_order.items():
+                if not isinstance(fills, dict):
+                    continue
+                self._exit_accounted_base[str(order_id)] = Decimal(str(fills.get("base") or "0"))
+                self._exit_accounted_quote[str(order_id)] = Decimal(str(fills.get("quote") or "0"))
+        for order_id in blob.get("order_ids") or []:
+            text = str(order_id)
+            if text not in self._exit_order_ids:
+                self._exit_order_ids.append(text)
+            order = self.get_in_flight_order(self.config.connector_name, text)
+            if order is None or order.is_done or self._exit_slot_for(text) is not None:
+                continue
+            price = order.price if order.price is not None and order.price == order.price else (
+                self._exit_trigger_price or Decimal("0")
+            )
+            slot = _Slice(LadderLevel(price=price, base_amount=order.amount))
+            slot.tracked = TrackedOrder(order_id=text)
+            slot.tracked.order = order
+            self._exit_slices.append(slot)
+        cfg = self._active_exit_config()
+        if self._exit_slices:
+            self._exit_plan_ready = True
+            self._exit_range = bool(cfg is not None and cfg.limit_price is None and cfg.price_low is not None)
+            self._exit_plan_base = self._position_base()
+            count = cfg.slices if cfg is not None else 1
+            self._exit_slice_base = self._exit_plan_base / Decimal(max(1, count))
+        started = blob.get("started_at")
+        if started not in (None, ""):
+            self._exit_started_at = float(started)
+        elif status in ("executing", "cancelling_entry") and self._exit_active is not None:
+            self._exit_started_at = float(self._strategy.current_timestamp)
+        if blob.get("paused_seconds") is not None:
+            self._exit_paused_seconds = float(blob.get("paused_seconds"))
+        schedule_state = blob.get("schedule")
+        if isinstance(schedule_state, dict):
+            if self._exit_plan_ready and cfg is not None and cfg.interval_seconds is not None:
+                total = self._exit_plan_base if self._exit_plan_base > 0 else self._position_base()
+                self._exit_schedule = self._build_exit_schedule(
+                    total, max(1, cfg.slices), cfg.interval_seconds,
+                )
+                self._exit_schedule.restore_state(schedule_state)
+            else:
+                self._exit_schedule_state = schedule_state
+        if self._exit_phase == "done":
+            if self._exit_active == "take_profit":
+                self.close_type = CloseType.TAKE_PROFIT
+            elif self._exit_active == "stop_loss":
+                self.close_type = CloseType.STOP_LOSS
+            self._begin_shutdown()
