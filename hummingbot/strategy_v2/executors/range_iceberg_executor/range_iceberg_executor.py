@@ -1,3 +1,4 @@
+import inspect
 import logging
 import random
 from decimal import Decimal
@@ -5,6 +6,7 @@ from typing import List, Optional, Set
 
 from hummingbot.core.data_type.common import OrderType, PositionAction, PositionSide, PriceType, TradeType
 from hummingbot.core.data_type.in_flight_order import OrderState
+from hummingbot.core.event.events import OrderFilledEvent
 from hummingbot.logger import HummingbotLogger
 from hummingbot.strategy.strategy_v2_base import StrategyV2Base
 from hummingbot.strategy_v2.executors.executor_base import ExecutorBase
@@ -13,6 +15,7 @@ from hummingbot.strategy_v2.executors.range_iceberg_executor.data_types import (
     CatchUpPolicy,
     ExecutionMode,
     RangeIcebergExecutorConfig,
+    ScheduleStart,
     SizeUnit,
 )
 from hummingbot.strategy_v2.executors.range_iceberg_executor.ladder import (
@@ -32,6 +35,7 @@ class _Slice:
     def __init__(self, level: LadderLevel):
         self.target_price = level.price
         self.target_amount = level.base_amount
+        self.pre_jitter_price: Optional[Decimal] = None
         self.tracked: Optional[TrackedOrder] = None
         self.cancel_requested = False
 
@@ -59,11 +63,19 @@ class RangeIcebergExecutor(ExecutorBase):
     RANGE keeps every child inside [price_low, price_high]. UP_TO prices a buy at the
     best ask, or a sell at the best bid, and never crosses limit_price. Iceberg shows
     only a few slices and replaces each one after it fills. A duration releases the
-    total on the same start + index * interval clock as TWAP and cancels leftovers
-    when the clock ends.
+    total on the same offset clock as TWAP and cancels leftovers when the clock ends.
 
-    Pausing freezes that clock, the duration, and expiry. Working orders stay. Time
-    spent paused is not counted, and resume continues from the frozen elapsed time.
+    By default that clock starts at the first fill. A partial fill counts. Until then
+    only the first slice is placed, except a range rung larger than that slice is
+    allowed out so it can fill and start the clock. Nothing is skipped or carried
+    before the anchor. schedule_start SUBMIT keeps the previous clock, which starts
+    when the executor starts.
+    expiry_seconds is always measured from the executor start, so an order that never
+    fills can still expire.
+
+    Pausing freezes the schedule clock after it has started, and it still freezes
+    expiry. Working orders stay. Time spent paused is not counted, and resume
+    continues from the frozen elapsed time.
     """
 
     _logger: Optional[HummingbotLogger] = None
@@ -74,8 +86,13 @@ class RangeIcebergExecutor(ExecutorBase):
             cls._logger = logging.getLogger(__name__)
         return cls._logger
 
-    def __init__(self, strategy: StrategyV2Base, config: RangeIcebergExecutorConfig, update_interval: float = 1.0,
-                 max_retries: int = 10):
+    def __init__(
+        self,
+        strategy: StrategyV2Base,
+        config: RangeIcebergExecutorConfig,
+        update_interval: float = 1.0,
+        max_retries: int = 10,
+    ):
         super().__init__(
             strategy=strategy,
             connectors=[config.connector_name],
@@ -88,10 +105,14 @@ class RangeIcebergExecutor(ExecutorBase):
         self._paused = False
         self._pause_started: Optional[float] = None
         self._paused_seconds = 0.0
+        self._schedule_paused_seconds = 0.0
         self._started_at = self._strategy.current_timestamp
+        self._schedule_started_at: Optional[float] = None
         self._last_place_timestamp = Decimal("-1")
         self._rng = random.Random(config.random_seed)
         self._schedule = self._make_schedule()
+        if self._schedule is not None and self.config.schedule_start == ScheduleStart.SUBMIT:
+            self._schedule_started_at = self._started_at
         self._build_plan()
         self._rounding_remainder_base = Decimal("0")
         self._account_settings_ready = False
@@ -125,6 +146,12 @@ class RangeIcebergExecutor(ExecutorBase):
         self._open_lookup_max_seconds = 120.0
         self._open_lookup_backoff_seconds = 10.0
         self._open_lookup_backoff_cap_seconds = 40.0
+        self._cap_block_reason = ""
+        self._retained_fees_quote = Decimal("0")
+        self._post_only_retry_after: Optional[float] = None
+        self._post_only_rejected_at: Optional[float] = None
+        self._post_only_reject_bid: Optional[Decimal] = None
+        self._post_only_reject_ask: Optional[Decimal] = None
 
     def _make_schedule(self) -> Optional[SliceSchedule]:
         resolved = self.config.resolved_schedule()
@@ -230,23 +257,162 @@ class RangeIcebergExecutor(ExecutorBase):
         if self._unknown_order_ids:
             await self._resolve_halted_orders()
             if self._unknown_order_ids:
-                self._describe_unknown_orders(
-                    "Resume looked the orders up again and they are still open or unknown."
-                )
+                self._describe_unknown_orders("Resume looked the orders up again and they are still open or unknown.")
                 self.pause()
                 return
             self._unknown_order_error = ""
         if self._paused:
-            self._paused_seconds += self._strategy.current_timestamp - (self._pause_started or self._strategy.current_timestamp)
+            now = self._strategy.current_timestamp
+            started = self._pause_started or now
+            self._paused_seconds += now - started
+            if self._schedule_started_at is not None:
+                self._schedule_paused_seconds += max(0.0, now - max(started, self._schedule_started_at))
             self._pause_started = None
             self._paused = False
 
-    def _elapsed(self) -> float:
+    def _elapsed_since(self, origin: float, paused_seconds: float) -> float:
         now = self._strategy.current_timestamp
-        paused = self._paused_seconds
+        paused = paused_seconds
         if self._paused and self._pause_started is not None:
-            paused += now - self._pause_started
-        return max(0.0, now - self._started_at - paused)
+            paused += max(0.0, now - max(self._pause_started, origin))
+        return max(0.0, now - origin - paused)
+
+    def _elapsed(self) -> float:
+        """Time since executor start, with every pause removed. expiry_seconds uses this."""
+        return self._elapsed_since(self._started_at, self._paused_seconds)
+
+    def _schedule_elapsed(self) -> float:
+        """
+        Time since the schedule anchor, with pauses after that anchor removed.
+
+        Before the first fill the anchor is unset and no schedule time has passed,
+        even if the executor has been running longer than the duration.
+        """
+        if self._schedule_started_at is None:
+            return 0.0
+        return self._elapsed_since(self._schedule_started_at, self._schedule_paused_seconds)
+
+    def _awaiting_schedule_anchor(self) -> bool:
+        return (
+            self._schedule is not None
+            and self._schedule_started_at is None
+            and self.config.schedule_start == ScheduleStart.FIRST_FILL
+        )
+
+    def _anchor_schedule(self, timestamp: float) -> None:
+        if not self._awaiting_schedule_anchor():
+            return
+        self._schedule_started_at = float(timestamp)
+
+    def _capture_schedule_anchor(self) -> None:
+        if not self._awaiting_schedule_anchor() or not self._has_observed_fill():
+            return
+        stamp = self._earliest_recorded_fill_timestamp()
+        if stamp is None:
+            stamp = self._strategy.current_timestamp
+        self._anchor_schedule(stamp)
+
+    def _has_observed_fill(self) -> bool:
+        if self._filled_unit() > 0:
+            return True
+        self._absorb_counted_fills()
+        if any(amount > 0 for amount in self._counted_fill_base.values()):
+            return True
+        if any(amount > 0 for amount in self._accounted_fill_by_order.values()):
+            return True
+        for slot in self._slices:
+            order = slot.tracked.order if slot.tracked else None
+            if order is None and slot.tracked and slot.tracked.order_id:
+                order = self.get_in_flight_order(self.config.connector_name, slot.tracked.order_id)
+            if order is None:
+                continue
+            if Decimal(str(getattr(order, "executed_amount_base", 0) or 0)) > 0:
+                return True
+            if Decimal(str(getattr(order, "executed_amount_quote", 0) or 0)) > 0:
+                return True
+            reported = getattr(order, "reported_deal_base", None)
+            if reported is not None and Decimal(str(reported)) > 0:
+                return True
+        return False
+
+    def _earliest_recorded_fill_timestamp(self) -> Optional[float]:
+        earliest: Optional[float] = None
+        for slot in self._slices:
+            order = slot.tracked.order if slot.tracked else None
+            if order is None:
+                continue
+            fills = getattr(order, "order_fills", None)
+            if not isinstance(fills, dict):
+                continue
+            for trade in fills.values():
+                stamp = getattr(trade, "fill_timestamp", None)
+                if stamp is None:
+                    continue
+                stamp = float(stamp)
+                if earliest is None or stamp < earliest:
+                    earliest = stamp
+        return earliest
+
+    def _schedule_time_remaining(self) -> Optional[float]:
+        duration = self.config.duration_seconds
+        if duration is None:
+            return None
+        if self._schedule_started_at is None:
+            return float(duration)
+        remaining = float(duration) - self._schedule_elapsed()
+        if remaining < 0:
+            return 0.0
+        return remaining
+
+    def _schedule_clock_state(self) -> Optional[dict]:
+        if self._schedule is None:
+            return None
+        state = self._schedule.export_state()
+        state.update(
+            {
+                "started_at": self._schedule_started_at,
+                "paused_seconds": self._schedule_paused_seconds,
+                "executor_started_at": self._started_at,
+                "executor_paused_seconds": self._paused_seconds,
+                "paused": self._paused,
+                "pause_started": self._pause_started,
+            }
+        )
+        return state
+
+    def restore_from_custom_info(self, info: Optional[dict]) -> None:
+        """
+        Restore the schedule anchor from serialized executor state.
+
+        executor_info stores get_custom_info(). schedule_started_at stays null until
+        the first fill. schedule_clock also keeps pause totals, the executor start
+        used by expiry, and window accounting so a resumed executor does not replay
+        skips that already happened.
+        """
+        if not info:
+            return
+        clock = info.get("schedule_clock") or {}
+        if not isinstance(clock, dict):
+            clock = {}
+        if self._schedule is not None and ("schedule_started_at" in info or "started_at" in clock):
+            started = info["schedule_started_at"] if "schedule_started_at" in info else clock.get("started_at")
+            if started is None:
+                if self.config.schedule_start == ScheduleStart.FIRST_FILL:
+                    self._schedule_started_at = None
+            else:
+                self._schedule_started_at = float(started)
+        if self._schedule is not None and clock.get("paused_seconds") is not None:
+            self._schedule_paused_seconds = float(clock["paused_seconds"])
+        if self._schedule is not None and clock.get("closed") is not None:
+            self._schedule.restore_state(clock)
+        if clock.get("executor_started_at") is not None:
+            self._started_at = float(clock["executor_started_at"])
+        if clock.get("executor_paused_seconds") is not None:
+            self._paused_seconds = float(clock["executor_paused_seconds"])
+        if "paused" in clock:
+            self._paused = bool(clock["paused"])
+            pause_started = clock.get("pause_started")
+            self._pause_started = None if pause_started is None else float(pause_started)
 
     async def validate_sufficient_balance(self):
         # Limit orders are rejected by the exchange when margin is short. Retries cover that.
@@ -269,6 +435,8 @@ class RangeIcebergExecutor(ExecutorBase):
         self._halt_on_unresolved_exchange_orders()
         await self._release_confirmed_failures()
         self._refresh_tracked_orders()
+        self._release_cancelled_rungs()
+        self._capture_schedule_anchor()
         self._advance_schedule()
         if self._time_limit_reached():
             self._advance_schedule(force_end=True)
@@ -290,6 +458,8 @@ class RangeIcebergExecutor(ExecutorBase):
         if self._slippage_blocks_new_orders():
             return
         if not self._rate_limit_allows_place():
+            return
+        if self._post_only_backoff_blocks():
             return
         slot = self._next_slot()
         if slot is None or not self._range_slot_released(slot):
@@ -324,9 +494,7 @@ class RangeIcebergExecutor(ExecutorBase):
         return sorted(order_id for order_id in self._unconfirmed_cancels if not self._cancel_confirmed(order_id))
 
     def _note_unconfirmed_cancels(self, pending: List[str]):
-        message = (
-            f"Cancel was not confirmed for {', '.join(pending)}. These orders may still be open."
-        )
+        message = f"Cancel was not confirmed for {', '.join(pending)}. These orders may still be open."
         if message != self._cancel_stop_error:
             self._cancel_stop_error = message
             self.logger().error(message)
@@ -350,7 +518,10 @@ class RangeIcebergExecutor(ExecutorBase):
     async def _control_up_to(self):
         if self._replacement_blocked():
             return
-        if any((slot.cancel_requested or self._holds_unaccounted_fill(slot)) and self._counts_as_open(slot) for slot in self._slices):
+        if any(
+            (slot.cancel_requested or self._holds_unaccounted_fill(slot)) and self._counts_as_open(slot)
+            for slot in self._slices
+        ):
             return
         desired = self._desired_price()
         if desired is None:
@@ -362,6 +533,8 @@ class RangeIcebergExecutor(ExecutorBase):
             return
         if self._working_count() >= self._visible_limit():
             return
+        if self._post_only_backoff_blocks():
+            return
         placeable = self._placeable()
         if placeable <= 0:
             return
@@ -369,33 +542,38 @@ class RangeIcebergExecutor(ExecutorBase):
 
     async def _place_slice(self, slot: _Slice):
         rules = self.get_trading_rules(self.config.connector_name, self.config.trading_pair)
-        price = self._jitter_price(slot.target_price, rules.min_price_increment)
-        amount = self._bounded_amount(slot.target_amount, price, rules.min_base_amount_increment, rules.min_order_size)
+        planned = slot.target_price
+        price = self._jitter_price(planned, rules.min_price_increment)
+        step = rules.min_base_amount_increment
+        amount = self._bounded_amount(slot.target_amount, price, step, rules.min_order_size)
         if amount < rules.min_order_size:
             slot.tracked = TrackedOrder(order_id="skipped")
             return
-        amount = await self._cap_base_amount(amount)
-        if amount is None or amount < rules.min_order_size:
+        amount = await self._cap_child_amount(amount, price, step, rules.min_order_size)
+        if amount is None:
             return
         order_id = self._submit(price, amount)
         slot.tracked = TrackedOrder(order_id=order_id)
         slot.target_amount = amount
         slot.target_price = price
+        slot.pre_jitter_price = planned
         self._submitted_order_ids.append(order_id)
         self._mark_action()
 
     async def _place_up_to_slice(self, price: Decimal, placeable_unit: Decimal):
         rules = self.get_trading_rules(self.config.connector_name, self.config.trading_pair)
+        planned = price
         price = self._clamp_limit(self._jitter_up_to_price(price))
         step = rules.min_base_amount_increment
         slice_unit = min(self._slice_unit_amount(), placeable_unit)
         raw_base = self._unit_to_base(slice_unit, price)
         amount = self._bounded_amount(raw_base, price, step, rules.min_order_size)
-        amount = await self._cap_base_amount(amount)
-        if amount is None or amount < rules.min_order_size:
+        amount = await self._cap_child_amount(amount, price, step, rules.min_order_size)
+        if amount is None:
             return
         order_id = self._submit(price, amount)
         slot = _Slice(LadderLevel(price=price, base_amount=amount))
+        slot.pre_jitter_price = planned
         slot.tracked = TrackedOrder(order_id=order_id)
         self._slices.append(slot)
         self._submitted_order_ids.append(order_id)
@@ -428,7 +606,33 @@ class RangeIcebergExecutor(ExecutorBase):
         if self.config.price_jitter_pct <= 0:
             return price
         swing = (Decimal(str(self._rng.random())) * 2) - Decimal("1")
-        return price * (Decimal("1") + self.config.price_jitter_pct * swing)
+        jittered = price * (Decimal("1") + self.config.price_jitter_pct * swing)
+        clamped = self._clamp_limit(jittered)
+        if not self._jitter_respects_market(clamped):
+            return price
+        return clamped
+
+    def _jitter_respects_market(self, price: Decimal) -> bool:
+        """
+        A buy cannot be pushed past the limit, and a post-only buy cannot reach the ask.
+        A sell cannot be pushed through the limit, and a post-only sell cannot reach the bid.
+        """
+        limit = self.config.limit_price
+        if self.config.side == TradeType.BUY:
+            if limit is not None and price > limit:
+                return False
+            if self.config.post_only:
+                ask = self.get_price(self.config.connector_name, self.config.trading_pair, PriceType.BestAsk)
+                if price >= ask:
+                    return False
+            return True
+        if limit is not None and price < limit:
+            return False
+        if self.config.post_only:
+            bid = self.get_price(self.config.connector_name, self.config.trading_pair, PriceType.BestBid)
+            if price <= bid:
+                return False
+        return True
 
     def _bounded_amount(self, raw_base: Decimal, price: Decimal, amount_step: Decimal, min_amount: Decimal) -> Decimal:
         """
@@ -553,8 +757,11 @@ class RangeIcebergExecutor(ExecutorBase):
         rules = self.get_trading_rules(self.config.connector_name, self.config.trading_pair)
         step = Decimal(str(rules.min_price_increment or 0))
         pending = [
-            slot for slot in self._slices
-            if slot.is_working and not slot.cancel_requested and self._price_differs(self._slot_price(slot), desired, step)
+            slot
+            for slot in self._slices
+            if slot.is_working
+            and not slot.cancel_requested
+            and not self._keep_working_price(slot, desired, step)
         ]
         if not pending:
             return False
@@ -562,6 +769,37 @@ class RangeIcebergExecutor(ExecutorBase):
             return True
         self._request_cancel(pending[0])
         return True
+
+    def _keep_working_price(self, slot: _Slice, desired: Decimal, step: Decimal) -> bool:
+        """
+        Leave an order whose pre-jitter target has not moved.
+        Also leave a post-only order that is already the best price on its side
+        when the new target is only one tick more aggressive, which is this order
+        seeing itself at the top of the book.
+        """
+        reference = slot.pre_jitter_price if slot.pre_jitter_price is not None else self._slot_price(slot)
+        if not self._price_differs(reference, desired, step):
+            return True
+        return self._resting_on_own_best(self._slot_price(slot), desired, step)
+
+    def _resting_on_own_best(self, order_price: Decimal, desired: Decimal, step: Decimal) -> bool:
+        if not self.config.post_only:
+            return False
+        bid = self.get_price(self.config.connector_name, self.config.trading_pair, PriceType.BestBid)
+        ask = self.get_price(self.config.connector_name, self.config.trading_pair, PriceType.BestAsk)
+        limit = self.config.limit_price
+        tick = step if step > 0 else Decimal("0")
+        if self.config.side == TradeType.BUY:
+            if order_price != bid or order_price >= ask:
+                return False
+            if limit is not None and order_price > limit:
+                return False
+            return desired <= order_price + tick
+        if order_price != ask or order_price <= bid:
+            return False
+        if limit is not None and order_price < limit:
+            return False
+        return desired >= order_price - tick
 
     def _cancel_one_working(self) -> bool:
         if not self._rate_limit_allows_place():
@@ -613,8 +851,14 @@ class RangeIcebergExecutor(ExecutorBase):
                 return self.get_price(self.config.connector_name, self.config.trading_pair, PriceType.BestAsk) > limit
             return self.get_price(self.config.connector_name, self.config.trading_pair, PriceType.BestBid) < limit
         if self.config.side == TradeType.BUY:
-            return self.get_price(self.config.connector_name, self.config.trading_pair, PriceType.BestAsk) > self.config.price_high
-        return self.get_price(self.config.connector_name, self.config.trading_pair, PriceType.BestBid) < self.config.price_low
+            return (
+                self.get_price(self.config.connector_name, self.config.trading_pair, PriceType.BestAsk)
+                > self.config.price_high
+            )
+        return (
+            self.get_price(self.config.connector_name, self.config.trading_pair, PriceType.BestBid)
+            < self.config.price_low
+        )
 
     def _expired(self) -> bool:
         if self.config.expiry_seconds is None:
@@ -622,9 +866,9 @@ class RangeIcebergExecutor(ExecutorBase):
         return self._elapsed() >= self.config.expiry_seconds
 
     def _time_limit_reached(self) -> bool:
-        if self.config.duration_seconds is None:
+        if self.config.duration_seconds is None or self._schedule_started_at is None:
             return False
-        return self._elapsed() + 1e-9 >= self.config.duration_seconds
+        return self._schedule_elapsed() + 1e-9 >= self.config.duration_seconds
 
     def _execution_complete(self) -> bool:
         if self.config.mode == ExecutionMode.RANGE:
@@ -643,17 +887,41 @@ class RangeIcebergExecutor(ExecutorBase):
         return all(slot.is_filled or (slot.order_id == "skipped") for slot in self._slices)
 
     def _advance_schedule(self, force_end: bool = False):
-        if self._schedule is None:
+        if self._schedule is None or self._schedule_started_at is None:
             return
-        elapsed = self.config.duration_seconds if force_end else self._elapsed()
+        elapsed = self.config.duration_seconds if force_end else self._schedule_elapsed()
         self._schedule.advance(elapsed, self._filled_unit(), self._open_unit(), self._outside_cap())
+
+    def _released_amount(self) -> Decimal:
+        """
+        Size the schedule has released.
+
+        Before the anchor that is the first slice, including when timing jitter
+        pushed its offset forward. A range rung larger than that slice is released
+        too, so the first order can rest and fill, which is what starts the clock.
+        The allowance never exceeds the total. After the anchor, release offsets
+        are measured from the anchor.
+        """
+        if self._schedule is None:
+            return self.config.total_amount
+        if self._schedule_started_at is None:
+            released = self._schedule.amounts[0]
+            if self.config.mode == ExecutionMode.RANGE and self._slices:
+                first = self._slices[0]
+                rung = self._base_to_unit(first.target_amount, first.target_price)
+                if rung > released:
+                    released = rung
+            if released > self.config.total_amount:
+                released = self.config.total_amount
+            return released
+        return self._schedule.opened(self._schedule_elapsed())
 
     def _placeable(self) -> Decimal:
         if self._schedule is None:
             opened = self.config.total_amount
             skipped = Decimal("0")
         else:
-            opened = self._schedule.opened(self._elapsed())
+            opened = self._released_amount()
             skipped = self._schedule.skipped
         remaining = opened - skipped - self._filled_unit() - self._open_unit()
         if remaining < 0:
@@ -713,7 +981,12 @@ class RangeIcebergExecutor(ExecutorBase):
 
     def _refresh_tracked_orders(self):
         for slot in self._slices:
-            if slot.tracked and slot.tracked.order_id and slot.tracked.order_id != "skipped" and slot.tracked.order is None:
+            if (
+                slot.tracked
+                and slot.tracked.order_id
+                and slot.tracked.order_id != "skipped"
+                and slot.tracked.order is None
+            ):
                 in_flight = self.get_in_flight_order(self.config.connector_name, slot.tracked.order_id)
                 if in_flight:
                     slot.tracked.order = in_flight
@@ -785,6 +1058,7 @@ class RangeIcebergExecutor(ExecutorBase):
         slot = self._slot_for(order_id)
         if slot is None or slot.tracked is None:
             return
+        self._retained_fees_quote += slot.tracked.cum_fees_quote
         base, quote = self._best_fill(order_id)
         order = self._order_for(order_id)
         if order is not None:
@@ -803,8 +1077,33 @@ class RangeIcebergExecutor(ExecutorBase):
         self._accounted_fill_quote = sum(self._accounted_quote_by_order.values(), Decimal("0"))
         # Safe: the fill was copied into the per-order tally above before the
         # slice forgets the order. This does not tell the exchange the order is gone.
+        # Fees were copied into _retained_fees_quote before the slice forgot the order.
         slot.tracked = None
         slot.cancel_requested = False
+
+    def _release_cancelled_rungs(self) -> None:
+        """
+        A range rung that ends cancelled still owns its unfilled remainder.
+        Keep the fill, then clear the rung so the remainder is posted again.
+        """
+        if self.config.mode != ExecutionMode.RANGE or self._shutdown_pending:
+            return
+        for slot in self._slices:
+            if slot.tracked is None or slot.order_id in (None, "skipped"):
+                continue
+            if slot.order_id in self._unconfirmed_cancels or slot.order_id in self._failed_order_ids:
+                continue
+            if slot.order_id in self._unknown_order_ids:
+                continue
+            order = slot.tracked.order
+            if order is None or not order.is_cancelled or order.is_filled:
+                continue
+            filled_base, _quote = self._best_fill(slot.order_id)
+            remainder = slot.target_amount - filled_base
+            if remainder < 0:
+                remainder = Decimal("0")
+            self._remember_fill_before_clearing(slot.order_id)
+            slot.target_amount = remainder
 
     async def _escalate_unresolved_cancel(self, order_id: str) -> bool:
         """
@@ -929,11 +1228,99 @@ class RangeIcebergExecutor(ExecutorBase):
                 ids.add(slot.order_id)
         return ids
 
-    async def _cap_base_amount(self, amount: Decimal) -> Optional[Decimal]:
+    def _exposure_target_base(self, price: Optional[Decimal]) -> Decimal:
+        """
+        Base the exposure cap will still allow.
+
+        A quote-sized up-to order spends the quote budget at the price it is about
+        to pay. Valuing that budget at the limit under-counts a fill below the limit
+        and blocks the last child. Other modes keep the static target.
+        """
+        if (
+            self.config.size_unit == SizeUnit.QUOTE
+            and self.config.mode == ExecutionMode.UP_TO
+            and price is not None
+            and price > 0
+        ):
+            return self.config.total_amount / price
+        return self._target_base()
+
+    def _exposure_query_kwargs(self, query) -> dict:
+        try:
+            names = inspect.signature(query).parameters
+        except (TypeError, ValueError):
+            names = {}
+        kwargs = {}
+        if "position_side" in names:
+            kwargs["position_side"] = self._settings_position_side()
+        if "position_action" in names:
+            kwargs["position_action"] = (
+                PositionAction.CLOSE if self.config.reduce_only else PositionAction.OPEN
+            )
+        if "exclude_client_order_ids" in names:
+            kwargs["exclude_client_order_ids"] = self._exposure_exclude_ids()
+        return kwargs
+
+    def _exposure_exclude_ids(self) -> Set[str]:
+        ids = set()
+        for order_id in self._known_order_ids():
+            if not order_id or order_id == "skipped":
+                continue
+            ids.add(str(order_id))
+            exchange_id = self._exchange_order_id_for(order_id)
+            if exchange_id:
+                ids.add(str(exchange_id))
+        return ids
+
+    def _own_working_base(self) -> Decimal:
+        total = Decimal("0")
+        for slot in self._slices:
+            if not self._counts_as_open(slot):
+                continue
+            if slot.tracked and slot.tracked.order is not None:
+                remaining = slot.tracked.order.amount - slot.tracked.executed_amount_base
+                if remaining < 0:
+                    remaining = Decimal("0")
+            else:
+                remaining = slot.target_amount
+            total += remaining
+        return total
+
+    async def _cap_child_amount(
+        self,
+        amount: Decimal,
+        price: Decimal,
+        amount_step: Decimal,
+        min_amount: Decimal,
+    ) -> Optional[Decimal]:
+        """
+        None means the child must not be sent. A cap that blocks the child sets status_reason.
+        """
+        capped = await self._cap_base_amount(amount, price)
+        if capped is None:
+            self._cap_block_reason = (
+                "Exposure cap blocked the next child. "
+                "The exchange position and open orders could not be read."
+            )
+            return None
+        if capped < amount:
+            capped = quantize_down(capped, amount_step)
+        if capped < min_amount:
+            self._cap_block_reason = (
+                "Exposure cap blocked the next child. "
+                "The live position and open orders leave no room under the total."
+            )
+            return None
+        self._cap_block_reason = ""
+        return capped
+
+    async def _cap_base_amount(self, amount: Decimal, price: Optional[Decimal] = None) -> Optional[Decimal]:
         """
         Cap a new child by the live position change and open orders.
         None means the exchange read failed and the child must not be sent.
         A connector without this read is left unchanged.
+        Own working children are not counted twice. A connector that can exclude
+        their ids does that itself. Otherwise their remaining size is removed here.
         """
         if amount <= 0:
             return amount
@@ -941,14 +1328,12 @@ class RangeIcebergExecutor(ExecutorBase):
         query = self._real_callable(connector, "ground_truth_exposure")
         if query is None:
             return amount
+        kwargs = self._exposure_query_kwargs(query)
         try:
             try:
-                result = query(
-                    self.config.trading_pair,
-                    self.config.side,
-                    position_side=self._settings_position_side(),
-                )
+                result = query(self.config.trading_pair, self.config.side, **kwargs)
             except TypeError:
+                kwargs = {}
                 result = query(self.config.trading_pair, self.config.side)
             if hasattr(result, "__await__"):
                 result = await result
@@ -958,12 +1343,16 @@ class RangeIcebergExecutor(ExecutorBase):
         except Exception:
             self.logger().error("Could not read the exchange position and open orders. Not placing a child.")
             return None
+        if "exclude_client_order_ids" not in kwargs:
+            open_base -= self._own_working_base()
+            if open_base < 0:
+                open_base = Decimal("0")
         if self._ground_truth_baseline is None:
             self._ground_truth_baseline = position_base
         change = position_base - self._ground_truth_baseline
         if change < 0:
             change = Decimal("0")
-        room = self._target_base() - change - open_base
+        room = self._exposure_target_base(price) - change - open_base
         if room < 0:
             room = Decimal("0")
         if amount > room:
@@ -1043,7 +1432,11 @@ class RangeIcebergExecutor(ExecutorBase):
             quote = counted_quote
         else:
             quote = accounted_quote
-        quote = max(quote, live_quote if live_base == base else Decimal("0"), counted_quote if counted_base == base else Decimal("0"))
+        quote = max(
+            quote,
+            live_quote if live_base == base else Decimal("0"),
+            counted_quote if counted_base == base else Decimal("0"),
+        )
         return base, quote
 
     def _clear_open_retry(self, order_id: str):
@@ -1097,6 +1490,8 @@ class RangeIcebergExecutor(ExecutorBase):
             return self._account_settings_error
         if self._open_lookup_count:
             return "open_order_retry: " + ", ".join(sorted(self._open_lookup_count))
+        if self._cap_block_reason:
+            return self._cap_block_reason
         return ""
 
     def to_format_status(self):
@@ -1139,9 +1534,7 @@ class RangeIcebergExecutor(ExecutorBase):
                 reason = self._confirmation_error(connector)
                 if not reason:
                     if self.config.margin_mode is None:
-                        reason = (
-                            f"The exchange did not confirm leverage {self.config.leverage}. Refusing to trade."
-                        )
+                        reason = f"The exchange did not confirm leverage {self.config.leverage}. Refusing to trade."
                     else:
                         reason = (
                             f"The exchange did not confirm leverage {self.config.leverage} "
@@ -1227,6 +1620,51 @@ class RangeIcebergExecutor(ExecutorBase):
             if in_flight:
                 slot.tracked.order = in_flight
 
+    def _is_post_only_reject(self, event) -> bool:
+        if not self.config.post_only:
+            return False
+        order_type = getattr(event, "order_type", None)
+        return order_type is None or order_type == OrderType.LIMIT_MAKER
+
+    def _note_post_only_backoff(self) -> None:
+        self._post_only_reject_bid = self.get_price(
+            self.config.connector_name, self.config.trading_pair, PriceType.BestBid
+        )
+        self._post_only_reject_ask = self.get_price(
+            self.config.connector_name, self.config.trading_pair, PriceType.BestAsk
+        )
+        now = float(self._strategy.current_timestamp)
+        interval = float(self.config.min_order_interval or 0)
+        if interval < 0:
+            interval = 0.0
+        self._post_only_rejected_at = now
+        self._post_only_retry_after = now + interval
+
+    def _clear_post_only_backoff(self) -> None:
+        self._post_only_retry_after = None
+        self._post_only_rejected_at = None
+        self._post_only_reject_bid = None
+        self._post_only_reject_ask = None
+
+    def _post_only_backoff_blocks(self) -> bool:
+        """
+        After a post-only reject, wait for the book to move or for the next refresh.
+        The same timestamp does not count as the next refresh.
+        """
+        if self._post_only_retry_after is None:
+            return False
+        bid = self.get_price(self.config.connector_name, self.config.trading_pair, PriceType.BestBid)
+        ask = self.get_price(self.config.connector_name, self.config.trading_pair, PriceType.BestAsk)
+        if bid != self._post_only_reject_bid or ask != self._post_only_reject_ask:
+            self._clear_post_only_backoff()
+            return False
+        now = float(self._strategy.current_timestamp)
+        rejected_at = self._post_only_rejected_at if self._post_only_rejected_at is not None else now
+        if now > rejected_at and now + 1e-9 >= float(self._post_only_retry_after):
+            self._clear_post_only_backoff()
+            return False
+        return True
+
     def process_order_failed_event(self, event_tag: int, market, event):
         slot = self._slot_for(event.order_id)
         if slot:
@@ -1234,12 +1672,33 @@ class RangeIcebergExecutor(ExecutorBase):
             self._unconfirmed_cancels.add(event.order_id)
             self._failed_order_ids.add(event.order_id)
             slot.cancel_requested = True
+            if self._is_post_only_reject(event):
+                self._note_post_only_backoff()
+                return
             self._current_retries += 1
             if self._current_retries > self._max_retries:
                 self.close_type = CloseType.FAILED
                 self.early_stop(close_type=CloseType.FAILED)
 
+    def process_order_filled_event(self, event_tag: int, market, event: OrderFilledEvent):
+        order_id = getattr(event, "order_id", None)
+        amount = Decimal(str(getattr(event, "amount", 0) or 0))
+        if order_id is not None and amount > 0:
+            if self._slot_for(order_id) is not None or order_id in self._submitted_order_ids:
+                self._current_retries = 0
+                self._clear_post_only_backoff()
+        if not self._awaiting_schedule_anchor():
+            return
+        if order_id is None:
+            return
+        if self._slot_for(order_id) is None and order_id not in self._submitted_order_ids:
+            return
+        if amount <= 0:
+            return
+        self._anchor_schedule(float(event.timestamp))
+
     def process_order_completed_event(self, event_tag: int, market, event):
+        self._capture_schedule_anchor()
         if self._execution_complete():
             self.close_execution_finished()
 
@@ -1284,7 +1743,8 @@ class RangeIcebergExecutor(ExecutorBase):
         return self.filled_amount_quote / filled
 
     def get_cum_fees_quote(self) -> Decimal:
-        return sum((slot.tracked.cum_fees_quote for slot in self._slices if slot.tracked), Decimal("0"))
+        live = sum((slot.tracked.cum_fees_quote for slot in self._slices if slot.tracked), Decimal("0"))
+        return live + self._retained_fees_quote
 
     def get_net_pnl_quote(self) -> Decimal:
         filled = self.filled_base
@@ -1312,6 +1772,9 @@ class RangeIcebergExecutor(ExecutorBase):
             "side": self.config.side.name,
             "mode": self.config.mode.value,
             "paused": self._paused,
+            "schedule_started_at": self._schedule_started_at,
+            "schedule_time_remaining": self._schedule_time_remaining(),
+            "schedule_clock": self._schedule_clock_state(),
             "unknown_order_halt": bool(self._unknown_order_ids),
             "unknown_order_ids": sorted(self._unknown_order_ids),
             "unknown_order_error": self._unknown_order_error,

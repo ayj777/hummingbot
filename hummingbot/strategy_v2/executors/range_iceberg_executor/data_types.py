@@ -48,6 +48,13 @@ class CatchUpPolicy(str, Enum):
     SKIP = "SKIP"
 
 
+class ScheduleStart(str, Enum):
+    """When a duration clock starts counting."""
+
+    FIRST_FILL = "FIRST_FILL"
+    SUBMIT = "SUBMIT"
+
+
 class MarginMode(str, Enum):
     """Margin mode sent as openType when it is set. None leaves the account margin unchanged."""
 
@@ -62,7 +69,8 @@ class RangeIcebergExecutorConfig(ExecutorConfigBase):
     RANGE spreads limit orders across [price_low, price_high]. UP_TO keeps buying at the
     best ask (or selling at the best bid) and never crosses limit_price. With iceberg on,
     only visible_count slices are shown. A duration releases that total on a clock and
-    stops when the clock ends, even if size is left.
+    stops when the clock ends, even if size is left. The clock starts at the first fill
+    unless schedule_start is SUBMIT, which starts it when the executor is created.
     """
 
     type: Literal["range_iceberg_executor"] = "range_iceberg_executor"
@@ -90,6 +98,7 @@ class RangeIcebergExecutorConfig(ExecutorConfigBase):
     duration: Optional[Union[float, str]] = None
     schedule_slices: Optional[int] = None
     schedule_interval: Optional[Union[float, str]] = None
+    schedule_start: ScheduleStart = ScheduleStart.FIRST_FILL
     timing_jitter_pct: Decimal = Decimal("0")
     catch_up: CatchUpPolicy = CatchUpPolicy.CARRY
     max_slippage: Optional[Decimal] = None
@@ -104,6 +113,16 @@ class RangeIcebergExecutorConfig(ExecutorConfigBase):
         if isinstance(value, str):
             return TradeType[value.upper()]
         return value
+
+    @field_validator("schedule_start", mode="before")
+    @classmethod
+    def parse_schedule_start(cls, value):
+        if isinstance(value, ScheduleStart):
+            return value
+        text = str(getattr(value, "value", value)).upper()
+        if text not in (ScheduleStart.FIRST_FILL.value, ScheduleStart.SUBMIT.value):
+            raise ValueError(f"schedule_start ({value}) must be FIRST_FILL or SUBMIT")
+        return ScheduleStart(text)
 
     @field_validator("margin_mode", mode="before")
     @classmethod

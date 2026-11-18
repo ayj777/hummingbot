@@ -1424,12 +1424,17 @@ class MexcPerpetualDerivative(PerpetualDerivativePyBase):
         trading_pair: str,
         side: TradeType,
         position_side: Optional[PositionSide] = None,
+        position_action: Optional[PositionAction] = None,
+        exclude_client_order_ids: Optional[Set[str]] = None,
     ) -> Tuple[Decimal, Decimal]:
         """
         Read the live position and open orders for this pair.
         Returns position base in the order's direction, and the remaining size of open
         orders on that side. In hedge mode, or when position_side is set, the read is
-        the long or the short, not both. Raises when either read fails.
+        the long or the short, not both. A hedge read that also names open or close
+        counts only that action, so a take-profit does not block an opening order.
+        Client ids in exclude_client_order_ids are left out of the open size.
+        Raises when either read fails.
         """
         symbol = await self.exchange_symbol_associated_to_pair(trading_pair)
         contract_size = self.get_contract_size(trading_pair)
@@ -1440,7 +1445,8 @@ class MexcPerpetualDerivative(PerpetualDerivativePyBase):
         )
         position_rows = self._rows_for_symbol(self._position_page(positions), symbol)
         order_rows = self._rows_for_symbol(await self._open_order_rows(), symbol)
-        wanted_position, wanted_sides = self._exposure_filters(side, position_side)
+        wanted_position, wanted_sides = self._exposure_filters(side, position_side, position_action)
+        excluded = {str(item) for item in (exclude_client_order_ids or ()) if item not in (None, "")}
         position_base = s_decimal_0
         for row in position_rows:
             if int(row.get("positionType") or 0) != wanted_position:
@@ -1450,11 +1456,23 @@ class MexcPerpetualDerivative(PerpetualDerivativePyBase):
         for row in order_rows:
             if int(row.get("side") or 0) not in wanted_sides:
                 continue
+            if self._exposure_row_excluded(row, excluded):
+                continue
             remaining = Decimal(str(row.get("vol") or "0")) - Decimal(str(row.get("dealVol") or "0"))
             if remaining < s_decimal_0:
                 remaining = s_decimal_0
             open_base += remaining * contract_size
         return position_base, open_base
+
+    @staticmethod
+    def _exposure_row_excluded(row: Dict[str, Any], excluded: Set[str]) -> bool:
+        if not excluded:
+            return False
+        for key in ("externalOid", "orderId", "order_id"):
+            value = row.get(key)
+            if value not in (None, "") and str(value) in excluded:
+                return True
+        return False
 
     async def _open_order_rows(self) -> List[Dict[str, Any]]:
         """
@@ -2274,15 +2292,29 @@ class MexcPerpetualDerivative(PerpetualDerivativePyBase):
         if kwargs.get("stop_loss_reverse") is not None:
             data["stopLossReverse"] = int(kwargs["stop_loss_reverse"])
 
-    def _exposure_filters(self, side: TradeType, position_side: Optional[PositionSide]) -> Tuple[int, Set[int]]:
+    def _exposure_filters(
+        self,
+        side: TradeType,
+        position_side: Optional[PositionSide],
+        position_action: Optional[PositionAction] = None,
+    ) -> Tuple[int, Set[int]]:
         """
         Hedge mode, and any caller that names a position side, counts only that long or short.
         One-way reads that do not name a side stay grouped by the buy or sell order side.
+        A hedge read that names an open or close action counts only that action
+        (open long for a buy that opens, close long for a sell that closes, and so on).
         """
         resolved = self._coerce_position_side(position_side)
         if resolved is None and self.position_mode is PositionMode.HEDGE:
             resolved = PositionSide.LONG if side is TradeType.BUY else PositionSide.SHORT
         if resolved is not None and (position_side is not None or self.position_mode is PositionMode.HEDGE):
+            if self.position_mode is PositionMode.HEDGE and position_action is not None:
+                opening = position_action is not PositionAction.CLOSE
+                if resolved is PositionSide.LONG:
+                    code = CONSTANTS.SIDE_OPEN_LONG if opening else CONSTANTS.SIDE_CLOSE_LONG
+                    return CONSTANTS.POSITION_TYPE_LONG, {code}
+                code = CONSTANTS.SIDE_OPEN_SHORT if opening else CONSTANTS.SIDE_CLOSE_SHORT
+                return CONSTANTS.POSITION_TYPE_SHORT, {code}
             if resolved is PositionSide.LONG:
                 return CONSTANTS.POSITION_TYPE_LONG, {CONSTANTS.SIDE_OPEN_LONG, CONSTANTS.SIDE_CLOSE_LONG}
             return CONSTANTS.POSITION_TYPE_SHORT, {CONSTANTS.SIDE_OPEN_SHORT, CONSTANTS.SIDE_CLOSE_SHORT}

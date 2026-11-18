@@ -4,6 +4,10 @@ Shared release clock for executors that spread a total across a duration.
 TWAPExecutor.create_order_plan uses release_timestamps(start, number_of_orders, order_interval),
 which is start + i * interval. The range iceberg schedule uses the same helper for its
 nominal release times, then closes the last window at the duration so leftovers are cancelled.
+
+Callers pass elapsed measured from their own anchor. Range iceberg anchors that clock at
+the first fill unless schedule_start is SUBMIT, which anchors it at executor start.
+Windows before the anchor are not passed in, so nothing is skipped or carried early.
 """
 
 import re
@@ -99,3 +103,24 @@ class SliceSchedule:
                 self.skipped += unplaced
             self._assigned += assigned
             self._closed += 1
+
+    def export_state(self) -> dict:
+        """
+        Window accounting that has to survive a serialized executor.
+
+        Decimals are strings so the dict can sit in custom_info and be stored as JSON.
+        """
+        return {
+            "skipped": str(self.skipped),
+            "closed": self._closed,
+            "assigned": str(self._assigned),
+        }
+
+    def restore_state(self, state: dict) -> None:
+        """Replace window accounting with a snapshot from export_state."""
+        if not state:
+            return
+        self.skipped = Decimal(str(state.get("skipped", "0")))
+        self._closed = int(state.get("closed", 0))
+        assigned = state.get("assigned", "0")
+        self._assigned = Decimal(str("0" if assigned is None else assigned))
