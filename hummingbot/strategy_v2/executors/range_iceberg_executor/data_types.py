@@ -264,17 +264,22 @@ class RangeIcebergExecutorConfig(ExecutorConfigBase):
     Once an exit is armed or active, the entry clock no longer stops the executor.
 
     early_stop cancels software entry and exit orders and does not close the
-    filled position. keep_position=True records POSITION_HOLD. The same stop is
-    what the API uses on shutdown. A protective exchange stop, when one was
-    placed, is left working across that shutdown and across a crash. It is
-    cancelled when the position is closed or the take profit finishes.
-    Resuming from custom_info restores an exit_state of ARMED, RESTING, or CLOSING.
+    filled position. keep_position=True records POSITION_HOLD and is the API
+    shutdown path: software orders are cancelled and the exchange stop is left
+    working. Every other terminal path cancels the exchange stop, including
+    keep_position=False, a user Stop, and FAILED.
 
     protective_exchange_stop defaults to on when the connector implements
-    place_position_stop_order, and off otherwise. Set it false to skip the
-    exchange stop. allow_adverse_take_profit permits a take-profit price that
-    is not past the average entry. stop_loss_fallback_seconds is how long a
-    stop-loss iceberg may rest with no fill before the remainder is a market order.
+    place_position_stop_order, and off otherwise. The exchange stop is a
+    backstop past the software stop trigger by protective_stop_buffer_pct
+    (default 0.5 percent) in the adverse direction. It is cancelled and that
+    cancel is confirmed before the software stop sends a close. Resuming from
+    custom_info restores an exit_state of ARMED, RESTING, or CLOSING, re-posts
+    a missing exit from open_base, and keeps the saved exchange stop id.
+
+    allow_adverse_take_profit permits a take-profit price that is not past the
+    average entry. stop_loss_fallback_seconds is how long a stop-loss iceberg
+    may go without a new fill before the remainder is a market order.
     """
 
     type: Literal["range_iceberg_executor"] = "range_iceberg_executor"
@@ -315,6 +320,7 @@ class RangeIcebergExecutorConfig(ExecutorConfigBase):
     exit_arming: ExitArming = ExitArming.ON_FULL_FILL
     allow_adverse_take_profit: bool = False
     protective_exchange_stop: Optional[bool] = None
+    protective_stop_buffer_pct: Decimal = Decimal("0.005")
     stop_loss_fallback_seconds: float = 30
 
     @field_validator("side", mode="before")
@@ -438,6 +444,11 @@ class RangeIcebergExecutorConfig(ExecutorConfigBase):
         elif self.schedule_slices is not None or self.schedule_interval is not None:
             raise ValueError("schedule_slices and schedule_interval need a duration")
         require_positive("stop_loss_fallback_seconds", self.stop_loss_fallback_seconds)
+        require_positive("protective_stop_buffer_pct", self.protective_stop_buffer_pct)
+        if self.protective_stop_buffer_pct >= 1:
+            raise ValueError(
+                f"protective_stop_buffer_pct ({self.protective_stop_buffer_pct}) must be lower than 1"
+            )
         if self.reduce_only and (self.take_profit is not None or self.stop_loss is not None):
             raise ValueError(
                 "take_profit and stop_loss cannot be set when reduce_only is true, "
@@ -479,17 +490,15 @@ class RangeIcebergExecutorConfig(ExecutorConfigBase):
 
     def _reject_adverse_take_profit_price(self):
         """
-        Reject a take-profit price that cannot be past the average entry.
+        Reject a take-profit price that is impossible for every fill.
 
-        A buy range fills at or above price_low, so a take-profit price at or
-        below that low is not a profit. A sell range fills at or below
-        price_high, so a take-profit price at or above that high is not a
-        profit. A sell up-to fills at or above limit_price, so a take-profit
-        price at or above that limit is not a profit. Set
-        allow_adverse_take_profit to keep the price anyway. A percent trigger
-        is always on the profitable side of the average. A price that can still
-        land on the right side of the eventual average is checked again once
-        that average exists.
+        A buy range fills at or above price_low, so a price at or below that
+        low is never a profit. A sell range fills at or below price_high, so a
+        price at or above that high is never a profit. An up-to fill can land
+        on either side of limit_price enough that the average still clears the
+        take profit, so that case is checked against the actual average once a
+        fill exists. Set allow_adverse_take_profit to keep a price anyway. A
+        percent trigger is always on the profitable side of the average.
         """
         cfg = self.take_profit
         if cfg is None or cfg.price is None or self.allow_adverse_take_profit:
@@ -506,13 +515,6 @@ class RangeIcebergExecutorConfig(ExecutorConfigBase):
                 raise ValueError(
                     f"take_profit price ({cfg.price}) must be below price_high ({self.price_high}) "
                     "for a SELL, because the average entry cannot be above that price. "
-                    "Set allow_adverse_take_profit to allow it."
-                )
-        if self.side == TradeType.SELL and self.mode == ExecutionMode.UP_TO and self.limit_price is not None:
-            if cfg.price >= self.limit_price:
-                raise ValueError(
-                    f"take_profit price ({cfg.price}) must be below limit_price ({self.limit_price}) "
-                    "for a SELL up-to, because the average entry cannot be below that price. "
                     "Set allow_adverse_take_profit to allow it."
                 )
 
