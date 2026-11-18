@@ -8,13 +8,14 @@ from pydantic import ValidationError
 from hummingbot.connector.derivative.position import Position
 from hummingbot.connector.trading_rule import TradingRule
 from hummingbot.core.data_type.common import OrderType, PositionAction, PositionSide, PriceType, TradeType
-from hummingbot.core.data_type.in_flight_order import InFlightOrder, OrderState
-from hummingbot.core.data_type.trade_fee import AddedToCostTradeFee
-from hummingbot.core.event.events import OrderFilledEvent
+from hummingbot.core.data_type.in_flight_order import InFlightOrder, OrderState, TradeUpdate
+from hummingbot.core.data_type.trade_fee import AddedToCostTradeFee, TokenAmount
+from hummingbot.core.event.events import MarketOrderFailureEvent, OrderFilledEvent
 from hummingbot.strategy_v2.executors.range_iceberg_executor.data_types import (
     CapBehavior,
     CatchUpPolicy,
     ExecutionMode,
+    LadderDistribution,
     RangeIcebergExecutorConfig,
     ScheduleStart,
     SizeUnit,
@@ -84,8 +85,13 @@ class RangeIcebergExecutorTests(IsolatedAsyncioWrapperTestCase):
         values.update(overrides)
         return RangeIcebergExecutorConfig(**values)
 
-    def _executor(self, **overrides) -> RangeIcebergExecutor:
-        executor = RangeIcebergExecutor(self.strategy, self._config(**overrides), update_interval=0.1)
+    def _executor(self, max_retries: int = 10, **overrides) -> RangeIcebergExecutor:
+        executor = RangeIcebergExecutor(
+            self.strategy,
+            self._config(**overrides),
+            update_interval=0.1,
+            max_retries=max_retries,
+        )
         executor._status = RunnableStatus.RUNNING
         return executor
 
@@ -1965,3 +1971,382 @@ class RangeIcebergExecutorTests(IsolatedAsyncioWrapperTestCase):
         self._run(resumed.control_task())
         self.assertEqual(Decimal("2500"), resumed._schedule.skipped)
         self.assertEqual(5_000, resumed.get_custom_info()["schedule_started_at"])
+
+    def test_up_to_quote_buy_below_the_limit_places_the_rest_and_reports_a_cap_block(self):
+        state = {"position": Decimal("0"), "open": Decimal("0")}
+
+        async def exposure(trading_pair, side, position_side=None):
+            return (state["position"], state["open"])
+
+        self.connector.ground_truth_exposure = exposure
+        self._book(Decimal("0.05999"), Decimal("0.06"))
+        executor = self._up_to(
+            size_unit=SizeUnit.QUOTE,
+            total_amount=Decimal("9"),
+            slice_amount=Decimal("6"),
+            limit_price=Decimal("0.09"),
+            levels=1,
+        )
+        self._run(executor.control_task())
+        self.assertEqual(Decimal("100"), self.buy_ids[0][1])
+        self.assertEqual(Decimal("0.06"), self.buy_ids[0][2])
+        self._fill("buy-1", Decimal("100"))
+        state["position"] = Decimal("100")
+        self._run(executor.control_task())
+        self.assertEqual(RunnableStatus.RUNNING, executor.status)
+        self.assertEqual(2, len(self.buy_ids))
+        self.assertEqual(Decimal("50"), self.buy_ids[1][1])
+        self.assertEqual(Decimal("0.06"), self.buy_ids[1][2])
+        self.assertEqual("", executor.get_custom_info()["status_reason"])
+        self._fill("buy-2", Decimal("50"))
+        self._run(executor.control_task())
+        self.assertEqual(CloseType.COMPLETED, executor.close_type)
+        self.assertEqual(Decimal("9"), executor.filled_amount_quote)
+
+        blocked_state = {"position": Decimal("0"), "open": Decimal("150")}
+
+        async def blocked(trading_pair, side, position_side=None):
+            return (blocked_state["position"], blocked_state["open"])
+
+        self.connector.ground_truth_exposure = blocked
+        stuck = self._up_to(
+            size_unit=SizeUnit.QUOTE,
+            total_amount=Decimal("9"),
+            slice_amount=Decimal("9"),
+            limit_price=Decimal("0.09"),
+            levels=1,
+        )
+        placed = len(self.buy_ids)
+        self._run(stuck.control_task())
+        self.assertEqual(placed, len(self.buy_ids))
+        self.assertEqual(RunnableStatus.RUNNING, stuck.status)
+        reason = stuck.get_custom_info()["status_reason"]
+        self.assertIn("Exposure cap blocked", reason)
+        self.assertEqual(reason, stuck.to_format_status())
+
+    def test_cancelled_range_rung_is_replaced_and_completion_counts_the_fill(self):
+        executor = self._executor(
+            size_unit=SizeUnit.BASE,
+            total_amount=Decimal("100"),
+            levels=2,
+            iceberg=False,
+            visible_count=2,
+            min_order_interval=0,
+        )
+        self._run(executor.control_task())
+        self._run(executor.control_task())
+        self.assertEqual([Decimal("50"), Decimal("50")], [row[1] for row in self.buy_ids])
+        self._fill("buy-1", Decimal("20"), state=OrderState.CANCELED)
+        self._fill("buy-2", Decimal("50"))
+        self._run(executor.control_task())
+        self.assertEqual(RunnableStatus.RUNNING, executor.status)
+        self.assertNotEqual(CloseType.COMPLETED, executor.close_type)
+        self.assertEqual(3, len(self.buy_ids))
+        self.assertEqual(Decimal("30"), self.buy_ids[2][1])
+        self.assertEqual(Decimal("70"), executor.filled_base)
+        self.assertEqual(1, sum(1 for slot in executor._slices if slot.is_working))
+        self._fill("buy-3", Decimal("30"))
+        self._run(executor.control_task())
+        self.assertEqual(CloseType.COMPLETED, executor.close_type)
+        self.assertEqual(Decimal("100"), executor.filled_base)
+
+    def test_first_fill_range_schedule_places_the_first_rung_before_the_anchor(self):
+        wide = self._executor(
+            size_unit=SizeUnit.BASE,
+            total_amount=Decimal("100"),
+            levels=2,
+            iceberg=False,
+            visible_count=2,
+            duration=100,
+            schedule_slices=4,
+            min_order_interval=0,
+        )
+        self._run(wide.control_task())
+        self.assertEqual(1, len(self.buy_ids))
+        self.assertEqual(Decimal("50"), self.buy_ids[0][1])
+        self.assertGreater(self.buy_ids[0][1], Decimal("100") / Decimal("4"))
+        self.now = 20_000
+        self._run(wide.control_task())
+        self.assertEqual(1, len(self.buy_ids))
+        self.assertIsNone(wide.get_custom_info()["schedule_started_at"])
+
+        placed = len(self.buy_ids)
+        weighted = self._executor(
+            size_unit=SizeUnit.BASE,
+            total_amount=Decimal("100"),
+            levels=4,
+            distribution=LadderDistribution.WEIGHTED,
+            weight=Decimal("-1"),
+            iceberg=False,
+            visible_count=4,
+            duration=100,
+            schedule_slices=4,
+            min_order_interval=0,
+        )
+        self._run(weighted.control_task())
+        self.assertEqual(placed + 1, len(self.buy_ids))
+        self.assertGreater(self.buy_ids[-1][1], Decimal("25"))
+        self.assertIsNone(weighted.get_custom_info()["schedule_started_at"])
+
+        submit_at = len(self.buy_ids)
+        submit = self._executor(
+            size_unit=SizeUnit.BASE,
+            total_amount=Decimal("100"),
+            levels=2,
+            iceberg=False,
+            visible_count=2,
+            duration=100,
+            schedule_slices=4,
+            schedule_start=ScheduleStart.SUBMIT,
+            min_order_interval=0,
+        )
+        self._run(submit.control_task())
+        self.assertEqual(submit_at, len(self.buy_ids))
+        self.now += 25
+        self._run(submit.control_task())
+        self.assertEqual(submit_at + 1, len(self.buy_ids))
+        self.assertEqual(Decimal("50"), self.buy_ids[-1][1])
+
+    def test_up_to_jitter_does_not_reprice_until_the_target_moves(self):
+        self._book(Decimal("0.079"), Decimal("0.08"))
+        executor = self._up_to(
+            total_amount=Decimal("100"),
+            slice_amount=Decimal("100"),
+            price_jitter_pct=Decimal("0.02"),
+            random_seed=1,
+        )
+        executor._rng.random = lambda: 0.9
+        self._run(executor.control_task())
+        self.assertEqual(1, len(self.buy_ids))
+        self.assertGreater(self.buy_ids[0][2], Decimal("0.08"))
+        self.assertLessEqual(self.buy_ids[0][2], Decimal("0.09"))
+        self.strategy.cancel.reset_mock()
+        for _ in range(5):
+            self.now += 1
+            self._run(executor.control_task())
+        self.assertEqual(1, len(self.buy_ids))
+        self.assertEqual(0, self.strategy.cancel.call_count)
+        self._book(Decimal("0.084"), Decimal("0.085"))
+        self._run(executor.control_task())
+        self.orders["buy-1"].current_state = OrderState.CANCELED
+        self._run(executor.control_task())
+        self.assertEqual(2, len(self.buy_ids))
+        self.assertLessEqual(self.buy_ids[1][2], Decimal("0.09"))
+        self.assertGreater(self.buy_ids[1][2], Decimal("0.08"))
+
+        self._book(Decimal("0.08000"), Decimal("0.08100"))
+        buy = self._up_to(
+            post_only=True,
+            total_amount=Decimal("100"),
+            slice_amount=Decimal("100"),
+            price_jitter_pct=Decimal("0.5"),
+            limit_price=Decimal("0.09"),
+            random_seed=2,
+        )
+        buy._rng.random = lambda: 1
+        self._run(buy.control_task())
+        buy_price = self.buy_ids[-1][2]
+        self.assertEqual(OrderType.LIMIT_MAKER, self.buy_ids[-1][3])
+        self.assertLess(buy_price, Decimal("0.08100"))
+        self.assertLessEqual(buy_price, Decimal("0.09"))
+
+        self._book(Decimal("0.08000"), Decimal("0.08100"))
+        sell = self._up_to(
+            side="SELL",
+            post_only=True,
+            total_amount=Decimal("100"),
+            slice_amount=Decimal("100"),
+            price_jitter_pct=Decimal("0.5"),
+            limit_price=Decimal("0.07"),
+            random_seed=3,
+        )
+        sell._rng.random = lambda: 0
+        self._run(sell.control_task())
+        sell_price = self.buy_ids[-1][2]
+        self.assertGreater(sell_price, Decimal("0.08000"))
+        self.assertGreaterEqual(sell_price, Decimal("0.07"))
+
+    def test_post_only_up_to_does_not_walk_through_its_own_best_order(self):
+        self._book(Decimal("0.08000"), Decimal("0.08100"))
+        executor = self._up_to(post_only=True, total_amount=Decimal("100"), slice_amount=Decimal("100"))
+        self._run(executor.control_task())
+        start = len(self.buy_ids) - 1
+        self.assertEqual(Decimal("0.08001"), self.buy_ids[start][2])
+        self._book(Decimal("0.08001"), Decimal("0.08100"))
+        self.strategy.cancel.reset_mock()
+        for _ in range(4):
+            self.now += 1
+            self._run(executor.control_task())
+        self.assertEqual(start + 1, len(self.buy_ids))
+        self.assertEqual(0, self.strategy.cancel.call_count)
+        self._book(Decimal("0.08010"), Decimal("0.08100"))
+        self._run(executor.control_task())
+        self.orders["buy-1"].current_state = OrderState.CANCELED
+        self._run(executor.control_task())
+        self.assertEqual(Decimal("0.08011"), self.buy_ids[-1][2])
+
+        self._book(Decimal("0.08000"), Decimal("0.08100"))
+        sell = self._up_to(
+            side="SELL",
+            post_only=True,
+            limit_price=Decimal("0.07"),
+            total_amount=Decimal("100"),
+            slice_amount=Decimal("100"),
+        )
+        before_sell = len(self.buy_ids)
+        self._run(sell.control_task())
+        first = self.buy_ids[before_sell][2]
+        self._book(Decimal("0.08000"), first)
+        self.strategy.cancel.reset_mock()
+        self.now += 1
+        self._run(sell.control_task())
+        self.assertEqual(before_sell + 1, len(self.buy_ids))
+        self.assertEqual(0, self.strategy.cancel.call_count)
+
+    def test_hedge_opening_cap_ignores_close_orders_and_own_children(self):
+        from bidict import bidict
+
+        from hummingbot.connector.derivative.mexc_perpetual import mexc_perpetual_constants as CONSTANTS
+        from hummingbot.connector.derivative.mexc_perpetual.mexc_perpetual_derivative import MexcPerpetualDerivative
+        from hummingbot.core.data_type.common import PositionMode
+
+        self._book(Decimal("0.07815"), Decimal("0.07816"))
+        exchange = MexcPerpetualDerivative(
+            mexc_perpetual_api_key="key",
+            mexc_perpetual_api_secret="secret",
+            trading_pairs=["AIOT-USDT"],
+            trading_required=True,
+        )
+        exchange._set_trading_pair_symbol_map(bidict({"AIOT_USDT": "AIOT-USDT"}))
+        exchange._contract_sizes["AIOT-USDT"] = Decimal("10")
+        exchange._perpetual_trading.set_position_mode(PositionMode.HEDGE)
+        book = {"rows": [{"symbol": "AIOT_USDT", "side": CONSTANTS.SIDE_CLOSE_LONG, "vol": 500, "dealVol": 0}]}
+
+        async def get(path_url, params=None, **kwargs):
+            if path_url == CONSTANTS.OPEN_POSITIONS_PATH:
+                return {"success": True, "code": 0, "data": []}
+            return {"success": True, "code": 0, "data": book["rows"]}
+
+        exchange._api_get = get
+        self.connector.ground_truth_exposure = exchange.ground_truth_exposure
+        executor = self._up_to(total_amount=Decimal("1000"), slice_amount=Decimal("600"), visible_count=2, levels=2)
+        self._run(executor.control_task())
+        self.assertEqual(Decimal("600"), self.buy_ids[0][1])
+        book["rows"] = [
+            {"symbol": "AIOT_USDT", "side": CONSTANTS.SIDE_CLOSE_LONG, "vol": 500, "dealVol": 0, "externalOid": "tp"},
+            {
+                "symbol": "AIOT_USDT",
+                "side": CONSTANTS.SIDE_OPEN_LONG,
+                "vol": 30,
+                "dealVol": 0,
+                "externalOid": "other-iceberg",
+            },
+            {"symbol": "AIOT_USDT", "side": CONSTANTS.SIDE_OPEN_LONG, "vol": 60, "dealVol": 0, "externalOid": "buy-1"},
+        ]
+        self._run(executor.control_task())
+        self.assertEqual(2, len(self.buy_ids))
+        self.assertEqual(Decimal("400"), self.buy_ids[1][1])
+        self.assertEqual("", executor.get_custom_info()["status_reason"])
+
+        book["rows"] = [
+            {"symbol": "AIOT_USDT", "side": CONSTANTS.SIDE_CLOSE_LONG, "vol": 500, "dealVol": 0, "externalOid": "tp"},
+            {
+                "symbol": "AIOT_USDT",
+                "side": CONSTANTS.SIDE_OPEN_LONG,
+                "vol": 100,
+                "dealVol": 0,
+                "externalOid": "manual",
+            },
+        ]
+        blocked = self._up_to(total_amount=Decimal("1000"), slice_amount=Decimal("1000"))
+        placed = len(self.buy_ids)
+        self._run(blocked.control_task())
+        self.assertEqual(placed, len(self.buy_ids))
+        self.assertEqual(RunnableStatus.RUNNING, blocked.status)
+        self.assertIn("Exposure cap blocked", blocked.get_custom_info()["status_reason"])
+
+    def test_post_only_reject_backs_off_and_a_fill_keeps_fees_and_retries(self):
+        self._book(Decimal("0.07"), Decimal("0.075"))
+        mover = self._executor(post_only=True, levels=1, iceberg=False, visible_count=1, min_order_interval=0)
+        self._run(mover.control_task())
+        self.assertEqual(1, len(self.buy_ids))
+        mover.process_order_failed_event(
+            0,
+            None,
+            MarketOrderFailureEvent(self.now, "buy-1", OrderType.LIMIT_MAKER),
+        )
+        self._run(mover.control_task())
+        self.assertEqual(1, len(self.buy_ids))
+        self.assertNotEqual(CloseType.FAILED, mover.close_type)
+        self._book(Decimal("0.081"), Decimal("0.082"))
+        self._run(mover.control_task())
+        self.assertEqual(2, len(self.buy_ids))
+
+        self._book(Decimal("0.07"), Decimal("0.075"))
+        repeater = self._executor(post_only=True, levels=1, iceberg=False, visible_count=1, min_order_interval=0)
+        for _ in range(12):
+            before = len(self.buy_ids)
+            self._run(repeater.control_task())
+            self.assertEqual(before + 1, len(self.buy_ids))
+            order_id = self.buy_ids[-1][0]
+            repeater.process_order_failed_event(
+                0,
+                None,
+                MarketOrderFailureEvent(self.now, order_id, OrderType.LIMIT_MAKER),
+            )
+            self._run(repeater.control_task())
+            self.assertEqual(before + 1, len(self.buy_ids))
+            self.now += 0.01
+        self.assertNotEqual(CloseType.FAILED, repeater.close_type)
+        self.assertEqual(0, repeater._current_retries)
+        self.assertEqual(RunnableStatus.RUNNING, repeater.status)
+
+        keeper = self._executor(levels=1, iceberg=False, visible_count=1, max_retries=1)
+        self._run(keeper.control_task())
+        self._run(keeper.control_task())
+        order = self.orders[self.buy_ids[-1][0]]
+        order.order_fills["fee-1"] = TradeUpdate(
+            trade_id="fee-1",
+            client_order_id=order.client_order_id,
+            exchange_order_id="ex-fee",
+            trading_pair="AIOT-USDT",
+            fill_timestamp=self.now,
+            fill_price=Decimal("0.08"),
+            fill_base_amount=Decimal("10"),
+            fill_quote_amount=Decimal("0.8"),
+            fee=AddedToCostTradeFee(flat_fees=[TokenAmount(token="USDT", amount=Decimal("0.15"))]),
+        )
+        self.assertEqual(Decimal("0.15"), keeper.cum_fees_quote)
+        failed_id = order.client_order_id
+        keeper.process_order_failed_event(
+            0,
+            None,
+            MarketOrderFailureEvent(self.now, failed_id, OrderType.LIMIT),
+        )
+        self._run(keeper.control_task())
+        self.assertEqual(Decimal("0.15"), keeper.cum_fees_quote)
+        self.assertEqual(1, keeper._current_retries)
+        keeper.process_order_filled_event(
+            0,
+            None,
+            OrderFilledEvent(
+                timestamp=self.now,
+                order_id=failed_id,
+                trading_pair="AIOT-USDT",
+                trade_type=TradeType.BUY,
+                order_type=OrderType.LIMIT,
+                price=Decimal("0.08"),
+                amount=Decimal("10"),
+                trade_fee=AddedToCostTradeFee(flat_fees=[TokenAmount(token="USDT", amount=Decimal("0"))]),
+            ),
+        )
+        self.assertEqual(0, keeper._current_retries)
+        replacement = self.buy_ids[-1][0]
+        keeper.process_order_failed_event(
+            0,
+            None,
+            MarketOrderFailureEvent(self.now, replacement, OrderType.LIMIT),
+        )
+        self.assertNotEqual(CloseType.FAILED, keeper.close_type)
+        self.assertEqual(1, keeper._current_retries)
+        self.assertEqual(Decimal("0.15"), keeper.cum_fees_quote)
