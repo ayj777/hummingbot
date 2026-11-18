@@ -280,8 +280,11 @@ class RangeIcebergExecutorConfig(ExecutorConfigBase):
     only the size not covered by the live stops and the unconfirmed take profit.
     A larger position at the same backstop price places the full open size and
     keeps the id MEXC returns. A changed stop price cancels the old stops
-    before the new full-size place. Every id is listed in
-    exchange_stop_order_ids. Resuming from custom_info restores an
+    before the new full-size place. The place never asks for more than the
+    open size minus resting reduce-only close limits. If a move fails, the
+    old stop is restored before any take profit is posted again, and that
+    restore retries at a short backoff capped at 2 seconds. Every id is
+    listed in exchange_stop_order_ids. Resuming from custom_info restores an
     exit_state of ARMED, RESTING, or CLOSING, re-posts a missing exit from
     open_base, and keeps the saved exchange stop ids. resume_entries false
     places no entry orders and sizes the restored open amount in base, even
