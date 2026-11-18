@@ -283,10 +283,15 @@ class RangeIcebergExecutorConfig(ExecutorConfigBase):
     before the new full-size place. The place never asks for more than the
     open size minus resting reduce-only close limits. If a move fails, the
     old stop is restored before any take profit is posted again, and that
-    restore retries at a short backoff capped at 2 seconds. Every id is
-    listed in exchange_stop_order_ids. Resuming from custom_info restores an
-    exit_state of ARMED, RESTING, or CLOSING, re-posts a missing exit from
-    open_base, and keeps the saved exchange stop ids. resume_entries false
+    restore retries at a short backoff capped at 2 seconds. The take profit
+    waits at most exchange_stop_hold_seconds (default 5) for that stop. After
+    the hold, the take profit is posted and the stop keeps retrying. A
+    connector with no place_position_stop_order does not hold the take profit.
+    A stop-loss exit is never held. exchange_stop_released is saved so a
+    resumed stop-loss close does not place a new stop. Every id is listed in
+    exchange_stop_order_ids. Resuming from custom_info restores an exit_state
+    of ARMED, RESTING, or CLOSING, re-posts a missing exit from open_base,
+    and keeps the saved exchange stop ids. resume_entries false
     places no entry orders and sizes the restored open amount in base, even
     when the saved config used quote.
 
@@ -335,6 +340,7 @@ class RangeIcebergExecutorConfig(ExecutorConfigBase):
     protective_exchange_stop: Optional[bool] = None
     protective_stop_buffer_pct: Decimal = Decimal("0.005")
     stop_loss_fallback_seconds: float = 30
+    exchange_stop_hold_seconds: float = 5
 
     @field_validator("side", mode="before")
     @classmethod
@@ -457,6 +463,7 @@ class RangeIcebergExecutorConfig(ExecutorConfigBase):
         elif self.schedule_slices is not None or self.schedule_interval is not None:
             raise ValueError("schedule_slices and schedule_interval need a duration")
         require_positive("stop_loss_fallback_seconds", self.stop_loss_fallback_seconds)
+        require_positive("exchange_stop_hold_seconds", self.exchange_stop_hold_seconds)
         require_positive("protective_stop_buffer_pct", self.protective_stop_buffer_pct)
         if self.protective_stop_buffer_pct >= 1:
             raise ValueError(

@@ -143,11 +143,14 @@ class RangeIcebergExecutor(ExecutorBase):
     failure backs off and is stored on exchange_stop_error. The stop is sized
     to the closable quantity: the open position minus resting reduce-only
     close limits. A smaller stop is partial coverage and the take profit is
-    cancelled so the stop can grow. No reduce-only close limit is posted
-    while a position that should have an exchange stop has none. A failed
-    move restores the old stop first, retrying at 0.5s, 1s, then 2s, and the
-    take profit is posted only after a stop is live again. The software stop
-    leaves that order working until every take-profit and entry cancel is
+    cancelled so the stop can grow. A take-profit limit waits for the stop
+    only while a place is still realistically coming, for
+    exchange_stop_hold_seconds (default 5s) or a few attempts. After that the
+    take profit is posted, the error stays, and the stop keeps retrying. A
+    connector that cannot place a stop does not hold the take profit. A
+    stop-loss exit is never held, and its slices are not cancelled to make
+    room for a     stop. A failed move restores the old stop first, retrying at
+    0.5s, 1s, then 2s. The software stop leaves that order working until every take-profit and entry cancel is
     confirmed. Only then does it cancel the backstop and send its own close.
     If those cancels are still open after stop_loss_fallback_seconds, the
     backstop stays and the software close is the open size minus the
@@ -177,7 +180,8 @@ class RangeIcebergExecutor(ExecutorBase):
 
     custom_info for the API and Condor includes exit_state, exit_order_ids,
     exchange_stop_order_id, exchange_stop_order_ids, has_exchange_stop,
-    exchange_stop_error, filled_base, closed_base, and open_base.
+    exchange_stop_error, exchange_stop_released, filled_base, closed_base,
+    and open_base.
     take_profit_trigger_price, stop_loss_trigger_price, and
     exchange_stop_trigger_price are null until a fill exists, and null when
     that exit is not configured. A percent trigger uses the current average
@@ -299,6 +303,7 @@ class RangeIcebergExecutor(ExecutorBase):
         self._exchange_stop_failures = 0
         self._exchange_stop_retry_after: Optional[float] = None
         self._exchange_stop_released = False
+        self._exchange_stop_hold_started_at: Optional[float] = None
         self._exchange_stop_reconciled = False
         self._exchange_stop_last_amount = Decimal("0")
         self._exchange_stop_cancel_failures = 0
@@ -2212,6 +2217,7 @@ class RangeIcebergExecutor(ExecutorBase):
             "exchange_stop_order_ids": self._exchange_stop_order_ids(),
             "has_exchange_stop": bool(self._exchange_stop_order_ids()),
             "exchange_stop_error": self._exchange_stop_error,
+            "exchange_stop_released": self._exchange_stop_released,
             "closed_base": str(self._exit_filled_base()),
             "open_base": str(self._position_base()),
             "exit_error": self._exit_error,
@@ -2690,19 +2696,55 @@ class RangeIcebergExecutor(ExecutorBase):
                 return True
         return False
 
+    def _stop_loss_close_in_progress(self) -> bool:
+        """
+        True while a stop-loss close is TRIGGERED or CLOSING.
+
+        Those slices are the software close. They are not cancelled to make
+        room for an exchange stop, and they are not held for one.
+        """
+        if self._exit_active != "stop_loss":
+            return False
+        return self._public_exit_state() in (ExitState.TRIGGERED, ExitState.CLOSING)
+
+    def _exchange_stop_hold_expired(self) -> bool:
+        """
+        The take profit has waited long enough for a stop that is still coming.
+
+        Four placement attempts cover the 0.5s, 1s, and 2s restore backoff.
+        exchange_stop_hold_seconds (default 5) is the time bound. Either one
+        ends the hold.
+        """
+        attempts = self._exchange_stop_failures + self._exchange_stop_restore_failures
+        if attempts >= 4:
+            return True
+        started = self._exchange_stop_hold_started_at
+        if started is None:
+            return False
+        elapsed = float(self._strategy.current_timestamp) - float(started)
+        return elapsed + 1e-9 >= float(self.config.exchange_stop_hold_seconds)
+
     def _reduce_only_limit_needs_a_live_stop(self) -> bool:
         """
-        A reduce-only close limit uses closable quantity.
+        Hold a take-profit limit only while an exchange stop is still coming.
 
-        Hold every such limit while a position that should have an exchange
-        stop has none. Restore the stop first. A full-size close posted into
-        that gap makes every later stop place fail.
+        Stop-loss exits are never held. A connector without
+        place_position_stop_order is never held. The hold is the restore or
+        placement cycle, and it ends at exchange_stop_hold_seconds or after a
+        few attempts. After that the take profit is posted, the error stays,
+        and the stop keeps retrying.
         """
+        if self._exit_active == "stop_loss":
+            return False
+        if not self._protective_stop_supported():
+            return False
         if not self._protective_stop_enabled() or not self._exchange_stop_is_due():
             return False
         if self._exchange_stop_released or self._keep_exchange_stop:
             return False
         if self._exchange_stop_order_ids():
+            return False
+        if self._exchange_stop_hold_expired():
             return False
         return True
 
@@ -2776,8 +2818,8 @@ class RangeIcebergExecutor(ExecutorBase):
         size and the returned id is stored at that vol. A changed price cancels
         the old stops, then places one full-size stop. If that place fails, the
         old size is put back at the old price in the same turn. A failed
-        restore keeps retrying until a stop is live, and the take profit stays
-        off the book until then. An identical size and price that is already
+        restore keeps retrying. The take profit stays off the book only while
+        the stop hold is still open. An identical size and price that is already
         live is not sent again.
         """
         if self._exchange_stop_restore and not self._exchange_stop_order_ids():
@@ -2813,9 +2855,10 @@ class RangeIcebergExecutor(ExecutorBase):
                 and not self._exit_working()
                 and not self._exit_orders_block()
                 and self._exit_phase != "done"
-                and self._exchange_stop_amount > 0
             ):
                 covered = self._exchange_stop_amount
+                if covered <= 0:
+                    covered = self._position_base()
                 if covered > self._position_base():
                     covered = self._position_base()
                 await self._post_resting_take_profit(covered)
@@ -4201,6 +4244,8 @@ class RangeIcebergExecutor(ExecutorBase):
 
     def _note_exchange_stop_failure(self, exc: Exception, *, restore: bool = False):
         now = float(self._strategy.current_timestamp)
+        if self._exchange_stop_hold_started_at is None:
+            self._exchange_stop_hold_started_at = now
         if restore or self._exchange_stop_restore:
             # 0.5s, 1s, 2s, then 2s. One restore at a time stays under MEXC's
             # 5 requests per 2 seconds. This is not the 30s place backoff.
@@ -4256,6 +4301,7 @@ class RangeIcebergExecutor(ExecutorBase):
         self._exchange_stop_restore = []
         self._exchange_stop_restore_failures = 0
         self._exchange_stop_retry_after = None
+        self._exchange_stop_hold_started_at = None
         if position - amount >= self._min_order_size():
             self._note_partial_stop_coverage(amount, position)
             return
@@ -4320,7 +4366,7 @@ class RangeIcebergExecutor(ExecutorBase):
                 continue
             restored.append({"id": str(new_id), "amount": stop["amount"], "price": stop["price"]})
         if not restored:
-            if self._resting_reduce_only_close_base() > 0:
+            if self._resting_reduce_only_close_base() > 0 and not self._stop_loss_close_in_progress():
                 self._cancel_exit_orders()
                 self._tp_grow_cancelling = True
             return False
@@ -4501,7 +4547,11 @@ class RangeIcebergExecutor(ExecutorBase):
         if amount < self._min_order_size():
             if saved:
                 await self._restore_exchange_stops(saved)
-            elif self._resting_reduce_only_close_base() > 0 and not self._tp_grow_cancelling:
+            elif (
+                self._resting_reduce_only_close_base() > 0
+                and not self._tp_grow_cancelling
+                and not self._stop_loss_close_in_progress()
+            ):
                 self._cancel_exit_orders()
                 self._tp_grow_cancelling = True
             return
@@ -4556,6 +4606,7 @@ class RangeIcebergExecutor(ExecutorBase):
             "exit_state": self._public_exit_state().value,
             "exchange_stop_order_id": self._exchange_stop_order_id,
             "exchange_stop_order_ids": self._exchange_stop_order_ids(),
+            "exchange_stop_released": self._exchange_stop_released,
             "trigger_price": None if self._exit_trigger_price is None else str(self._exit_trigger_price),
             "entry_filled_base": str(self.filled_base),
             "entry_filled_quote": str(self.filled_amount_quote),
@@ -4702,7 +4753,12 @@ class RangeIcebergExecutor(ExecutorBase):
         if not isinstance(stop_ids, list) or not stop_ids:
             stop_ids = [] if stop_id in (None, "") else [stop_id]
         stop_ids = [str(item) for item in stop_ids if item not in (None, "")]
-        if stop_ids:
+        released = custom_info.get("exchange_stop_released", blob.get("exchange_stop_released"))
+        if isinstance(released, str):
+            released = released.strip().lower() in ("true", "1", "yes")
+        if released:
+            self._exchange_stop_released = True
+        if stop_ids and not self._exchange_stop_released:
             price = self._exchange_stop_trigger_price()
             total = self._position_base()
             count = len(stop_ids)
