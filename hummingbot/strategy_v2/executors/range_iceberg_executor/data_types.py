@@ -279,14 +279,19 @@ class RangeIcebergExecutorConfig(ExecutorConfigBase):
     stop_loss_fallback_seconds, the backstop stays and the software close is
     only the size not covered by the live stops and the unconfirmed take profit.
     A larger position at the same backstop price places the full open size and
-    keeps the id MEXC returns. A changed stop price cancels the old stops
-    before the new full-size place. The place never asks for more than the
+    keeps the id MEXC returns. A changed stop price is moved with
+    change_stop_plan_price and then resized at that price. Cancel-and-place
+    is only used when that reprice fails. The place never asks for more than the
     open size minus resting reduce-only close limits. If a move fails, the
-    old stop is restored before any take profit is posted again, and that
-    restore retries at a short backoff capped at 2 seconds. The take profit
-    waits at most exchange_stop_hold_seconds (default 5) for that stop. After
-    the hold, the take profit is posted and the stop keeps retrying. A
-    connector with no place_position_stop_order does not hold the take profit.
+    old stop is restored before any take profit is posted again. That restore
+    retries at 0.5s, 1s, then 2s, and after four failures waits
+    stop_loss_fallback_seconds. The take profit waits at most
+    exchange_stop_hold_seconds (default 5) for that stop, including while a
+    restore is still failing. After the hold, the take profit is posted and
+    the stop keeps retrying. A failed grow leaves the take profit at the size
+    the live stop covers, and after three failed placements it is no longer
+    cancelled to make room. A connector with no place_position_stop_order
+    does not hold the take profit and does not cancel one that is already up.
     A stop-loss exit is never held. exchange_stop_released is saved so a
     resumed stop-loss close does not place a new stop. Every id is listed in
     exchange_stop_order_ids. Resuming from custom_info restores an exit_state

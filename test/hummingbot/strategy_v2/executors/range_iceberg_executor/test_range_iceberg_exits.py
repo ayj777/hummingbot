@@ -2047,6 +2047,183 @@ class RangeIcebergExitTests(IsolatedAsyncioWrapperTestCase):
         self.assertFalse(resumed.get_custom_info()["has_exchange_stop"])
         self.assertTrue(resumed.get_custom_info()["exchange_stop_released"])
 
+    def _places_in_any_two_seconds(self, times) -> int:
+        worst = 0
+        for stamp in times:
+            count = sum(1 for other in times if stamp <= other < stamp + 2)
+            if count > worst:
+                worst = count
+        return worst
+
+    def test_failed_grow_keeps_the_take_profit_on_the_book(self):
+        state = self._install_mexc_stop_book()
+        self._mid(Decimal("0.085"))
+        executor = self._executor(
+            exit_arming="ON_ANY_FILL",
+            take_profit={"price": "0.10", "execution": "SINGLE", "order_type": "LIMIT"},
+            stop_loss={"price": "0.07", "execution": "SINGLE"},
+        )
+        self._run(executor.control_task())
+        order = self.orders[self.buy_ids[-1][0]]
+        order.executed_amount_base = Decimal("50")
+        order.executed_amount_quote = Decimal("4")
+        order.current_state = OrderState.PARTIALLY_FILLED
+        self._run(executor.control_task())
+        self.assertEqual(Decimal("50"), state["stops"]["stop-1"]["amount"])
+        self.assertEqual(1, len(self._open_limit_closes()))
+        state["fail"] = 100
+        order.executed_amount_base = Decimal("100")
+        order.executed_amount_quote = Decimal("8")
+        order.current_state = OrderState.FILLED
+        on_book = 0
+        place_times = []
+        seen = len(state["placed"])
+        for _ in range(180):
+            self._run(executor.control_task())
+            added = len(state["placed"]) - seen
+            place_times.extend([self.now] * added)
+            seen = len(state["placed"])
+            if self._open_limit_closes():
+                on_book += 1
+            self.now += 1
+        self.assertGreaterEqual(on_book, int(180 * 0.95))
+        self.assertLessEqual(self._places_in_any_two_seconds(place_times), 5)
+        self.assertEqual(Decimal("50"), state["stops"]["stop-1"]["amount"])
+        self.assertNotEqual("", executor.get_custom_info()["exchange_stop_error"])
+        self.assertTrue(self._open_limit_closes())
+        self.assertEqual(Decimal("50"), self._open_limit_closes()[0].amount)
+
+    def test_percent_stop_reprices_in_place_before_it_resizes(self):
+        state = self._install_mexc_stop_book()
+        repriced = []
+
+        async def change_price(order_id, stop_loss_price=None, **kwargs):
+            price = Decimal(str(stop_loss_price))
+            repriced.append((str(order_id), price))
+            state["stops"][str(order_id)]["price"] = price
+            return {"success": True}
+
+        self.connector.change_stop_plan_price = change_price
+        self._mid(Decimal("0.085"))
+        executor = self._executor(
+            exit_arming="ON_ANY_FILL",
+            take_profit={"percent": "0.10", "execution": "SINGLE", "order_type": "LIMIT"},
+            stop_loss={"percent": "0.05", "execution": "SINGLE"},
+        )
+        self._run(executor.control_task())
+        order = self.orders[self.buy_ids[-1][0]]
+        order.executed_amount_base = Decimal("50")
+        order.executed_amount_quote = Decimal("4")
+        order.current_state = OrderState.PARTIALLY_FILLED
+        self._run(executor.control_task())
+        stop_id = "stop-1"
+        old_price = state["stops"][stop_id]["price"]
+        order.executed_amount_base = Decimal("100")
+        order.executed_amount_quote = Decimal("9")
+        order.current_state = OrderState.FILLED
+        self._mid(Decimal("0.092"))
+        for _ in range(6):
+            self._run(executor.control_task())
+            self.assertIn(stop_id, state["stops"])
+            self.assertNotIn(stop_id, state["cancelled"])
+        self.assertEqual([], state["cancelled"])
+        self.assertGreaterEqual(len(repriced), 1)
+        self.assertEqual(stop_id, repriced[0][0])
+        self.assertNotEqual(old_price, state["stops"][stop_id]["price"])
+        self.assertEqual(Decimal("100"), state["stops"][stop_id]["amount"])
+        self.assertEqual([stop_id], executor.get_custom_info()["exchange_stop_order_ids"])
+        self.assertEqual("", executor.get_custom_info()["exchange_stop_error"])
+        self.assertEqual(Decimal("100"), self._open_limit_closes()[0].amount)
+
+    def test_failed_reprice_posts_the_take_profit_within_the_hold(self):
+        state = self._install_mexc_stop_book()
+
+        async def change_price(*args, **kwargs):
+            raise RuntimeError("reprice rejected")
+
+        self.connector.change_stop_plan_price = change_price
+        self._mid(Decimal("0.085"))
+        executor = self._executor(
+            exit_arming="ON_ANY_FILL",
+            take_profit={"percent": "0.10", "execution": "SINGLE", "order_type": "LIMIT"},
+            stop_loss={"percent": "0.05", "execution": "SINGLE"},
+        )
+        self._run(executor.control_task())
+        order = self.orders[self.buy_ids[-1][0]]
+        order.executed_amount_base = Decimal("50")
+        order.executed_amount_quote = Decimal("4")
+        order.current_state = OrderState.PARTIALLY_FILLED
+        self._run(executor.control_task())
+        order.executed_amount_base = Decimal("100")
+        order.executed_amount_quote = Decimal("9")
+        order.current_state = OrderState.FILLED
+        self._mid(Decimal("0.092"))
+        self._run(executor.control_task())
+        state["fail"] = 100
+        before = len(state["placed"])
+        start = self.now
+        posted_at = None
+        for _ in range(180):
+            self._run(executor.control_task())
+            if posted_at is None and self._open_limit_closes():
+                posted_at = self.now
+            self.now += 1
+        self.assertIsNotNone(posted_at)
+        self.assertLessEqual(posted_at - start, float(executor.config.exchange_stop_hold_seconds))
+        self.assertLessEqual(len(state["placed"]) - before, 10)
+        self.assertNotEqual("", executor.get_custom_info()["exchange_stop_error"])
+        self.assertTrue(self._open_limit_closes())
+
+    def test_unsupported_stop_posts_the_take_profit_once(self):
+        executor = self._executor(
+            protective_exchange_stop=True,
+            take_profit={"percent": "0.10", "execution": "SINGLE", "order_type": "LIMIT"},
+            stop_loss={"percent": "0.05", "execution": "SINGLE"},
+        )
+        self._open_entry(executor)
+        self._run(executor.control_task())
+        limits = [call for call in self._close_calls() if call[1][3] == OrderType.LIMIT]
+        self.assertEqual(1, len(limits))
+        order_id = self.buy_ids[-1][0]
+        for _ in range(30):
+            self.now += 2
+            self._run(executor.control_task())
+        limits = [call for call in self._close_calls() if call[1][3] == OrderType.LIMIT]
+        self.assertEqual(1, len(limits))
+        self.assertEqual(OrderState.OPEN, self.orders[order_id].current_state)
+        cancelled_ids = [call.args[2] for call in self.strategy.cancel.call_args_list]
+        self.assertNotIn(order_id, cancelled_ids)
+        self.assertIn("place_position_stop_order", executor.get_custom_info()["exchange_stop_error"])
+
+    def test_repeated_stop_rejects_leave_the_take_profit_resting(self):
+        state = self._install_mexc_stop_book(fail_times=100)
+        self._mid(Decimal("0.085"))
+        executor = self._executor(
+            take_profit={"percent": "0.10", "execution": "SINGLE", "order_type": "LIMIT"},
+            stop_loss={"percent": "0.05", "execution": "SINGLE"},
+        )
+        self._open_entry(executor)
+        resting_id = None
+        for _ in range(20):
+            self._run(executor.control_task())
+            self.now += 1
+            opens = self._open_limit_closes()
+            if opens and executor._failed_stop_placements() >= 3:
+                resting_id = next(iter(self.orders))
+                for order_id, _amount, _price, order_type, action in self.buy_ids:
+                    if action == PositionAction.CLOSE and order_type == OrderType.LIMIT:
+                        if self.orders[order_id].current_state == OrderState.OPEN:
+                            resting_id = order_id
+                break
+        self.assertIsNotNone(resting_id)
+        for _ in range(120):
+            self.now += 1
+            self._run(executor.control_task())
+        self.assertEqual(OrderState.OPEN, self.orders[resting_id].current_state)
+        self.assertNotEqual("", executor.get_custom_info()["exchange_stop_error"])
+        self.assertIsNone(executor.get_custom_info()["exchange_stop_order_id"])
+        self.assertLessEqual(len(state["placed"]), 12)
+
     def test_stop_loss_keeps_the_backstop_while_the_take_profit_cancel_is_unconfirmed(self):
         cancelled = []
         self._install_mexc_stop_book()
