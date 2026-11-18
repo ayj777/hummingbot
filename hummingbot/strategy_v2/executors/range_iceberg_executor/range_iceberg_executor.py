@@ -17,6 +17,7 @@ from hummingbot.strategy_v2.executors.range_iceberg_executor.data_types import (
     ExitArming,
     ExitExecution,
     ExitOrderType,
+    ExitState,
     RangeIcebergExecutorConfig,
     RangeIcebergExitConfig,
     ScheduleStart,
@@ -86,7 +87,8 @@ class RangeIcebergExecutor(ExecutorBase):
     continues from the frozen elapsed time.
     Pause stops new entry orders. An exit that already started keeps closing, and an
     armed exit can still trigger. A pause after an exit trigger also freezes the
-    exit clock.
+    exit clock. An unknown-order halt is different: no new exit order is sent
+    until that halt clears.
 
     Optional take profit and stop loss close the filled position. They are off unless
     the config sets them. A single take profit is one limit at the trigger, or one
@@ -109,11 +111,47 @@ class RangeIcebergExecutor(ExecutorBase):
     (MEXC hedge side 2). Exit size never exceeds this executor's own filled amount,
     net of what the exit has already closed.
 
-    Take profit and stop loss are mutually exclusive. A take-profit limit that has
-    not filled is cancelled if the stop loss triggers. Once a stop-loss iceberg has
-    sent its first close, it runs until the filled amount is closed. A later move
-    back through the take-profit price does not cancel that iceberg and does not
-    start the take profit.
+    A single limit take profit is not a trigger. It rests at the trigger for the
+    filled amount, and further entry fills add to it or resize it. The order is
+    reduce-only and never larger than the filled amount. The entry keeps running.
+    A market take profit, an iceberg take profit, and a stop loss are triggers.
+    They cancel the remaining entry before they send the close.
+
+    The stop loss can take over any unfinished take profit. That includes a limit
+    that has partly filled and an iceberg child that is still resting. The
+    take-profit remainder is cancelled and the stop closes what is still open.
+    Once a stop loss has started, a later move back through the take-profit price
+    does not cancel it and does not start the take profit.
+
+    Under ON_FULL_FILL, a duration or expiry that ends with only a partial fill
+    cancels the rest of the entry and arms exits on the filled amount. It does
+    not stop the executor while that position still needs a close. Once an exit
+    is armed or active, the entry time limit and expiry are not checked again.
+
+    early_stop cancels software entry and exit orders. It does not close the
+    filled position. keep_position=True is the API shutdown path and records
+    POSITION_HOLD. The saved custom_info is enough to resume an exit whose
+    exit_state is ARMED, RESTING, or CLOSING. When the stop loss is armed and
+    the connector can place one, a protective exchange stop is sent as well.
+    That stop is left in place by early_stop, including keep_position=True, so
+    a shutdown or a crash does not leave the position without a stop. It is
+    cancelled when the position is flat or the take profit finishes.
+    protective_exchange_stop defaults to on only if the connector implements
+    place_position_stop_order.
+
+    Repeated exit rejections use their own retry budget and backoff. They do
+    not mark the executor FAILED while the position is open until a market
+    close has been tried. The error is stored on custom_info.
+
+    The exposure cap reads the whole pair and side. Two executors on the same
+    pair and side can starve each other, because each one counts the other's
+    fills and open orders. The cap is not scoped to this executor.
+
+    custom_info for the API and Condor includes exit_state, exit_order_ids,
+    exchange_stop_order_id, filled_base, closed_base, and open_base.
+    take_profit_trigger_price and stop_loss_trigger_price are null until a
+    fill exists, and null when that exit is not configured. A percent trigger
+    uses the current average fill.
     """
 
     _logger: Optional[HummingbotLogger] = None
@@ -206,6 +244,15 @@ class RangeIcebergExecutor(ExecutorBase):
         self._exit_accounted_quote: dict = {}
         self._exit_order_ids: List[str] = []
         self._exit_force_single = False
+        self._exit_force_market = False
+        self._entry_clock_handled = False
+        self._exchange_stop_order_id: Optional[str] = None
+        self._exchange_stop_amount = Decimal("0")
+        self._exchange_stop_price: Optional[Decimal] = None
+        self._exit_failure_count = 0
+        self._exit_retry_after: Optional[float] = None
+        self._exit_market_attempted = False
+        self._exit_error = ""
 
     def _make_schedule(self) -> Optional[SliceSchedule]:
         resolved = self.config.resolved_schedule()
@@ -511,32 +558,38 @@ class RangeIcebergExecutor(ExecutorBase):
         self._release_cancelled_exit_rungs()
         self._capture_schedule_anchor()
         if self._exit_phase == "done":
+            await self._sync_exchange_stop()
             return
         if self._exit_phase in ("cancelling_entry", "executing"):
             await self._control_exit()
+            await self._sync_exchange_stop()
             return
         self._advance_schedule()
-        if self._exit_active is None and self._time_limit_reached():
-            self._advance_schedule(force_end=True)
-            self.early_stop(keep_position=False, close_type=CloseType.TIME_LIMIT)
+        if await self._handle_entry_clock():
+            await self._sync_exchange_stop()
             return
-        if self._exit_active is None and self._expired():
-            self.early_stop(keep_position=False, close_type=CloseType.EXPIRED)
-            return
-        if self._exit_phase == "armed":
+        if self._exit_phase in ("armed", "resting"):
             await self._control_exit()
-            return
+            if self._exit_phase in ("cancelling_entry", "executing", "done", "armed"):
+                await self._sync_exchange_stop()
+                return
+            if self._entry_clock_handled or self._execution_complete():
+                await self._sync_exchange_stop()
+                return
         if self._execution_complete():
             if self._needs_exit_after_entry():
                 self._exit_phase = "armed"
                 await self._control_exit()
+                await self._sync_exchange_stop()
                 return
             self.close_execution_finished()
             return
-        if self._partial_exit_ready():
+        if self._resting_limit_applies() or self._partial_exit_ready():
             await self._control_exit()
             if self._exit_phase in ("cancelling_entry", "executing", "done"):
+                await self._sync_exchange_stop()
                 return
+        await self._sync_exchange_stop()
         if self.status != RunnableStatus.RUNNING or self._paused:
             return
         if self.config.mode == ExecutionMode.UP_TO:
@@ -557,10 +610,18 @@ class RangeIcebergExecutor(ExecutorBase):
 
     def early_stop(self, keep_position: bool = False, close_type: Optional[CloseType] = None):
         """
-        Cancel entry and exit orders, then stop.
+        Cancel software entry and exit orders, then stop.
 
-        keep_position selects POSITION_HOLD instead of EARLY_STOP. It does not close
-        the filled position. That matches the behavior without take profit or stop loss.
+        The filled position is not closed. keep_position=True selects POSITION_HOLD
+        and is the close type the API uses on shutdown. keep_position=False selects
+        EARLY_STOP unless the caller passes a close type. Neither value flattens
+        the position.
+
+        A protective exchange stop is not cancelled here. It keeps protecting the
+        position through the shutdown and through a process crash. Cancel it when
+        the position is closed or the take profit finishes. custom_info keeps
+        exit_state, exit_order_ids, and exchange_stop_order_id so a later start
+        can resume an exit that was ARMED, RESTING, or CLOSING.
         """
         self.close_type = close_type or (CloseType.POSITION_HOLD if keep_position else CloseType.EARLY_STOP)
         self.close_timestamp = self._strategy.current_timestamp
@@ -1511,6 +1572,11 @@ class RangeIcebergExecutor(ExecutorBase):
         A connector without this read is left unchanged.
         Own working children are not counted twice. A connector that can exclude
         their ids does that itself. Otherwise their remaining size is removed here.
+
+        The read is the whole pair and side. Another executor's fills and open
+        orders on that pair and side reduce the room, so two icebergs can starve
+        each other. Scoping the cap to this executor would drop the exchange
+        check that stops a child when the live position is already at the total.
         """
         if amount <= 0:
             return amount
@@ -1597,10 +1663,9 @@ class RangeIcebergExecutor(ExecutorBase):
                     pass
 
     def _live_fill(self, order_id: str):
-        slot = self._slot_for(order_id)
-        order = slot.tracked.order if slot and slot.tracked else None
-        if order is None and slot and slot.tracked:
-            order = self.get_in_flight_order(self.config.connector_name, order_id)
+        # A fill can land after the rung has been cleared, once the cancel is
+        # confirmed. The in-flight order is still the size the position holds.
+        order = self._order_for(order_id)
         if order is None:
             return Decimal("0"), Decimal("0")
         return (
@@ -1682,6 +1747,8 @@ class RangeIcebergExecutor(ExecutorBase):
             return "open_order_retry: " + ", ".join(sorted(self._open_lookup_count))
         if self._cap_block_reason:
             return self._cap_block_reason
+        if self._exit_error:
+            return self._exit_error
         return ""
 
     def to_format_status(self):
@@ -1857,23 +1924,44 @@ class RangeIcebergExecutor(ExecutorBase):
 
     def process_order_failed_event(self, event_tag: int, market, event):
         slot = self._slot_for(event.order_id) or self._exit_slot_for(event.order_id)
-        if slot:
+        if slot is None and event.order_id not in self._exit_order_ids:
+            return
+        if slot is not None:
             self._strategy.cancel(self.config.connector_name, self.config.trading_pair, event.order_id)
             self._unconfirmed_cancels.add(event.order_id)
             self._failed_order_ids.add(event.order_id)
             slot.cancel_requested = True
-            if self._is_post_only_reject(event):
-                self._note_post_only_backoff()
+        is_exit = self._is_exit_order(event.order_id)
+        if not is_exit and self._is_post_only_reject(event):
+            self._note_post_only_backoff()
+            return
+        if is_exit:
+            self._note_exit_failure(event.order_id)
+            return
+        self._current_retries += 1
+        if self._current_retries > self._max_retries:
+            if self._position_base() > 0 and self._exits_configured() and not self._exit_market_attempted:
+                self._exit_force_market = True
+                self._exit_force_single = True
+                self._exit_market_attempted = True
+                self._exit_error = (
+                    "Entry orders failed with the position still open. "
+                    "Sending a market close before the executor is marked FAILED."
+                )
+                if self._exit_phase == "idle":
+                    self._exit_phase = "armed"
                 return
-            self._current_retries += 1
-            if self._current_retries > self._max_retries:
-                self.close_type = CloseType.FAILED
-                self.early_stop(close_type=CloseType.FAILED)
+            self.close_type = CloseType.FAILED
+            self.early_stop(close_type=CloseType.FAILED)
 
     def process_order_filled_event(self, event_tag: int, market, event: OrderFilledEvent):
         order_id = getattr(event, "order_id", None)
         amount = Decimal(str(getattr(event, "amount", 0) or 0))
         if order_id is not None and amount > 0:
+            if self._is_exit_order(order_id):
+                self._exit_failure_count = 0
+                self._exit_retry_after = None
+                self._exit_error = ""
             if self._slot_for(order_id) is not None or order_id in self._submitted_order_ids:
                 self._current_retries = 0
                 self._clear_post_only_backoff()
@@ -1995,12 +2083,18 @@ class RangeIcebergExecutor(ExecutorBase):
             "skipped_amount": str(self._skipped_amount()),
             "average_fill_price": str(self.average_fill_price),
             "rounding_remainder": str(self._size_remainder()),
-            "child_order_ids": [slot.order_id for slot in self._slices if slot.order_id],
+            "child_order_ids": self._child_order_ids(),
             "take_profit": self._exit_config_view(self.config.take_profit),
             "stop_loss": self._exit_config_view(self.config.stop_loss),
             "exit_arming": self.config.exit_arming.value,
             "take_profit_trigger_price": self._trigger_text("take_profit"),
             "stop_loss_trigger_price": self._trigger_text("stop_loss"),
+            "exit_state": self._public_exit_state().value,
+            "exit_order_ids": self._public_exit_order_ids(),
+            "exchange_stop_order_id": self._exchange_stop_order_id,
+            "closed_base": str(self._exit_filled_base()),
+            "open_base": str(self._position_base()),
+            "exit_error": self._exit_error,
             "exit_status": self._exit_phase,
             "exit_active": self._exit_active,
             "exit_filled_amount": str(self._exit_filled_base()),
@@ -2082,7 +2176,18 @@ class RangeIcebergExecutor(ExecutorBase):
         return self._trigger_price_for(kind)
 
     def _trigger_text(self, kind: str):
-        price = self._reported_trigger(kind)
+        """
+        custom_info price for one exit.
+
+        Null when that exit is not configured, and null before this executor
+        has a fill. A percent trigger is the current average fill times the
+        percent. It is not the price stored when the exit first armed, so a
+        later entry fill moves it. An absolute price is that price, once a
+        fill exists.
+        """
+        if self._exit_config(kind) is None or self.filled_base <= 0:
+            return None
+        price = self._trigger_price_for(kind)
         if price is None:
             return None
         return str(price)
@@ -2093,6 +2198,98 @@ class RangeIcebergExecutor(ExecutorBase):
             return price >= trigger if long_entry else price <= trigger
         return price <= trigger if long_entry else price >= trigger
 
+    def _entry_clock_close_type(self) -> Optional[CloseType]:
+        if self._time_limit_reached():
+            return CloseType.TIME_LIMIT
+        if self._expired():
+            return CloseType.EXPIRED
+        return None
+
+    async def _handle_entry_clock(self) -> bool:
+        """
+        Apply the entry duration or expiry.
+
+        True means the caller should not place more entry orders this tick.
+        A clock that ends with a fill and a configured exit cancels the rest
+        of the entry and arms the exit. It does not stop the executor. Once
+        an exit is armed or active, a later tick does not apply the clock again.
+        """
+        if self._entry_clock_handled:
+            return False
+        if self._exit_phase in ("cancelling_entry", "executing", "done"):
+            self._entry_clock_handled = True
+            return False
+        close_type = self._entry_clock_close_type()
+        if close_type is None:
+            return False
+        if close_type == CloseType.TIME_LIMIT:
+            self._advance_schedule(force_end=True)
+        if self.filled_base > 0 and self._exits_configured():
+            self._entry_clock_handled = True
+            self._cancel_entry_orders_for_exit()
+            if self._exit_phase == "idle":
+                self._exit_phase = "armed"
+            await self._control_exit()
+            return True
+        if self._exit_phase in ("armed", "resting") or self._exit_active is not None:
+            self._entry_clock_handled = True
+            return True
+        self.early_stop(keep_position=False, close_type=close_type)
+        return True
+
+    def _limit_take_profit_config(self) -> bool:
+        cfg = self.config.take_profit
+        return bool(
+            cfg is not None
+            and cfg.execution == ExitExecution.SINGLE
+            and cfg.order_type == ExitOrderType.LIMIT
+        )
+
+    def _resting_limit_applies(self) -> bool:
+        """
+        A single limit take profit can rest before the entry is finished.
+
+        ON_FULL_FILL waits for the entry to finish, or for the entry clock to
+        end. ON_ANY_FILL rests as soon as any size is filled. The stop loss
+        taking over, or a forced market close, is not this path.
+        """
+        if not self._limit_take_profit_config():
+            return False
+        if self._exit_active == "stop_loss" or self._exit_force_market:
+            return False
+        if self.filled_base <= 0 or self._exit_phase == "done":
+            return False
+        if self._take_profit_price_is_adverse():
+            return False
+        if self.config.exit_arming == ExitArming.ON_FULL_FILL:
+            return self._execution_complete() or self._entry_clock_handled or self._exit_phase in (
+                "armed",
+                "resting",
+                "executing",
+            )
+        return True
+
+    def _take_profit_price_is_adverse(self) -> bool:
+        cfg = self.config.take_profit
+        if cfg is None or cfg.price is None or self.config.allow_adverse_take_profit:
+            return False
+        average = self.average_fill_price
+        if average <= 0:
+            return False
+        if self.config.side == TradeType.BUY and cfg.price <= average:
+            self._exit_error = (
+                f"take_profit price ({cfg.price}) is not above the average entry ({average}). "
+                "Set allow_adverse_take_profit to place it."
+            )
+            return True
+        if self.config.side == TradeType.SELL and cfg.price >= average:
+            self._exit_error = (
+                f"take_profit price ({cfg.price}) is not below the average entry ({average}). "
+                "Set allow_adverse_take_profit to place it."
+            )
+            return True
+        return False
+
     def _take_profit_wants_to_start(self, price: Decimal) -> bool:
         cfg = self.config.take_profit
         if cfg is None:
@@ -2100,8 +2297,12 @@ class RangeIcebergExecutor(ExecutorBase):
         trigger = self._trigger_price_for("take_profit")
         if trigger is None:
             return False
+        # A resting limit is posted by _maintain_resting_take_profit. It is not
+        # a price trigger and it does not cancel the entry.
         if cfg.execution == ExitExecution.SINGLE and cfg.order_type == ExitOrderType.LIMIT:
-            return True
+            return False
+        if self._take_profit_price_is_adverse():
+            return False
         return self._price_reached("take_profit", trigger, price)
 
     def _stop_wants_to_start(self, price: Decimal) -> bool:
@@ -2118,18 +2319,15 @@ class RangeIcebergExecutor(ExecutorBase):
 
     def _take_profit_is_committed(self) -> bool:
         """
-        A resting take-profit limit can still be replaced by the stop loss.
-        A take profit that has already filled, or a take-profit market or iceberg
-        that has sent an order, is the close and is not replaced.
+        An unfinished take profit never blocks the stop loss.
+
+        A partial limit fill and a live iceberg child are both unfinished while
+        the open position is still at least a minimum order. The stop cancels
+        the remainder and closes what is left.
         """
         if self._exit_active != "take_profit":
             return False
-        cfg = self.config.take_profit
-        if cfg is None:
-            return True
-        if cfg.execution == ExitExecution.ICEBERG or cfg.order_type == ExitOrderType.MARKET:
-            return self._exit_has_live_order()
-        return self._exit_has_fill()
+        return self._position_base() < self._min_order_size()
 
     def _exit_has_live_order(self) -> bool:
         return any(slot.order_id and slot.order_id != "skipped" and not slot.retired for slot in self._exit_slices)
@@ -2138,37 +2336,130 @@ class RangeIcebergExecutor(ExecutorBase):
         """
         Pick the exit that should be working.
 
-        A stop-loss iceberg that has started stays selected even if price returns
-        to the take-profit side. That close runs until the filled amount is closed.
+        A stop loss that has started stays selected even if price returns to
+        the take-profit side. Until the take profit has closed the position,
+        a stop trigger replaces it.
         """
         if self._exit_active == "stop_loss":
             return "stop_loss"
         price = self._reference_price()
         stop_hit = self._stop_wants_to_start(price)
-        if self._exit_active == "take_profit":
-            if stop_hit and not self._take_profit_is_committed():
-                return "stop_loss"
-            return "take_profit"
-        if stop_hit:
+        if stop_hit and not self._take_profit_is_committed():
             return "stop_loss"
+        if self._exit_active == "take_profit":
+            return "take_profit"
         if self._take_profit_wants_to_start(price):
             return "take_profit"
         return None
 
+    def _exit_retry_blocks(self) -> bool:
+        if self._exit_retry_after is None:
+            return False
+        return float(self._strategy.current_timestamp) + 1e-9 < float(self._exit_retry_after)
+
+    def _note_exit_failure(self, order_id: str):
+        """
+        Count an exit rejection on its own budget.
+
+        The entry retry counter is left alone. While the position is open, the
+        budget ends in one market close, not in FAILED. FAILED is used only
+        after that market close has also been rejected.
+        """
+        self._exit_failure_count += 1
+        step = max(float(self.config.min_order_interval or 0), 0.5)
+        delay = min(30.0, step * (2 ** (self._exit_failure_count - 1)))
+        self._exit_retry_after = float(self._strategy.current_timestamp) + delay
+        budget = max(int(self._max_retries), 1)
+        if self._exit_failure_count <= budget:
+            self._exit_error = (
+                f"Exit order {order_id} was rejected ({self._exit_failure_count} of {budget}). "
+                "The close will retry. The position stays open."
+            )
+            return
+        if self._position_base() > 0 and not self._exit_market_attempted:
+            self._exit_force_single = True
+            self._exit_force_market = True
+            self._exit_market_attempted = True
+            self._exit_retry_after = None
+            self._exit_error = (
+                f"Exit order {order_id} was rejected {self._exit_failure_count} times. "
+                "Sending a market close for the open position."
+            )
+            return
+        self._exit_error = (
+            f"Could not close the open position after {self._exit_failure_count} exit rejections, "
+            "including a market close."
+        )
+        if self._position_base() > 0:
+            self.close_type = CloseType.FAILED
+            self.early_stop(close_type=CloseType.FAILED)
+
     async def _control_exit(self):
         if self._exit_phase == "done" or not self._exits_configured() or self.filled_base <= 0:
             return
-        kind = self._choose_exit()
-        if kind is None:
-            if self._execution_complete() and self._exit_phase == "idle":
+        if self._exit_retry_blocks():
+            if self._exit_phase == "idle":
                 self._exit_phase = "armed"
             return
-        self._activate_exit(kind)
-        if self._entry_blocks_exit() or self._exit_orders_block():
-            self._exit_phase = "cancelling_entry"
+        kind = self._choose_exit()
+        if kind == "stop_loss" or (kind == "take_profit" and not self._limit_take_profit_config()):
+            if self._unknown_order_ids and self._exit_phase not in ("cancelling_entry", "executing"):
+                if self._exit_phase == "idle":
+                    self._exit_phase = "armed"
+                return
+            self._activate_exit(kind)
+            if self._entry_blocks_exit() or self._exit_orders_block():
+                self._exit_phase = "cancelling_entry"
+                return
+            self._exit_phase = "executing"
+            await self._execute_exit()
             return
-        self._exit_phase = "executing"
-        await self._execute_exit()
+        if self._resting_limit_applies() or (
+            kind == "take_profit" and self._limit_take_profit_config() and not self._exit_force_market
+        ):
+            await self._maintain_resting_take_profit()
+            return
+        if self._exit_force_market and kind is not None:
+            if self._unknown_order_ids:
+                return
+            self._activate_exit(kind)
+            if self._entry_blocks_exit() or self._exit_orders_block():
+                self._exit_phase = "cancelling_entry"
+                return
+            self._exit_phase = "executing"
+            await self._execute_exit()
+            return
+        if kind is None:
+            if (self._execution_complete() or self._entry_clock_handled) and self._exit_phase == "idle":
+                self._exit_phase = "armed"
+            return
+
+    async def _maintain_resting_take_profit(self):
+        """
+        Post or grow a reduce-only limit take profit without cancelling the entry.
+
+        The working close size is the open position. A new entry fill adds
+        another limit for the shortfall. The total never exceeds the fill.
+        """
+        self._refresh_exit_orders()
+        self._exit_active = "take_profit"
+        self._exit_trigger_price = self._trigger_price_for("take_profit")
+        if self._exit_done_closing():
+            if self._exit_filled_base() > 0 or self._position_base() <= 0:
+                self._finish_exit()
+            return
+        if self._exit_phase not in ("cancelling_entry", "executing"):
+            self._exit_phase = "resting"
+        if self._unknown_order_ids:
+            return
+        if not self._rate_limit_allows_place():
+            return
+        amount = self._cap_exit_amount(self._position_base())
+        if amount <= 0:
+            return
+        price = self._quantize_exit_price(self._exit_trigger_price or self._reference_price())
+        order_id = self._submit_exit(price, amount, OrderType.LIMIT)
+        self._track_exit(price, amount, order_id)
 
     def _activate_exit(self, kind: str):
         if self._exit_active == kind and self._exit_phase in ("cancelling_entry", "executing"):
@@ -2179,6 +2470,7 @@ class RangeIcebergExecutor(ExecutorBase):
             self._exit_schedule = None
             self._exit_schedule_state = None
             self._exit_force_single = False
+            self._exit_force_market = False
             self._exit_started_at = None
             self._exit_paused_seconds = 0.0
         self._exit_active = kind
@@ -2238,10 +2530,62 @@ class RangeIcebergExecutor(ExecutorBase):
             else:
                 self.close_execution_finished()
             return
+        if self._unknown_order_ids:
+            return
+        if self._stop_iceberg_should_market():
+            self._cancel_exit_orders()
+            if self._exit_orders_block():
+                self._exit_phase = "cancelling_entry"
+                return
+            self._exit_force_single = True
+            self._exit_force_market = True
+            await self._execute_exit_single()
+            return
         if self._active_is_single():
             await self._execute_exit_single()
             return
         await self._execute_exit_iceberg()
+
+    def _stop_iceberg_should_market(self) -> bool:
+        """
+        A stop-loss iceberg that cannot rest on the trigger side, or that has
+        not filled within the fallback time, closes the rest with a market order.
+        """
+        if self._exit_active != "stop_loss" or self._exit_force_market:
+            return False
+        cfg = self.config.stop_loss
+        if cfg is None or cfg.execution != ExitExecution.ICEBERG:
+            return False
+        if self._stop_bounds_are_wrong():
+            self._exit_error = (
+                "Stop loss price bounds are on the wrong side of the trigger. "
+                "Closing the open position with a market order."
+            )
+            return True
+        if self._exit_filled_base() > 0:
+            return False
+        if self._exit_started_at is None:
+            return False
+        return self._exit_elapsed() >= float(self.config.stop_loss_fallback_seconds)
+
+    def _stop_bounds_are_wrong(self) -> bool:
+        cfg = self.config.stop_loss
+        if cfg is None or cfg.execution != ExitExecution.ICEBERG:
+            return False
+        trigger = self._trigger_price_for("stop_loss")
+        if trigger is None:
+            return False
+        long_entry = self.config.side == TradeType.BUY
+        if cfg.limit_price is not None:
+            if long_entry and cfg.limit_price > trigger:
+                return True
+            if not long_entry and cfg.limit_price < trigger:
+                return True
+        if long_entry and cfg.price_low is not None and cfg.price_low > trigger:
+            return True
+        if not long_entry and cfg.price_high is not None and cfg.price_high < trigger:
+            return True
+        return False
 
     def _active_is_single(self) -> bool:
         cfg = self._active_exit_config()
@@ -2274,7 +2618,12 @@ class RangeIcebergExecutor(ExecutorBase):
         if amount <= 0:
             return
         cfg = self._active_exit_config()
-        market = self._exit_active == "stop_loss" or cfg is None or cfg.order_type == ExitOrderType.MARKET
+        market = (
+            self._exit_force_market
+            or self._exit_active == "stop_loss"
+            or cfg is None
+            or cfg.order_type == ExitOrderType.MARKET
+        )
         if market:
             order_type = OrderType.MARKET
             price = Decimal("NaN")
@@ -2409,7 +2758,7 @@ class RangeIcebergExecutor(ExecutorBase):
         desired = self._desired_price(
             side=self._exit_side(),
             limit_price=cfg.limit_price,
-            cap_behavior=self.config.cap_behavior,
+            cap_behavior=self._exit_cap_behavior(),
             post_only=False,
         )
         if desired is None:
@@ -2459,7 +2808,7 @@ class RangeIcebergExecutor(ExecutorBase):
             desired = self._desired_price(
                 side=self._exit_side(),
                 limit_price=cfg.limit_price,
-                cap_behavior=self.config.cap_behavior,
+                cap_behavior=self._exit_cap_behavior(),
                 post_only=False,
             )
             if desired is None:
@@ -2524,7 +2873,41 @@ class RangeIcebergExecutor(ExecutorBase):
             return 0.0
         return self._elapsed_since(self._exit_started_at, self._exit_paused_seconds)
 
+    def _exit_cap_behavior(self) -> CapBehavior:
+        """
+        A stop-loss iceberg always rests at the cap.
+
+        Copying the entry WAIT behavior would send nothing when the market is
+        through the floor or the cap, and the stop would never fire.
+        """
+        if self._exit_active == "stop_loss":
+            return CapBehavior.REST_AT_CAP
+        return self.config.cap_behavior
+
     def _exit_placeable(self) -> Decimal:
+        if not self._exit_range:
+            # An up-to close is sized from the position held now, not from the
+            # size captured when the exit first triggered. A fill that arrives
+            # after the entry cancel is confirmed is still closed.
+            live_total = self._position_base() + self._exit_filled_base()
+            if self._exit_schedule is None:
+                opened = live_total
+                skipped = Decimal("0")
+            else:
+                scheduled = self._exit_schedule.opened(self._exit_elapsed())
+                planned = self._exit_plan_base if self._exit_plan_base > 0 else live_total
+                if planned <= 0:
+                    fraction = Decimal("1")
+                else:
+                    fraction = scheduled / planned
+                    if fraction > 1:
+                        fraction = Decimal("1")
+                opened = live_total * fraction
+                skipped = Decimal("0")
+            remaining = opened - skipped - self._exit_filled_base() - self._exit_open_base()
+            if remaining < 0:
+                return Decimal("0")
+            return remaining
         if self._exit_schedule is None:
             opened = self._exit_plan_base if self._exit_plan_base > 0 else self._position_base()
             skipped = Decimal("0")
@@ -2736,6 +3119,183 @@ class RangeIcebergExecutor(ExecutorBase):
         elif quote > previous_quote:
             self._exit_accounted_quote[slot.order_id] = quote
 
+    def _child_order_ids(self) -> List[str]:
+        ids: List[str] = []
+        for slot in self._slices:
+            if slot.order_id and slot.order_id != "skipped" and slot.order_id not in ids:
+                ids.append(slot.order_id)
+        for order_id in self._public_exit_order_ids():
+            if order_id not in ids:
+                ids.append(order_id)
+        return ids
+
+    def _public_exit_order_ids(self) -> List[str]:
+        ids: List[str] = []
+        for order_id in self._exit_order_ids:
+            if order_id and order_id != "skipped" and order_id not in ids:
+                ids.append(order_id)
+        for slot in self._exit_slices:
+            if slot.order_id and slot.order_id != "skipped" and slot.order_id not in ids:
+                ids.append(slot.order_id)
+        return ids
+
+    def _public_exit_state(self) -> ExitState:
+        """
+        The state the API and Condor should display.
+
+        A resting limit take profit is RESTING until it starts to fill. Waiting
+        on a stop, or on a market or iceberg take profit, is ARMED. Sending the
+        close is CLOSING. Cancelling the entry or the other exit after a
+        trigger is TRIGGERED.
+        """
+        if self._exit_phase == "done":
+            return ExitState.DONE
+        if self._exit_phase == "cancelling_entry":
+            return ExitState.TRIGGERED
+        if self._exit_phase == "executing":
+            if self._resting_untriggered_limit():
+                return ExitState.RESTING
+            return ExitState.CLOSING
+        if self._exit_phase == "resting":
+            if self._exit_filled_base() > 0:
+                return ExitState.CLOSING
+            return ExitState.RESTING
+        if self._exit_phase == "armed" or self._exit_active is not None:
+            return ExitState.ARMED
+        if not self._exits_configured() or self.filled_base <= 0:
+            return ExitState.NONE
+        if self.config.exit_arming == ExitArming.ON_ANY_FILL or self._execution_complete() or self._entry_clock_handled:
+            return ExitState.ARMED
+        return ExitState.NONE
+
+    def _resting_untriggered_limit(self) -> bool:
+        return (
+            self._limit_take_profit_config()
+            and self._exit_active == "take_profit"
+            and self._exit_filled_base() <= 0
+            and not self._exit_force_market
+        )
+
+    def _protective_stop_supported(self) -> bool:
+        connector = self.connectors[self.config.connector_name]
+        return self._real_callable(connector, "place_position_stop_order") is not None
+
+    def _protective_stop_enabled(self) -> bool:
+        flag = self.config.protective_exchange_stop
+        if flag is False:
+            return False
+        if flag is True:
+            return True
+        return self._protective_stop_supported()
+
+    def _exchange_stop_is_due(self) -> bool:
+        if self.config.stop_loss is None or self.filled_base <= 0:
+            return False
+        if self._exit_phase == "done" or self._position_base() < self._min_order_size():
+            return False
+        if self.config.exit_arming == ExitArming.ON_ANY_FILL:
+            return True
+        return (
+            self._execution_complete()
+            or self._entry_clock_handled
+            or self._exit_phase in ("armed", "resting", "cancelling_entry", "executing")
+        )
+
+    def _exchange_position_id(self):
+        connector = self.connectors[self.config.connector_name]
+        finder = self._real_callable(connector, "_position_id_for_order")
+        if finder is not None:
+            try:
+                found = finder(
+                    self.config.trading_pair,
+                    self._exit_side(),
+                    PositionAction.CLOSE,
+                    True,
+                )
+            except TypeError:
+                found = None
+            if found not in (None, "", 0, "0"):
+                return found
+        ids = getattr(connector, "_position_ids", None)
+        if isinstance(ids, dict):
+            side = PositionSide.LONG if self.config.side == TradeType.BUY else PositionSide.SHORT
+            found = ids.get((self.config.trading_pair, side))
+            if found not in (None, "", 0, "0"):
+                return found
+        return None
+
+    async def _sync_exchange_stop(self):
+        """
+        Place or refresh the exchange-side stop, and cancel it once the
+        position is flat or the take profit has finished.
+
+        early_stop does not call this with a cancel. The stop stays on the
+        book through keep_position shutdown.
+        """
+        if self._exit_phase == "done" or (self._exchange_stop_order_id and self._position_base() <= 0):
+            await self._cancel_exchange_stop()
+            return
+        if not self._protective_stop_enabled() or not self._exchange_stop_is_due():
+            return
+        trigger = self._trigger_price_for("stop_loss")
+        amount = self._position_base()
+        if trigger is None or amount < self._min_order_size():
+            return
+        if (
+            self._exchange_stop_order_id
+            and self._exchange_stop_amount == amount
+            and self._exchange_stop_price == trigger
+        ):
+            return
+        connector = self.connectors[self.config.connector_name]
+        place = self._real_callable(connector, "place_position_stop_order")
+        if place is None:
+            if self.config.protective_exchange_stop is True and not self._exit_error:
+                self._exit_error = (
+                    "protective_exchange_stop is on, but the connector has no place_position_stop_order."
+                )
+            return
+        position_id = self._exchange_position_id()
+        if position_id is None:
+            return
+        if self._exchange_stop_order_id:
+            await self._cancel_exchange_stop()
+        try:
+            order_id = place(
+                trading_pair=self.config.trading_pair,
+                position_id=str(position_id),
+                amount=amount,
+                stop_loss_price=trigger,
+            )
+            if hasattr(order_id, "__await__"):
+                order_id = await order_id
+        except Exception:
+            self.logger().exception("Could not place the exchange protective stop.")
+            return
+        if order_id in (None, ""):
+            return
+        self._exchange_stop_order_id = str(order_id)
+        self._exchange_stop_amount = amount
+        self._exchange_stop_price = trigger
+
+    async def _cancel_exchange_stop(self):
+        order_id = self._exchange_stop_order_id
+        if not order_id:
+            return
+        connector = self.connectors[self.config.connector_name]
+        cancel = self._real_callable(connector, "cancel_stop_orders")
+        if cancel is not None:
+            try:
+                result = cancel([order_id])
+                if hasattr(result, "__await__"):
+                    await result
+            except Exception:
+                self.logger().exception("Could not cancel the exchange protective stop %s.", order_id)
+                return
+        self._exchange_stop_order_id = None
+        self._exchange_stop_amount = Decimal("0")
+        self._exchange_stop_price = None
+
     def _exit_config_view(self, cfg: Optional[RangeIcebergExitConfig]):
         if cfg is None:
             return None
@@ -2769,6 +3329,8 @@ class RangeIcebergExecutor(ExecutorBase):
         return {
             "active": self._exit_active,
             "status": self._exit_phase,
+            "exit_state": self._public_exit_state().value,
+            "exchange_stop_order_id": self._exchange_stop_order_id,
             "trigger_price": None if self._exit_trigger_price is None else str(self._exit_trigger_price),
             "entry_filled_base": str(self.filled_base),
             "entry_filled_quote": str(self.filled_amount_quote),
@@ -2798,16 +3360,45 @@ class RangeIcebergExecutor(ExecutorBase):
             return
         blob = custom_info.get("exit")
         if not isinstance(blob, dict):
-            return
+            public_state = str(custom_info.get("exit_state") or "")
+            phase_for_state = {
+                "ARMED": "armed",
+                "RESTING": "resting",
+                "TRIGGERED": "cancelling_entry",
+                "CLOSING": "executing",
+                "DONE": "done",
+            }
+            if public_state not in phase_for_state:
+                return
+            blob = {
+                "status": phase_for_state[public_state],
+                "active": custom_info.get("exit_active"),
+                "order_ids": list(custom_info.get("exit_order_ids") or []),
+                "entry_filled_base": custom_info.get("filled_base") or "0",
+                "entry_filled_quote": custom_info.get("filled_quote") or "0",
+                "filled_by_order": {},
+                "exchange_stop_order_id": custom_info.get("exchange_stop_order_id"),
+            }
         status = str(blob.get("status") or "idle")
         active = blob.get("active")
         if active not in ("take_profit", "stop_loss"):
             active = None
         if status == "idle" and active is None and not blob.get("filled_by_order"):
             return
-        if status not in ("idle", "armed", "cancelling_entry", "executing", "done"):
+        if status not in ("idle", "armed", "resting", "cancelling_entry", "executing", "done"):
             status = "idle"
+        public_state = str(custom_info.get("exit_state") or blob.get("exit_state") or "")
+        if status == "idle" and public_state in ("ARMED", "RESTING", "TRIGGERED", "CLOSING", "DONE"):
+            status = {
+                "ARMED": "armed",
+                "RESTING": "resting",
+                "TRIGGERED": "cancelling_entry",
+                "CLOSING": "executing",
+                "DONE": "done",
+            }[public_state]
         self._exit_active = active
+        if self._exit_active is None and status == "resting":
+            self._exit_active = "take_profit"
         self._exit_phase = status
         trigger = blob.get("trigger_price")
         self._exit_trigger_price = None if trigger in (None, "") else Decimal(str(trigger))
@@ -2818,6 +3409,11 @@ class RangeIcebergExecutor(ExecutorBase):
             self._accounted_quote_by_order["restored-entry"] = entry_quote
             self._accounted_fill_base = sum(self._accounted_fill_by_order.values(), Decimal("0"))
             self._accounted_fill_quote = sum(self._accounted_quote_by_order.values(), Decimal("0"))
+        stop_id = custom_info.get("exchange_stop_order_id", blob.get("exchange_stop_order_id"))
+        if stop_id not in (None, ""):
+            self._exchange_stop_order_id = str(stop_id)
+            self._exchange_stop_amount = self._position_base()
+            self._exchange_stop_price = self._trigger_price_for("stop_loss")
         filled_by_order = blob.get("filled_by_order") or {}
         if isinstance(filled_by_order, dict):
             for order_id, fills in filled_by_order.items():

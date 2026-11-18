@@ -89,10 +89,33 @@ class ExitArming(str, Enum):
     ON_FULL_FILL waits until the entry has finished filling. ON_ANY_FILL arms as
     soon as any amount is filled, so a partial fill can be protected. The exit
     size is the filled amount, minus what the exit has already closed.
+
+    A single limit take profit is not a trigger. ON_ANY_FILL posts that limit
+    for the filled amount and leaves the entry running. A market take profit,
+    an iceberg take profit, and a stop loss are triggers: they cancel the
+    remaining entry and close.
     """
 
     ON_FULL_FILL = "ON_FULL_FILL"
     ON_ANY_FILL = "ON_ANY_FILL"
+
+
+class ExitState(str, Enum):
+    """
+    Public exit progress in custom_info["exit_state"].
+
+    NONE means no exit is eligible. ARMED means an exit is waiting for price.
+    RESTING means a limit take profit is on the book and has not started the close.
+    TRIGGERED means a trigger fired and entry or the other exit is being cancelled.
+    CLOSING means close orders are working. DONE means the exit finished.
+    """
+
+    NONE = "NONE"
+    ARMED = "ARMED"
+    RESTING = "RESTING"
+    TRIGGERED = "TRIGGERED"
+    CLOSING = "CLOSING"
+    DONE = "DONE"
 
 
 class RangeIcebergExitConfig(BaseModel):
@@ -119,11 +142,19 @@ class RangeIcebergExitConfig(BaseModel):
     for a range ladder. Set one of those price styles. A cancelled range rung is
     posted again for its unfilled remainder.
 
-    Take profit and stop loss are mutually exclusive. The first one that starts
-    sending close orders is the close. A take-profit limit that has not filled
-    yet is cancelled if the stop loss triggers, and the stop loss then runs to
-    completion. Once a stop-loss iceberg has started, a move back through the
-    take-profit price does not cancel it and does not start the take profit.
+    Take profit and stop loss can both be set. The stop loss can take over any
+    unfinished take profit, including a limit that has already filled part of
+    the position and an iceberg child that is still resting. It cancels the
+    take-profit remainder and closes what is still open. Once a stop loss has
+    started, a move back through the take-profit price does not cancel it and
+    does not start the take profit.
+
+    A stop-loss iceberg must be able to trade when the trigger prints. For a
+    long, the sell floor (limit_price or price_low) has to be at or below the
+    trigger. For a short, the buy cap (limit_price or price_high) has to be at
+    or above the trigger. A percent trigger is checked when the average fill
+    is known. The stop loss always rests at that cap, and if nothing has filled
+    when the fallback time ends it closes the rest with a market order.
     """
 
     percent: Optional[Decimal] = None
@@ -227,6 +258,23 @@ class RangeIcebergExecutorConfig(ExecutorConfigBase):
     RangeIcebergExitConfig. exit_arming chooses whether that close waits for a full fill.
     An iceberg exit schedule starts when that exit triggers. It does not wait for a
     first exit fill.
+
+    When the entry duration or expiry ends with a fill and an exit is configured,
+    the remaining entry is cancelled and the exit is armed on the filled amount.
+    Once an exit is armed or active, the entry clock no longer stops the executor.
+
+    early_stop cancels software entry and exit orders and does not close the
+    filled position. keep_position=True records POSITION_HOLD. The same stop is
+    what the API uses on shutdown. A protective exchange stop, when one was
+    placed, is left working across that shutdown and across a crash. It is
+    cancelled when the position is closed or the take profit finishes.
+    Resuming from custom_info restores an exit_state of ARMED, RESTING, or CLOSING.
+
+    protective_exchange_stop defaults to on when the connector implements
+    place_position_stop_order, and off otherwise. Set it false to skip the
+    exchange stop. allow_adverse_take_profit permits a take-profit price that
+    is not past the average entry. stop_loss_fallback_seconds is how long a
+    stop-loss iceberg may rest with no fill before the remainder is a market order.
     """
 
     type: Literal["range_iceberg_executor"] = "range_iceberg_executor"
@@ -265,6 +313,9 @@ class RangeIcebergExecutorConfig(ExecutorConfigBase):
     take_profit: Optional[RangeIcebergExitConfig] = None
     stop_loss: Optional[RangeIcebergExitConfig] = None
     exit_arming: ExitArming = ExitArming.ON_FULL_FILL
+    allow_adverse_take_profit: bool = False
+    protective_exchange_stop: Optional[bool] = None
+    stop_loss_fallback_seconds: float = 30
 
     @field_validator("side", mode="before")
     @classmethod
@@ -386,6 +437,7 @@ class RangeIcebergExecutorConfig(ExecutorConfigBase):
                 require_positive("schedule_interval", interval)
         elif self.schedule_slices is not None or self.schedule_interval is not None:
             raise ValueError("schedule_slices and schedule_interval need a duration")
+        require_positive("stop_loss_fallback_seconds", self.stop_loss_fallback_seconds)
         if self.reduce_only and (self.take_profit is not None or self.stop_loss is not None):
             raise ValueError(
                 "take_profit and stop_loss cannot be set when reduce_only is true, "
@@ -393,6 +445,8 @@ class RangeIcebergExecutorConfig(ExecutorConfigBase):
             )
         self._prepare_exit("take_profit", self.take_profit, is_stop=False)
         self._prepare_exit("stop_loss", self.stop_loss, is_stop=True)
+        self._reject_adverse_take_profit_price()
+        self._reject_stop_bounds_on_the_wrong_side()
         if (
             self.take_profit is not None
             and self.stop_loss is not None
@@ -422,3 +476,75 @@ class RangeIcebergExecutorConfig(ExecutorConfigBase):
             exit_config.order_type = ExitOrderType.MARKET
         elif exit_config.order_type is None:
             exit_config.order_type = ExitOrderType.LIMIT
+
+    def _reject_adverse_take_profit_price(self):
+        """
+        Reject a take-profit price that cannot be past the average entry.
+
+        A buy range fills at or above price_low, so a take-profit price at or
+        below that low is not a profit. A sell range fills at or below
+        price_high, so a take-profit price at or above that high is not a
+        profit. A sell up-to fills at or above limit_price, so a take-profit
+        price at or above that limit is not a profit. Set
+        allow_adverse_take_profit to keep the price anyway. A percent trigger
+        is always on the profitable side of the average. A price that can still
+        land on the right side of the eventual average is checked again once
+        that average exists.
+        """
+        cfg = self.take_profit
+        if cfg is None or cfg.price is None or self.allow_adverse_take_profit:
+            return
+        if self.side == TradeType.BUY and self.mode != ExecutionMode.UP_TO and self.price_low is not None:
+            if cfg.price <= self.price_low:
+                raise ValueError(
+                    f"take_profit price ({cfg.price}) must be above price_low ({self.price_low}) "
+                    "for a BUY, because the average entry cannot be below that price. "
+                    "Set allow_adverse_take_profit to allow it."
+                )
+        if self.side == TradeType.SELL and self.mode != ExecutionMode.UP_TO and self.price_high is not None:
+            if cfg.price >= self.price_high:
+                raise ValueError(
+                    f"take_profit price ({cfg.price}) must be below price_high ({self.price_high}) "
+                    "for a SELL, because the average entry cannot be above that price. "
+                    "Set allow_adverse_take_profit to allow it."
+                )
+        if self.side == TradeType.SELL and self.mode == ExecutionMode.UP_TO and self.limit_price is not None:
+            if cfg.price >= self.limit_price:
+                raise ValueError(
+                    f"take_profit price ({cfg.price}) must be below limit_price ({self.limit_price}) "
+                    "for a SELL up-to, because the average entry cannot be below that price. "
+                    "Set allow_adverse_take_profit to allow it."
+                )
+
+    def _reject_stop_bounds_on_the_wrong_side(self):
+        """
+        A stop-loss iceberg whose bound sits on the wrong side of an absolute
+        trigger would rest away from the market. Percent triggers are checked
+        once the average fill is known.
+        """
+        cfg = self.stop_loss
+        if cfg is None or cfg.execution != ExitExecution.ICEBERG or cfg.price is None:
+            return
+        trigger = cfg.price
+        if self.side == TradeType.BUY:
+            if cfg.limit_price is not None and cfg.limit_price > trigger:
+                raise ValueError(
+                    f"stop_loss limit_price ({cfg.limit_price}) must be less than or equal to "
+                    f"the trigger ({trigger}) for a BUY, so the sell does not rest above the market"
+                )
+            if cfg.price_low is not None and cfg.price_low > trigger:
+                raise ValueError(
+                    f"stop_loss price_low ({cfg.price_low}) must be less than or equal to "
+                    f"the trigger ({trigger}) for a BUY, so the sell does not rest above the market"
+                )
+            return
+        if cfg.limit_price is not None and cfg.limit_price < trigger:
+            raise ValueError(
+                f"stop_loss limit_price ({cfg.limit_price}) must be greater than or equal to "
+                f"the trigger ({trigger}) for a SELL, so the buy does not rest below the market"
+            )
+        if cfg.price_high is not None and cfg.price_high < trigger:
+            raise ValueError(
+                f"stop_loss price_high ({cfg.price_high}) must be greater than or equal to "
+                f"the trigger ({trigger}) for a SELL, so the buy does not rest below the market"
+            )
