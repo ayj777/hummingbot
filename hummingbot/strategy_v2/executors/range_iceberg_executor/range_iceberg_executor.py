@@ -144,8 +144,10 @@ class RangeIcebergExecutor(ExecutorBase):
     to the closable quantity: the open position minus resting reduce-only
     close limits. A smaller stop is partial coverage. The take profit is
     cancelled so the stop can grow, then put back at the covered size if the
-    grow fails. After three failed placements the take profit stays up and
-    later retries use only the free closable quantity. A take-profit limit
+    grow fails. After three failed placements the fast retries leave it up.
+    Each slow retry (stop_loss_fallback_seconds) clears it once, places the
+    full stop, and posts it again, even when the free quantity is zero. A
+    take-profit limit
     waits for the stop only while a place is still realistically coming, for
     exchange_stop_hold_seconds (default 5s) or a few attempts. After that the
     take profit is posted, the error stays, and the stop keeps retrying. A
@@ -2813,15 +2815,76 @@ class RangeIcebergExecutor(ExecutorBase):
 
     def _stop_clearing_take_profit_for_room(self) -> bool:
         """
-        True once clearing the take profit would only churn the book.
+        True once a fast retry must not cancel the take profit.
 
         A connector that cannot place a stop never cancels it. After three
-        failed placements the take profit stays at the covered size, and later
-        retries use whatever closable quantity is already free.
+        failed placements the fast path leaves the take profit up. The slow
+        retry still clears it once, places, and puts it back.
         """
         if not self._protective_stop_supported():
             return True
         return self._failed_stop_placements() >= 3
+
+    def _exchange_stop_retry_delay(self, attempts: int) -> float:
+        """
+        0.5s, 1s, then 2s. From the fourth failure, stop_loss_fallback_seconds.
+
+        That is the slow schedule. One attempt per interval stays under
+        5 requests per 2 seconds.
+        """
+        if attempts >= 4:
+            return float(self.config.stop_loss_fallback_seconds)
+        return min(2.0, 0.5 * (2 ** (max(attempts, 1) - 1)))
+
+    def _slow_clear_should_run(self) -> bool:
+        """
+        The slow retry needs the take profit off the book for one place.
+
+        No live stop, or a short one, and the free closable quantity is not
+        the full position. A connector without stop support never clears.
+        """
+        if not self._protective_stop_supported() or self._stop_loss_close_in_progress():
+            return False
+        if self._exchange_stop_place_waiting() or self._failed_stop_placements() < 3:
+            return False
+        position = self._position_base()
+        if position < self._min_order_size():
+            return False
+        needs_full = (
+            not self._exchange_stop_order_ids()
+            or self._exchange_stop_needs_more_size()
+            or self._exchange_stop_price_is_stale()
+        )
+        if not needs_full:
+            return False
+        if self._closable_stop_amount() >= position:
+            return False
+        return self._resting_reduce_only_close_base() > 0
+
+    def _begin_slow_room_clear(self) -> bool:
+        """
+        Cancel the resting take profit and retire it when the cancel is already confirmed.
+
+        True when the closable quantity can now take a full-size stop.
+        """
+        self._cancel_exit_orders()
+        self._tp_grow_cancelling = True
+        self._retire_confirmed_exit_cancels()
+        if self._closable_stop_amount() >= self._min_order_size():
+            self._tp_grow_cancelling = False
+            return True
+        return False
+
+    def _schedule_blocked_stop_retry(self):
+        """
+        Record the next try when no order was sent because the book has no room.
+
+        The error text moves forward with the backoff. It does not stay on an
+        old 'Next try' once that time has passed.
+        """
+        if self._exchange_stop_place_waiting():
+            return
+        self._note_exchange_stop_failure(RuntimeError("closable quantity"))
 
     def _take_profit_size_behind_the_stop(self) -> Decimal:
         covered = self._exchange_stop_amount
@@ -2855,9 +2918,11 @@ class RangeIcebergExecutor(ExecutorBase):
         up, so the covered size does not drop while that cancel is open. It is
         not cancelled again until the stop backoff has passed, and it is put
         back after every attempt that cleared it. After three failed placements
-        it stays at the size the live stop covers. With the take profit off the
-        book, a same-price place sends the full open size and the returned id
-        is stored at that vol. A changed price is moved in place first, then
+        it stays at the size the live stop covers until the slow retry. That
+        retry clears it once, places a full-size stop, and puts it back in the
+        same cycle. With the take profit off the book, a same-price place sends
+        the full open size and the returned id is stored at that vol. A changed
+        price is moved in place first, then
         resized at that price. Cancel-and-place runs only when the reprice
         fails. If that place fails, the old size is put back at the old price
         in the same turn. A failed restore keeps retrying, and the take profit
@@ -2865,6 +2930,9 @@ class RangeIcebergExecutor(ExecutorBase):
         already live is not sent again.
         """
         if self._exchange_stop_restore and not self._exchange_stop_order_ids():
+            if self._exit_working() and self._slow_clear_should_run():
+                if not self._begin_slow_room_clear():
+                    return
             restored = await self._restore_exchange_stops(self._exchange_stop_restore)
             if restored and not self._reduce_only_limit_needs_a_live_stop():
                 if (
@@ -2879,6 +2947,9 @@ class RangeIcebergExecutor(ExecutorBase):
                 return
             await self._repost_take_profit_behind_the_stop()
             return
+        if self._exit_working() and self._slow_clear_should_run():
+            if not self._begin_slow_room_clear():
+                return
         if (self._exit_working() or self._exit_orders_block()) and (
             self._tp_grow_cancelling or not self._stop_clearing_take_profit_for_room()
         ):
@@ -4296,10 +4367,7 @@ class RangeIcebergExecutor(ExecutorBase):
             # not keep placing. One restore at a time stays under MEXC's
             # 5 requests per 2 seconds.
             self._exchange_stop_restore_failures += 1
-            if self._exchange_stop_restore_failures >= 4:
-                delay = float(self.config.stop_loss_fallback_seconds)
-            else:
-                delay = min(2.0, 0.5 * (2 ** (self._exchange_stop_restore_failures - 1)))
+            delay = self._exchange_stop_retry_delay(self._exchange_stop_restore_failures)
             self._exchange_stop_retry_after = now + delay
             self._exchange_stop_error = (
                 f"Could not restore the exchange protective stop ({self._exchange_stop_restore_failures}). "
@@ -4307,7 +4375,7 @@ class RangeIcebergExecutor(ExecutorBase):
             )
             return
         self._exchange_stop_failures += 1
-        delay = min(30.0, 0.5 * (2 ** (self._exchange_stop_failures - 1)))
+        delay = self._exchange_stop_retry_delay(self._exchange_stop_failures)
         self._exchange_stop_retry_after = now + delay
         self._exchange_stop_error = (
             f"Could not place the exchange protective stop ({self._exchange_stop_failures}). "
@@ -4543,9 +4611,11 @@ class RangeIcebergExecutor(ExecutorBase):
         is confirmed. The old id is kept when the cancel fails. If the new
         place fails, the old size is restored in the same turn. A failed
         restore retries at 0.5s, 1s, then 2s, and after four failures at
-        stop_loss_fallback_seconds. The take profit is not cancelled to make
-        room once three placements have failed, or when the connector cannot
-        place a stop. The software stop, a finished exit, and every terminal
+        stop_loss_fallback_seconds. Each slow retry that still needs room
+        clears the take profit once, places, and posts it again. A zero
+        closable quantity still schedules that next try. The fast path stops
+        cancelling after three failures, and a connector that cannot place a
+        stop never cancels. The software stop, a finished exit, and every terminal
         path except keep_position cancel the order instead of refreshing it.
         """
         if self._keep_exchange_stop and self._shutdown_pending:
@@ -4608,7 +4678,8 @@ class RangeIcebergExecutor(ExecutorBase):
         if amount < self._min_order_size():
             if saved:
                 await self._restore_exchange_stops(saved)
-            elif (
+                return
+            if (
                 self._resting_reduce_only_close_base() > 0
                 and not self._tp_grow_cancelling
                 and not self._stop_loss_close_in_progress()
@@ -4616,7 +4687,22 @@ class RangeIcebergExecutor(ExecutorBase):
             ):
                 self._cancel_exit_orders()
                 self._tp_grow_cancelling = True
-            return
+                return
+            if (
+                self._resting_reduce_only_close_base() > 0
+                and not self._stop_loss_close_in_progress()
+                and self._slow_clear_should_run()
+            ):
+                if self._begin_slow_room_clear():
+                    amount = self._closable_stop_amount()
+                else:
+                    return
+            else:
+                self._schedule_blocked_stop_retry()
+                return
+            if amount < self._min_order_size():
+                self._schedule_blocked_stop_retry()
+                return
         if self._live_stop_matches(amount, trigger):
             self._finish_exchange_stop_place(amount, position)
             return

@@ -289,8 +289,9 @@ class RangeIcebergExecutorConfig(ExecutorConfigBase):
     exchange_stop_hold_seconds (default 5) for that stop, including while a
     restore is still failing. After the hold, the take profit is posted and
     the stop keeps retrying. A failed grow leaves the take profit at the size
-    the live stop covers, and after three failed placements it is no longer
-    cancelled to make room. A connector with no place_position_stop_order
+    the live stop covers. After three failed placements the fast retries
+    leave it up, and each slow retry clears it once, places, and posts it
+    again. A connector with no place_position_stop_order
     does not hold the take profit and does not cancel one that is already up.
     A stop-loss exit is never held. exchange_stop_released is saved so a
     resumed stop-loss close does not place a new stop. Every id is listed in

@@ -2195,6 +2195,219 @@ class RangeIcebergExitTests(IsolatedAsyncioWrapperTestCase):
         self.assertNotIn(order_id, cancelled_ids)
         self.assertIn("place_position_stop_order", executor.get_custom_info()["exchange_stop_error"])
 
+    def _drive_stop_retries(self, executor, state, seconds):
+        """
+        One control tick per second. Returns place times, the moment MEXC
+        starts accepting, the moment a full stop is live, and whether a
+        take profit was open at the end of each tick.
+        """
+        accept_at = None
+        recovered_at = None
+        place_times = []
+        seen = len(state["placed"])
+        on_book = []
+        for _ in range(seconds):
+            self._run(executor.control_task())
+            added = len(state["placed"]) - seen
+            place_times.extend([self.now] * added)
+            seen = len(state["placed"])
+            if accept_at is None and state["fail"] == 0 and seen > 0:
+                accept_at = self.now
+            stop = next(iter(state["stops"].values()), None)
+            if (
+                recovered_at is None
+                and stop is not None
+                and stop["amount"] >= Decimal("100")
+            ):
+                recovered_at = self.now
+            on_book.append(bool(self._open_limit_closes()))
+            self.now += 1
+        return place_times, accept_at, recovered_at, on_book
+
+    def _assert_full_stop_and_take_profit(self, executor, state):
+        self.assertEqual(1, len(state["stops"]))
+        stop = next(iter(state["stops"].values()))
+        self.assertEqual(Decimal("100"), stop["amount"])
+        self.assertTrue(executor.get_custom_info()["has_exchange_stop"])
+        opens = self._open_limit_closes()
+        self.assertEqual(1, len(opens))
+        self.assertEqual(Decimal("100"), opens[0].amount)
+
+    def test_k2_two_rejects_then_a_full_stop_and_take_profit(self):
+        state = self._install_mexc_stop_book(fail_times=2)
+        self._mid(Decimal("0.085"))
+        executor = self._executor(
+            take_profit={"price": "0.10", "execution": "SINGLE", "order_type": "LIMIT"},
+            stop_loss={"price": "0.07", "execution": "SINGLE"},
+        )
+        self._open_entry(executor)
+        place_times, accept_at, recovered_at, _on_book = self._drive_stop_retries(executor, state, 300)
+        self._assert_full_stop_and_take_profit(executor, state)
+        self.assertIsNotNone(accept_at)
+        self.assertIsNotNone(recovered_at)
+        self.assertLessEqual(self._places_in_any_two_seconds(place_times), 5)
+
+    def test_k3_three_rejects_then_a_full_stop_and_take_profit(self):
+        state = self._install_mexc_stop_book(fail_times=3)
+        self._mid(Decimal("0.085"))
+        executor = self._executor(
+            take_profit={"price": "0.10", "execution": "SINGLE", "order_type": "LIMIT"},
+            stop_loss={"price": "0.07", "execution": "SINGLE"},
+        )
+        self._open_entry(executor)
+        place_times, _accept_at, recovered_at, _on_book = self._drive_stop_retries(executor, state, 300)
+        self._assert_full_stop_and_take_profit(executor, state)
+        self.assertIsNotNone(recovered_at)
+        self.assertLessEqual(self._places_in_any_two_seconds(place_times), 5)
+
+    def test_k4_four_rejects_recover_on_the_slow_retry(self):
+        state = self._install_mexc_stop_book(fail_times=4)
+        self._mid(Decimal("0.085"))
+        executor = self._executor(
+            take_profit={"price": "0.10", "execution": "SINGLE", "order_type": "LIMIT"},
+            stop_loss={"price": "0.07", "execution": "SINGLE"},
+        )
+        self._open_entry(executor)
+        place_times, accept_at, recovered_at, _on_book = self._drive_stop_retries(executor, state, 300)
+        self._assert_full_stop_and_take_profit(executor, state)
+        self.assertIsNotNone(accept_at)
+        self.assertIsNotNone(recovered_at)
+        self.assertLessEqual(
+            recovered_at - accept_at,
+            float(executor.config.stop_loss_fallback_seconds),
+        )
+        self.assertLessEqual(self._places_in_any_two_seconds(place_times), 5)
+        self.assertGreaterEqual(len(state["placed"]), 5)
+
+    def test_k6_six_rejects_recover_on_the_slow_retry(self):
+        state = self._install_mexc_stop_book(fail_times=6)
+        self._mid(Decimal("0.085"))
+        executor = self._executor(
+            take_profit={"price": "0.10", "execution": "SINGLE", "order_type": "LIMIT"},
+            stop_loss={"price": "0.07", "execution": "SINGLE"},
+        )
+        self._open_entry(executor)
+        place_times, accept_at, recovered_at, _on_book = self._drive_stop_retries(executor, state, 300)
+        self._assert_full_stop_and_take_profit(executor, state)
+        self.assertLessEqual(
+            recovered_at - accept_at,
+            float(executor.config.stop_loss_fallback_seconds),
+        )
+        self.assertLessEqual(self._places_in_any_two_seconds(place_times), 5)
+
+    def test_k4_no_tp_four_rejects_still_place_the_stop(self):
+        state = self._install_mexc_stop_book(fail_times=4)
+        self._mid(Decimal("0.085"))
+        executor = self._executor(stop_loss={"price": "0.07", "execution": "SINGLE"})
+        self._open_entry(executor)
+        _times, _accept_at, recovered_at, on_book = self._drive_stop_retries(executor, state, 300)
+        self.assertIsNotNone(recovered_at)
+        self.assertEqual(1, len(state["stops"]))
+        self.assertEqual(Decimal("100"), next(iter(state["stops"].values()))["amount"])
+        self.assertTrue(executor.get_custom_info()["has_exchange_stop"])
+        self.assertFalse(any(on_book))
+        self.assertEqual([], self._open_limit_closes())
+
+    def test_permanent_stop_rejects_clear_the_take_profit_for_at_most_two_ticks(self):
+        state = self._install_mexc_stop_book(fail_times=100)
+        self._mid(Decimal("0.085"))
+        executor = self._executor(
+            take_profit={"price": "0.10", "execution": "SINGLE", "order_type": "LIMIT"},
+            stop_loss={"price": "0.07", "execution": "SINGLE"},
+        )
+        self._open_entry(executor)
+        place_times, _accept_at, recovered_at, on_book = self._drive_stop_retries(executor, state, 300)
+        self.assertIsNone(recovered_at)
+        self.assertIsNone(executor.get_custom_info()["exchange_stop_order_id"])
+        self.assertIn("Next try", executor.get_custom_info()["exchange_stop_error"])
+        self.assertNotIn("4.0s", executor.get_custom_info()["exchange_stop_error"])
+        self.assertLessEqual(self._places_in_any_two_seconds(place_times), 5)
+        posted = next((index for index, on in enumerate(on_book) if on), None)
+        self.assertIsNotNone(posted)
+        resting = on_book[posted:]
+        for start in range(len(resting)):
+            window = resting[start:start + 30]
+            off = sum(1 for on in window if not on)
+            self.assertLessEqual(off, 2)
+        self.assertTrue(self._open_limit_closes())
+
+    def test_h3_three_rejects_then_accept_leaves_a_live_stop(self):
+        state = self._install_mexc_stop_book(fail_times=3)
+        self._mid(Decimal("0.085"))
+        executor = self._executor(
+            take_profit={"percent": "0.10", "execution": "SINGLE", "order_type": "LIMIT"},
+            stop_loss={"percent": "0.05", "execution": "SINGLE"},
+        )
+        self._open_entry(executor)
+        _times, _accept_at, recovered_at, _on_book = self._drive_stop_retries(executor, state, 300)
+        self.assertIsNotNone(recovered_at)
+        self.assertTrue(executor.get_custom_info()["has_exchange_stop"])
+        self.assertEqual(Decimal("100"), next(iter(state["stops"].values()))["amount"])
+
+    def test_h4_four_rejects_then_accept_leaves_a_live_stop(self):
+        state = self._install_mexc_stop_book(fail_times=4)
+        self._mid(Decimal("0.085"))
+        executor = self._executor(
+            take_profit={"percent": "0.10", "execution": "SINGLE", "order_type": "LIMIT"},
+            stop_loss={"percent": "0.05", "execution": "SINGLE"},
+        )
+        self._open_entry(executor)
+        _times, accept_at, recovered_at, _on_book = self._drive_stop_retries(executor, state, 300)
+        self.assertIsNotNone(recovered_at)
+        self.assertLessEqual(
+            recovered_at - accept_at,
+            float(executor.config.stop_loss_fallback_seconds),
+        )
+        self.assertTrue(executor.get_custom_info()["has_exchange_stop"])
+
+    def test_gr3_failed_reprice_lands_a_stop_once_mexc_accepts(self):
+        state = self._install_mexc_stop_book()
+
+        async def change_price(*args, **kwargs):
+            raise RuntimeError("reprice rejected")
+
+        self.connector.change_stop_plan_price = change_price
+        self._mid(Decimal("0.085"))
+        executor = self._executor(
+            exit_arming="ON_ANY_FILL",
+            take_profit={"percent": "0.10", "execution": "SINGLE", "order_type": "LIMIT"},
+            stop_loss={"percent": "0.05", "execution": "SINGLE"},
+        )
+        self._run(executor.control_task())
+        order = self.orders[self.buy_ids[-1][0]]
+        order.executed_amount_base = Decimal("50")
+        order.executed_amount_quote = Decimal("4")
+        order.current_state = OrderState.PARTIALLY_FILLED
+        self._run(executor.control_task())
+        self.assertIn("stop-1", state["stops"])
+        order.executed_amount_base = Decimal("100")
+        order.executed_amount_quote = Decimal("9")
+        order.current_state = OrderState.FILLED
+        self._mid(Decimal("0.092"))
+        state["fail"] = 4
+        _times, _accept_at, recovered_at, _on_book = self._drive_stop_retries(executor, state, 300)
+        self.assertIsNotNone(recovered_at)
+        self.assertTrue(executor.get_custom_info()["has_exchange_stop"])
+        self.assertGreaterEqual(next(iter(state["stops"].values()))["amount"], Decimal("50"))
+
+    def test_rs2_repeated_rejects_then_accept_leaves_a_live_stop(self):
+        state = self._install_mexc_stop_book(fail_times=6)
+        self._mid(Decimal("0.085"))
+        executor = self._executor(
+            take_profit={"percent": "0.10", "execution": "SINGLE", "order_type": "LIMIT"},
+            stop_loss={"percent": "0.05", "execution": "SINGLE"},
+        )
+        self._open_entry(executor)
+        place_times, accept_at, recovered_at, _on_book = self._drive_stop_retries(executor, state, 300)
+        self.assertIsNotNone(recovered_at)
+        self.assertLessEqual(
+            recovered_at - accept_at,
+            float(executor.config.stop_loss_fallback_seconds),
+        )
+        self.assertTrue(executor.get_custom_info()["has_exchange_stop"])
+        self.assertEqual(Decimal("100"), next(iter(state["stops"].values()))["amount"])
+        self.assertLessEqual(self._places_in_any_two_seconds(place_times), 5)
+
     def test_repeated_stop_rejects_leave_the_take_profit_resting(self):
         state = self._install_mexc_stop_book(fail_times=100)
         self._mid(Decimal("0.085"))
@@ -2203,26 +2416,19 @@ class RangeIcebergExitTests(IsolatedAsyncioWrapperTestCase):
             stop_loss={"percent": "0.05", "execution": "SINGLE"},
         )
         self._open_entry(executor)
-        resting_id = None
-        for _ in range(20):
-            self._run(executor.control_task())
-            self.now += 1
-            opens = self._open_limit_closes()
-            if opens and executor._failed_stop_placements() >= 3:
-                resting_id = next(iter(self.orders))
-                for order_id, _amount, _price, order_type, action in self.buy_ids:
-                    if action == PositionAction.CLOSE and order_type == OrderType.LIMIT:
-                        if self.orders[order_id].current_state == OrderState.OPEN:
-                            resting_id = order_id
-                break
-        self.assertIsNotNone(resting_id)
-        for _ in range(120):
-            self.now += 1
-            self._run(executor.control_task())
-        self.assertEqual(OrderState.OPEN, self.orders[resting_id].current_state)
-        self.assertNotEqual("", executor.get_custom_info()["exchange_stop_error"])
+        place_times, _accept_at, recovered_at, on_book = self._drive_stop_retries(executor, state, 120)
+        self.assertIsNone(recovered_at)
         self.assertIsNone(executor.get_custom_info()["exchange_stop_order_id"])
+        self.assertNotEqual("", executor.get_custom_info()["exchange_stop_error"])
+        self.assertLessEqual(self._places_in_any_two_seconds(place_times), 5)
         self.assertLessEqual(len(state["placed"]), 12)
+        posted = next((index for index, on in enumerate(on_book) if on), None)
+        self.assertIsNotNone(posted)
+        resting = on_book[posted:]
+        for start in range(len(resting)):
+            off = sum(1 for on in resting[start:start + 30] if not on)
+            self.assertLessEqual(off, 2)
+        self.assertTrue(self._open_limit_closes())
 
     def test_stop_loss_keeps_the_backstop_while_the_take_profit_cancel_is_unconfirmed(self):
         cancelled = []
