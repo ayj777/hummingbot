@@ -5,13 +5,19 @@ from unittest.mock import AsyncMock, MagicMock, PropertyMock, patch
 
 import pandas as pd
 
+from hummingbot.client.config.config_helpers import get_connector_class
+from hummingbot.client.settings import AllConnectorSettings
+from hummingbot.connector.derivative.mexc_perpetual.mexc_perpetual_derivative import MexcPerpetualDerivative
+from hummingbot.connector.exchange.mexc.mexc_exchange import MexcExchange
 from hummingbot.connector.trading_rule import TradingRule
 from hummingbot.core.data_type.common import PriceType
 from hummingbot.core.data_type.funding_info import FundingInfo
 from hummingbot.core.data_type.order_book_query_result import OrderBookQueryResult
 from hummingbot.data_feed.candles_feed.candles_base import CandlesBase
+from hummingbot.data_feed.candles_feed.candles_factory import CandlesFactory
 from hummingbot.data_feed.candles_feed.data_types import CandlesConfig
 from hummingbot.strategy.strategy_v2_base import MarketDataProvider
+from hummingbot.strategy_v2.backtesting.backtesting_data_provider import BacktestingDataProvider
 from hummingbot.strategy_v2.executors.data_types import ConnectorPair
 
 
@@ -839,3 +845,219 @@ class TestMarketDataProvider(IsolatedAsyncioWrapperTestCase):
             config = CandlesConfig(connector="binance", trading_pair="BTC-USDT", interval="1m", max_records=100)
             self.provider.get_candles_feed(config)
             mock_get_candle.assert_called_once_with(config, connector=None)
+
+    def test_resolve_connector_name_strips_paper_trade_suffix(self):
+        self.assertEqual(MarketDataProvider._resolve_connector_name("mexc_paper_trade"), "mexc")
+        self.assertEqual(
+            MarketDataProvider._resolve_connector_name("mexc_perpetual_paper_trade"),
+            "mexc_perpetual",
+        )
+        self.assertEqual(MarketDataProvider._resolve_connector_name("binance"), "binance")
+        self.assertEqual(MarketDataProvider._resolve_connector_name("paper_trade"), "paper_trade")
+        self.assertEqual(MarketDataProvider._resolve_connector_name("_paper_trade"), "_paper_trade")
+
+    def test_non_trading_connector_paper_trade_uses_underlying_exchange(self):
+        # The registered paper setting points at hummingbot.connector.exchange.mexc_paper_trade,
+        # which is the missing module behind the rate-fetch error. Public data must use mexc.
+        settings = AllConnectorSettings.get_connector_settings()
+        original_names = list(AllConnectorSettings.paper_trade_connectors_names)
+        had_paper_setting = "mexc_paper_trade" in settings
+        had_perpetual_paper_setting = "mexc_perpetual_paper_trade" in settings
+        AllConnectorSettings.initialize_paper_trade_settings(["mexc", "mexc_perpetual"])
+        try:
+            with self.assertRaises(ModuleNotFoundError):
+                get_connector_class("mexc_paper_trade")
+
+            spot = self.provider.get_non_trading_connector("mexc_paper_trade")
+            self.assertIsInstance(spot, MexcExchange)
+            self.assertFalse(spot._trading_required)
+            self.assertIs(self.provider.get_non_trading_connector("mexc"), spot)
+            self.assertNotIn("mexc_paper_trade", self.provider._non_trading_connectors)
+
+            perpetual = self.provider.get_non_trading_connector("mexc_perpetual_paper_trade")
+            self.assertIsInstance(perpetual, MexcPerpetualDerivative)
+            self.assertFalse(perpetual._trading_required)
+            self.assertIs(self.provider.get_non_trading_connector("mexc_perpetual"), perpetual)
+        finally:
+            if not had_paper_setting:
+                settings.pop("mexc_paper_trade", None)
+            if not had_perpetual_paper_setting:
+                settings.pop("mexc_perpetual_paper_trade", None)
+            AllConnectorSettings.paper_trade_connectors_names = original_names
+
+    def test_get_connector_config_map_paper_trade_uses_underlying(self):
+        self.assertEqual(
+            MarketDataProvider.get_connector_config_map("mexc_paper_trade"),
+            MarketDataProvider.get_connector_config_map("mexc"),
+        )
+
+    def test_get_connector_with_fallback_paper_trade_without_connected_market(self):
+        connector = self.provider.get_connector_with_fallback("mexc_paper_trade")
+        self.assertIsInstance(connector, MexcExchange)
+        self.assertIs(connector, self.provider.get_non_trading_connector("mexc"))
+
+    def test_get_connector_with_fallback_prefers_connected_paper_connector(self):
+        paper = MagicMock()
+        self.provider.connectors["mexc_paper_trade"] = paper
+        self.assertIs(self.provider.get_connector_with_fallback("mexc_paper_trade"), paper)
+        self.assertEqual(len(self.provider._non_trading_connectors), 0)
+
+    def test_get_connector_with_fallback_paper_trade_uses_connected_underlying(self):
+        live = MagicMock()
+        self.provider.connectors["mexc"] = live
+        self.assertIs(self.provider.get_connector_with_fallback("mexc_paper_trade"), live)
+        self.assertEqual(len(self.provider._non_trading_connectors), 0)
+
+    def test_public_lookup_paper_trade_uses_underlying_connector(self):
+        connector = self.provider.get_non_trading_connector("mexc_paper_trade")
+        connector.get_order_book = MagicMock(return_value="book")
+        connector.get_price_by_type = MagicMock(return_value=Decimal("1"))
+        connector.get_funding_info = MagicMock(return_value="funding")
+        self.assertEqual(self.provider.get_order_book("mexc_paper_trade", "BTC-USDT"), "book")
+        self.assertEqual(
+            self.provider.get_price_by_type("mexc_paper_trade", "BTC-USDT"),
+            Decimal("1"),
+        )
+        self.assertEqual(self.provider.get_funding_info("mexc_paper_trade", "BTC-USDT"), "funding")
+
+    def test_get_shared_connector_paper_trade_reuses_underlying_non_trading_connector(self):
+        underlying = self.provider.get_non_trading_connector("mexc")
+        self.assertIs(self.provider._get_shared_connector("mexc_paper_trade"), underlying)
+
+    def test_get_shared_connector_paper_trade_does_not_materialize_or_use_wrapper(self):
+        self.provider.connectors["mexc_paper_trade"] = MagicMock()
+        self.assertIsNone(self.provider._get_shared_connector("mexc_paper_trade"))
+        self.assertEqual(len(self.provider._non_trading_connectors), 0)
+
+    def test_get_candles_feed_paper_trade_uses_underlying_exchange(self):
+        self.assertNotIn("mexc_paper_trade", CandlesFactory._candles_map)
+        self.assertIn("mexc", CandlesFactory._candles_map)
+        underlying = self.provider.get_non_trading_connector("mexc")
+        with patch(
+            "hummingbot.data_feed.candles_feed.candles_factory.CandlesFactory.get_candle"
+        ) as mock_get_candle:
+            mock_get_candle.return_value = MagicMock()
+            config = CandlesConfig(
+                connector="mexc_paper_trade", trading_pair="BTC-USDT", interval="1m", max_records=100
+            )
+            self.provider.get_candles_feed(config)
+            called_config = mock_get_candle.call_args[0][0]
+            self.assertEqual(called_config.connector, "mexc")
+            self.assertEqual(called_config.trading_pair, "BTC-USDT")
+            mock_get_candle.assert_called_once_with(called_config, connector=underlying)
+            self.assertIn("mexc_BTC-USDT_1m", self.provider.candles_feeds)
+
+    def test_get_candles_feed_paper_trade_reuses_underlying_feed(self):
+        existing = MagicMock()
+        existing.max_records = 100
+        self.provider.candles_feeds["mexc_BTC-USDT_1m"] = existing
+        config = CandlesConfig(
+            connector="mexc_paper_trade", trading_pair="BTC-USDT", interval="1m", max_records=100
+        )
+        with patch(
+            "hummingbot.data_feed.candles_feed.candles_factory.CandlesFactory.get_candle"
+        ) as mock_get_candle:
+            result = self.provider.get_candles_feed(config)
+        self.assertIs(result, existing)
+        mock_get_candle.assert_not_called()
+
+    def test_stop_candle_feed_paper_trade_resolves_key(self):
+        mock_feed = MagicMock()
+        self.provider.candles_feeds["mexc_BTC-USDT_1m"] = mock_feed
+        config = CandlesConfig(connector="mexc_paper_trade", trading_pair="BTC-USDT", interval="1m")
+        self.provider.stop_candle_feed(config)
+        mock_feed.stop.assert_called_once()
+        self.assertNotIn("mexc_BTC-USDT_1m", self.provider.candles_feeds)
+
+    def test_get_candles_df_paper_trade_uses_underlying_exchange(self):
+        with patch(
+            "hummingbot.data_feed.candles_feed.candles_factory.CandlesFactory.get_candle"
+        ) as mock_get_candle:
+            mock_feed = MagicMock()
+            mock_feed.candles_df = pd.DataFrame({"timestamp": [1], "close": [2]})
+            mock_feed.max_records = 500
+            mock_get_candle.return_value = mock_feed
+            result = self.provider.get_candles_df("mexc_paper_trade", "BTC-USDT", "1m", 100)
+            called_config = mock_get_candle.call_args[0][0]
+            self.assertEqual(called_config.connector, "mexc")
+            self.assertEqual(result["close"].iloc[0], 2)
+
+    @patch("hummingbot.core.rate_oracle.rate_oracle.RateOracle.get_instance")
+    async def test_update_rates_task_paper_trade_fetches_mexc_public_prices(self, mock_rate_oracle):
+        mock_oracle = MagicMock()
+        mock_rate_oracle.return_value = mock_oracle
+        connector_pair = ConnectorPair(connector_name="mexc_paper_trade", trading_pair="BTC-USDT")
+        self.provider._rates_required.add_or_update("mexc_paper_trade", connector_pair)
+
+        captured = {}
+
+        async def fake_prices(connector, trading_pairs, timeout=5):
+            captured["connector"] = connector
+            captured["pairs"] = list(trading_pairs)
+            return {"BTC-USDT": Decimal("123.45")}
+
+        with patch.object(self.provider, "_safe_get_last_traded_prices", side_effect=fake_prices):
+            with patch("asyncio.sleep", side_effect=asyncio.CancelledError()):
+                with self.assertRaises(asyncio.CancelledError):
+                    await self.provider.update_rates_task()
+
+        self.assertIsInstance(captured["connector"], MexcExchange)
+        self.assertEqual(captured["connector"].name, "mexc")
+        self.assertEqual(captured["pairs"], ["BTC-USDT"])
+        mock_oracle.set_price.assert_called_once_with("BTC-USDT", Decimal("123.45"))
+        self.assertIs(
+            captured["connector"],
+            self.provider.get_non_trading_connector("mexc"),
+        )
+
+    async def test_initialize_order_book_paper_trade_starts_underlying_connector(self):
+        connector = MagicMock()
+        connector.order_book_tracker = MagicMock()
+        with patch.object(self.provider, "get_connector_with_fallback", return_value=connector):
+            with patch.object(
+                self.provider, "_ensure_non_trading_connector_started", new_callable=AsyncMock, return_value=True
+            ) as start:
+                with patch.object(
+                    self.provider, "_wait_for_order_book_initialized", new_callable=AsyncMock, return_value=True
+                ):
+                    result = await self.provider.initialize_order_book("mexc_paper_trade", "BTC-USDT")
+        self.assertTrue(result)
+        start.assert_awaited_once_with(connector, "mexc", "BTC-USDT")
+
+    async def test_initialize_order_book_connected_paper_connector_uses_that_market(self):
+        paper = MagicMock()
+        paper.order_book_tracker = MagicMock()
+        paper.add_trading_pair = AsyncMock(return_value=True)
+        self.provider.connectors["mexc_paper_trade"] = paper
+        result = await self.provider.initialize_order_book("mexc_paper_trade", "BTC-USDT")
+        self.assertTrue(result)
+        paper.add_trading_pair.assert_awaited_once_with("BTC-USDT")
+        self.assertEqual(len(self.provider._non_trading_connectors), 0)
+
+    def test_backtesting_connector_paper_trade_uses_underlying_exchange(self):
+        provider = BacktestingDataProvider({})
+        connector = provider.connectors["mexc_paper_trade"]
+        self.assertIsInstance(connector, MexcExchange)
+        self.assertFalse(connector._trading_required)
+        self.assertIsInstance(provider.get_connector("mexc_perpetual_paper_trade"), MexcPerpetualDerivative)
+
+    async def test_backtesting_candles_paper_trade_uses_underlying_exchange(self):
+        provider = BacktestingDataProvider({})
+        provider.start_time = 0
+        provider.end_time = 120
+        mock_feed = MagicMock()
+        mock_feed.get_historical_candles = AsyncMock(
+            return_value=pd.DataFrame({"timestamp": [0, 60, 120], "close": [1, 2, 3]})
+        )
+        with patch(
+            "hummingbot.strategy_v2.backtesting.backtesting_data_provider.CandlesFactory.get_candle",
+            return_value=mock_feed,
+        ) as mock_get_candle:
+            result = await provider.get_candles_feed(
+                CandlesConfig(connector="mexc_paper_trade", trading_pair="BTC-USDT", interval="1m", max_records=10)
+            )
+        called_config = mock_get_candle.call_args[0][0]
+        self.assertEqual(called_config.connector, "mexc")
+        self.assertIn("mexc_BTC-USDT_1m", provider.candles_feeds)
+        candles = provider.get_candles_df("mexc_paper_trade", "BTC-USDT", "1m")
+        self.assertEqual(len(candles), len(result))

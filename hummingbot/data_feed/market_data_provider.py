@@ -27,6 +27,8 @@ from hummingbot.strategy_v2.executors.data_types import ConnectorPair
 
 class MarketDataProvider:
     _logger: Optional[HummingbotLogger] = None
+    # Paper trade connectors are named "<exchange>_paper_trade" and have no module of their own.
+    _PAPER_TRADE_SUFFIX = "_paper_trade"
 
     @classmethod
     def logger(cls) -> HummingbotLogger:
@@ -159,7 +161,9 @@ class MarketDataProvider:
                 # Process non-gateway connectors
                 for connector, connector_pairs in non_gateway_connectors.items():
                     try:
-                        connector_instance = self._non_trading_connectors[connector]
+                        # *_paper_trade has no connector module. Last traded prices come from the
+                        # underlying exchange public API (mexc_paper_trade -> mexc).
+                        connector_instance = self.get_non_trading_connector(connector)
                         prices = await self._safe_get_last_traded_prices(
                             connector=connector_instance,
                             trading_pairs=[pair.trading_pair for pair in connector_pairs])
@@ -196,6 +200,8 @@ class MarketDataProvider:
         :param config: CandlesConfig
         :return: Candle feed instance.
         """
+        # Candle classes are registered under the exchange name. mexc_paper_trade has no feed.
+        config = self._candles_config_for_public_data(config)
         key = self._generate_candle_feed_key(config)
         existing_feed = self.candles_feeds.get(key)
 
@@ -228,9 +234,13 @@ class MarketDataProvider:
         connector via its factory. Only membership (``in``) is checked before indexing an
         already-present key, so a non-trading connector is reused only if it was created elsewhere.
 
+        A ``*_paper_trade`` name is resolved to the underlying exchange first. The paper trade
+        wrapper is not reused: it has no public throttler or symbol map for the candle feed.
+
         :param connector_name: Name of the connector/exchange.
         :return: A ConnectorBase instance to reuse, or None.
         """
+        connector_name = self._resolve_connector_name(connector_name)
         connector = self.connectors.get(connector_name)
         if connector is None and connector_name in self._non_trading_connectors:
             connector = self._non_trading_connectors[connector_name]
@@ -250,6 +260,7 @@ class MarketDataProvider:
         Stops a candle feed based on the given configuration.
         :param config: CandlesConfig
         """
+        config = self._candles_config_for_public_data(config)
         key = self._generate_candle_feed_key(config)
         candle_feed = self.candles_feeds.get(key)
         if candle_feed and hasattr(candle_feed, 'stop'):
@@ -272,11 +283,17 @@ class MarketDataProvider:
         Retrieves a connector instance with fallback to non-trading connector.
         Prefers existing connected connector with API keys if available,
         otherwise creates a non-trading connector for public data access.
+        A paper trade name uses the connected underlying exchange when that exchange is already
+        present, and otherwise a non-trading instance of it.
         :param connector_name: str
         :return: ConnectorBase
         """
         # Try to get existing connector first (has API keys)
         connector = self.connectors.get(connector_name)
+        if connector is None:
+            resolved_name = self._resolve_connector_name(connector_name)
+            if resolved_name != connector_name:
+                connector = self.connectors.get(resolved_name)
         if connector:
             return connector
 
@@ -287,10 +304,40 @@ class MarketDataProvider:
         """
         Retrieves a non-trading connector from cache or creates one if not exists.
         Uses the _non_trading_connectors cache to avoid creating multiple instances.
+        A ``*_paper_trade`` name is resolved to the underlying exchange before lookup, so
+        ``mexc_paper_trade`` and ``mexc`` share one public connector.
         :param connector_name: str
         :return: ConnectorBase
         """
-        return self._non_trading_connectors[connector_name]
+        return self._non_trading_connectors[self._resolve_connector_name(connector_name)]
+
+    @staticmethod
+    def _resolve_connector_name(connector_name: str) -> str:
+        """
+        Map a paper trade connector name to the underlying exchange used for public market data.
+
+        Paper connectors are named ``<exchange>_paper_trade``. ConnectorManager strips that suffix
+        before loading the real exchange, and TradingPairFetcher reads pairs from the parent
+        connector. Public price, rate, candle, and non-trading connector lookups do the same so a
+        name such as ``mexc_paper_trade`` uses MEXC public endpoints instead of importing
+        ``hummingbot.connector.exchange.mexc_paper_trade``.
+        """
+        suffix = MarketDataProvider._PAPER_TRADE_SUFFIX
+        if connector_name.endswith(suffix) and len(connector_name) > len(suffix):
+            return connector_name[:-len(suffix)]
+        return connector_name
+
+    def _candles_config_for_public_data(self, config: CandlesConfig) -> CandlesConfig:
+        """
+        Return a candles config whose connector is the underlying exchange.
+
+        Candle classes are keyed by the exchange name. ``mexc_paper_trade`` has no candle class,
+        so the feed is created for ``mexc``.
+        """
+        resolved = self._resolve_connector_name(config.connector)
+        if resolved == config.connector:
+            return config
+        return config.model_copy(update={"connector": resolved})
 
     def _create_non_trading_connector(self, connector_name: str):
         """
@@ -298,9 +345,13 @@ class MarketDataProvider:
         This is the factory method used by the LazyDict cache.
         Note: The connector is NOT started automatically. Call _ensure_non_trading_connector_started()
         to start it with at least one trading pair.
+        Paper trade names are resolved here as well, so a direct cache lookup of
+        ``mexc_paper_trade`` still builds the underlying exchange instead of importing a module
+        that does not exist.
         :param connector_name: str
         :return: ConnectorBase
         """
+        connector_name = self._resolve_connector_name(connector_name)
         conn_setting = self.conn_settings.get(connector_name)
         if conn_setting is None:
             self.logger().error(f"Connector {connector_name} not found")
@@ -361,6 +412,9 @@ class MarketDataProvider:
 
     @staticmethod
     def get_connector_config_map(connector_name: str):
+        # Paper trade settings either are missing or point at a module that does not exist.
+        # Public requests use the underlying exchange config.
+        connector_name = MarketDataProvider._resolve_connector_name(connector_name)
         connector_config = AllConnectorSettings.get_connector_config_keys(connector_name)
         if getattr(connector_config, "use_auth_for_public_endpoints", False):
             # Use real API keys for connectors that require auth for public endpoints
@@ -407,12 +461,19 @@ class MarketDataProvider:
             self.logger().warning(f"Connector {connector_name} does not have order_book_tracker")
             return False
 
-        # For non-trading connectors, ensure the network is started with this trading pair
-        if connector_name not in self.connectors:
-            if not self._non_trading_connectors_started.get(connector_name, False):
+        # For non-trading connectors, ensure the network is started with this trading pair.
+        # A connected paper trade market, or the underlying exchange when that is connected,
+        # already tracks its own books. Only a freshly created public connector is started here,
+        # and it is tracked under the underlying exchange name.
+        public_name = self._resolve_connector_name(connector_name)
+        trading_connector_present = connector_name in self.connectors or (
+            public_name != connector_name and public_name in self.connectors
+        )
+        if not trading_connector_present:
+            if not self._non_trading_connectors_started.get(public_name, False):
                 # First time - start the connector with this trading pair as the initial subscription
                 success = await self._ensure_non_trading_connector_started(
-                    connector, connector_name, trading_pair
+                    connector, public_name, trading_pair
                 )
                 if not success:
                     return False
@@ -624,7 +685,7 @@ class MarketDataProvider:
         # Fetch historical data
         try:
             historical_config = HistoricalCandlesConfig(
-                connector_name=connector_name,
+                connector_name=self._resolve_connector_name(connector_name),
                 trading_pair=trading_pair,
                 interval=interval,
                 start_time=fetch_start,

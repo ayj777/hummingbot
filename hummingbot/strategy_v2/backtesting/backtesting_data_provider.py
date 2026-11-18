@@ -39,14 +39,28 @@ class BacktestingDataProvider(MarketDataProvider):
         self.trading_rules = {}
         self.conn_settings = AllConnectorSettings.get_connector_settings()
         self.connectors = LazyDict[str, Optional[ConnectorBase]](
-            lambda name: self.get_connector(name) if (
-                self.conn_settings[name].type in self.CONNECTOR_TYPES and
-                name not in self.EXCLUDED_CONNECTORS and
-                "testnet" not in name
-            ) else None
+            lambda name: self._lazy_backtest_connector(name)
         )
 
+    def _lazy_backtest_connector(self, connector_name: str) -> Optional[ConnectorBase]:
+        """
+        Build a public connector for backtesting.
+
+        ``*_paper_trade`` names resolve to the underlying exchange before the settings lookup,
+        matching MarketDataProvider. Unknown names still raise KeyError.
+        """
+        public_name = self._resolve_connector_name(connector_name)
+        conn_setting = self.conn_settings[public_name]
+        if (
+            conn_setting.type in self.CONNECTOR_TYPES
+            and public_name not in self.EXCLUDED_CONNECTORS
+            and "testnet" not in public_name
+        ):
+            return self.get_connector(public_name)
+        return None
+
     def get_connector(self, connector_name: str):
+        connector_name = self._resolve_connector_name(connector_name)
         conn_setting = self.conn_settings.get(connector_name)
         if conn_setting is None:
             logger.error(f"Connector {connector_name} not found")
@@ -93,6 +107,7 @@ class BacktestingDataProvider(MarketDataProvider):
         :param config: CandlesConfig
         :return: Candle feed instance.
         """
+        config = self._candles_config_for_public_data(config)
         key = self._generate_candle_feed_key(config)
         existing_feed = self.candles_feeds.get(key, pd.DataFrame())
         # existing_feed = self.ensure_epoch_index(existing_feed)
@@ -126,6 +141,7 @@ class BacktestingDataProvider(MarketDataProvider):
         :param max_records: int
         :return: Candles dataframe.
         """
+        connector_name = self._resolve_connector_name(connector_name)
         candles_df = self.candles_feeds.get(f"{connector_name}_{trading_pair}_{interval}")
         return candles_df[(candles_df["timestamp"] >= self.start_time) & (candles_df["timestamp"] <= self.end_time)]
 
