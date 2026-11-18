@@ -266,16 +266,20 @@ class RangeIcebergExecutorConfig(ExecutorConfigBase):
     early_stop cancels software entry and exit orders and does not close the
     filled position. keep_position=True records POSITION_HOLD and is the API
     shutdown path: software orders are cancelled and the exchange stop is left
-    working. Every other terminal path cancels the exchange stop, including
-    keep_position=False, a user Stop, and FAILED.
+    working. A user Stop and keep_position=False cancel it too. A stop loss
+    that exhausted its close retries places the exchange stop again before it
+    stops, and leaves that stop working.
 
     protective_exchange_stop defaults to on when the connector implements
     place_position_stop_order, and off otherwise. The exchange stop is a
     backstop past the software stop trigger by protective_stop_buffer_pct
-    (default 0.5 percent) in the adverse direction. It is cancelled and that
-    cancel is confirmed before the software stop sends a close. Resuming from
-    custom_info restores an exit_state of ARMED, RESTING, or CLOSING, re-posts
-    a missing exit from open_base, and keeps the saved exchange stop id.
+    (default 0.5 percent) in the adverse direction. The software stop cancels
+    it first. If that cancel is still unconfirmed after stop_loss_fallback_seconds,
+    the software close is only the size the live stop does not cover.
+    Resuming from custom_info restores an exit_state of ARMED, RESTING, or
+    CLOSING, re-posts a missing exit from open_base, and keeps the saved
+    exchange stop id. resume_entries false places no entry orders and sizes
+    the restored open amount in base, even when the saved config used quote.
 
     allow_adverse_take_profit permits a take-profit price that is not past the
     average entry. stop_loss_fallback_seconds is how long a stop-loss iceberg

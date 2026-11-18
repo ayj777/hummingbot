@@ -10,7 +10,9 @@ from hummingbot.connector.derivative.mexc_perpetual.mexc_perpetual_constants imp
 )
 from hummingbot.connector.derivative.mexc_perpetual.mexc_perpetual_derivative import MexcPerpetualDerivative
 from hummingbot.connector.trading_rule import TradingRule
-from hummingbot.core.data_type.common import OrderType, PositionAction, PositionMode, PriceType, TradeType
+from types import SimpleNamespace
+
+from hummingbot.core.data_type.common import OrderType, PositionAction, PositionMode, PositionSide, PriceType, TradeType
 from hummingbot.core.event.events import MarketOrderFailureEvent
 from hummingbot.core.data_type.in_flight_order import InFlightOrder, OrderState
 from hummingbot.connector.derivative.position import Position
@@ -1513,3 +1515,360 @@ class RangeIcebergExitTests(IsolatedAsyncioWrapperTestCase):
         self.assertEqual(before_closes + 1, len(self._close_calls()))
         self.assertEqual(Decimal(snapshot["open_base"]), self._close_calls()[-1][1][2])
         self.assertEqual("RESTING", resumed.get_custom_info()["exit_state"])
+
+    def _open_order_count(self) -> int:
+        count = 0
+        for method in (self.strategy.buy, self.strategy.sell):
+            for call in method.call_args_list:
+                if call.args[5] == PositionAction.OPEN:
+                    count += 1
+        return count
+
+    def test_resume_entries_false_places_no_entry_orders_for_a_quote_config(self):
+        self._mid(Decimal("0.085"))
+        executor = self._executor(
+            size_unit=SizeUnit.QUOTE,
+            total_amount=Decimal("8"),
+            take_profit={"percent": "0.10", "execution": "SINGLE", "order_type": "LIMIT"},
+            stop_loss={"percent": "0.05", "execution": "SINGLE"},
+        )
+        executor.restore_from_custom_info({
+            "resume_entries": False,
+            "size_unit": "BASE",
+            "total_amount": "60",
+            "open_base": "60",
+            "average_fill_price": "0.08",
+            "exit_state": "RESTING",
+            "exit": {"status": "resting", "active": "take_profit"},
+        })
+        for _ in range(3):
+            self._run(executor.control_task())
+        self.assertEqual(0, self._open_order_count())
+        self.assertEqual(Decimal("60"), executor.filled_base)
+        self.assertEqual(Decimal("60"), Decimal(executor.get_custom_info()["open_base"]))
+        self.assertEqual(SizeUnit.BASE, executor._size_unit_override)
+
+    def test_exits_only_resume_rebuilds_average_and_does_not_fire_stop(self):
+        self._mid(Decimal("0.085"))
+        executor = self._executor(
+            size_unit=SizeUnit.QUOTE,
+            total_amount=Decimal("8"),
+            take_profit={"percent": "0.10", "execution": "SINGLE", "order_type": "LIMIT"},
+            stop_loss={"percent": "0.05", "execution": "SINGLE"},
+        )
+        executor.restore_from_custom_info({
+            "resume_entries": False,
+            "size_unit": "BASE",
+            "total_amount": "60",
+            "open_base": "60",
+            "filled_base": "100",
+            "closed_base": "40",
+            "average_fill_price": "0.08",
+            "exit_state": "RESTING",
+            "exit": {
+                "status": "resting",
+                "active": "take_profit",
+                "entry_filled_base": "60",
+                "entry_filled_quote": "20",
+                "filled_by_order": {"old-tp": {"base": "40", "quote": "4.4"}},
+                "order_ids": ["old-tp"],
+            },
+        })
+        before = len(self._close_calls())
+        for _ in range(3):
+            self._run(executor.control_task())
+        info = executor.get_custom_info()
+        self.assertEqual(Decimal("60"), executor.filled_base)
+        self.assertEqual(Decimal("0"), Decimal(info["closed_base"]))
+        self.assertEqual(Decimal("0.088"), Decimal(info["take_profit_trigger_price"]))
+        self.assertEqual(Decimal("0.076"), Decimal(info["stop_loss_trigger_price"]))
+        self.assertEqual(0, self._open_order_count())
+        markets = [call for call in self._close_calls()[before:] if call[1][3] == OrderType.MARKET]
+        self.assertEqual([], markets)
+        self.assertNotEqual(CloseType.STOP_LOSS, executor.close_type)
+        self.assertEqual("RESTING", info["exit_state"])
+
+    def test_growing_take_profit_resizes_the_stop_only_after_the_limit_is_gone(self):
+        events = []
+
+        async def place_stop(trading_pair, position_id, amount, stop_loss_price=None, **kwargs):
+            events.append(("place", amount))
+            if len(events) == 1:
+                return "stop-1"
+            return "stop-2"
+
+        async def cancel_stop(order_ids):
+            events.append(("cancel", list(order_ids)))
+            return {"success": True}
+
+        self.connector.place_position_stop_order = place_stop
+        self.connector.cancel_stop_orders = cancel_stop
+        self.connector._position_id_for_order = lambda trading_pair, trade_type, position_action, reduce_only: 4242
+        self._mid(Decimal("0.085"))
+        executor = self._executor(
+            exit_arming="ON_ANY_FILL",
+            take_profit={"percent": "0.10", "execution": "SINGLE", "order_type": "LIMIT"},
+            stop_loss={"percent": "0.05", "execution": "SINGLE"},
+        )
+        self._run(executor.control_task())
+        order = self.orders[self.buy_ids[-1][0]]
+        order.executed_amount_base = Decimal("40")
+        order.executed_amount_quote = Decimal("3.2")
+        order.current_state = OrderState.PARTIALLY_FILLED
+        self._run(executor.control_task())
+        self.assertEqual("stop-1", executor.get_custom_info()["exchange_stop_order_id"])
+        self.assertTrue(executor.get_custom_info()["has_exchange_stop"])
+        self.assertEqual(Decimal("40"), self._close_calls()[-1][1][2])
+        order.executed_amount_base = Decimal("100")
+        order.executed_amount_quote = Decimal("8")
+        order.current_state = OrderState.FILLED
+        cancels_before = self.strategy.cancel.call_count
+        self._run(executor.control_task())
+        self.assertGreater(self.strategy.cancel.call_count, cancels_before)
+        self.assertEqual([("place", Decimal("40"))], [item for item in events if item[0] == "place"])
+        self.assertEqual([], [item for item in events if item[0] == "cancel"])
+        self.assertEqual("stop-1", executor.get_custom_info()["exchange_stop_order_id"])
+        self._run(executor.control_task())
+        place_at = [index for index, item in enumerate(events) if item[0] == "place"]
+        cancel_at = [index for index, item in enumerate(events) if item[0] == "cancel"]
+        self.assertEqual(Decimal("100"), events[place_at[-1]][1])
+        self.assertLess(place_at[-1], cancel_at[0])
+        self.assertEqual(["stop-1"], events[cancel_at[0]][1])
+        self.assertEqual("stop-2", executor.get_custom_info()["exchange_stop_order_id"])
+        self.assertTrue(executor.get_custom_info()["has_exchange_stop"])
+        self.assertEqual("", executor.get_custom_info()["exchange_stop_error"])
+        self.assertEqual(Decimal("100"), self._close_calls()[-1][1][2])
+
+        failed_events = []
+
+        async def place_fail(trading_pair, position_id, amount, stop_loss_price=None, **kwargs):
+            failed_events.append(amount)
+            if len(failed_events) > 1:
+                raise RuntimeError("closable quantity")
+            return "stop-1"
+
+        async def cancel_fail(order_ids):
+            return {"success": True}
+
+        self.connector.place_position_stop_order = place_fail
+        self.connector.cancel_stop_orders = cancel_fail
+        other = self._executor(
+            exit_arming="ON_ANY_FILL",
+            take_profit={"percent": "0.10", "execution": "SINGLE", "order_type": "LIMIT"},
+            stop_loss={"percent": "0.05", "execution": "SINGLE"},
+        )
+        self._run(other.control_task())
+        other_order = self.orders[self.buy_ids[-1][0]]
+        other_order.executed_amount_base = Decimal("40")
+        other_order.executed_amount_quote = Decimal("3.2")
+        other_order.current_state = OrderState.PARTIALLY_FILLED
+        self._run(other.control_task())
+        other_order.executed_amount_base = Decimal("100")
+        other_order.executed_amount_quote = Decimal("8")
+        other_order.current_state = OrderState.FILLED
+        self._run(other.control_task())
+        self._run(other.control_task())
+        info = other.get_custom_info()
+        self.assertEqual("stop-1", info["exchange_stop_order_id"])
+        self.assertTrue(info["has_exchange_stop"])
+        self.assertIn("closable quantity", info["exchange_stop_error"])
+        self.assertEqual(Decimal("40"), self._close_calls()[-1][1][2])
+        places = len(failed_events)
+        cancels = self.strategy.cancel.call_count
+        self._run(other.control_task())
+        self.assertEqual(places, len(failed_events))
+        self.assertEqual(cancels, self.strategy.cancel.call_count)
+        self.assertEqual("stop-1", other.get_custom_info()["exchange_stop_order_id"])
+
+    def test_missing_position_is_not_a_flat_close(self):
+        self._install_exchange_stop()
+        self._mid(Decimal("0.085"))
+        executor = self._executor(stop_loss={"percent": "0.05", "execution": "SINGLE"})
+        self._open_entry(executor)
+        self._run(executor.control_task())
+        self.connector.account_positions = {}
+        self._mid(Decimal("0.07"))
+        before = len(self._close_calls())
+        self._run(executor.control_task())
+        self.assertEqual(before + 1, len(self._close_calls()))
+        self.assertEqual(OrderType.MARKET, self._close_calls()[-1][1][3])
+        self.assertNotEqual("DONE", executor.get_custom_info()["exit_state"])
+
+        stale = self._executor(stop_loss={"percent": "0.05", "execution": "SINGLE"})
+        self._mid(Decimal("0.085"))
+        self._open_entry(stale)
+        self._run(stale.control_task())
+        stale._last_fill_timestamp = self.now
+        self.connector.account_positions = {
+            "aiot": SimpleNamespace(
+                trading_pair="AIOT-USDT",
+                position_side=PositionSide.LONG,
+                amount=Decimal("0"),
+                update_timestamp=self.now - 5,
+            )
+        }
+        self._mid(Decimal("0.07"))
+        before = len(self._close_calls())
+        self._run(stale.control_task())
+        self.assertEqual(before + 1, len(self._close_calls()))
+        self.assertNotEqual(CloseType.STOP_LOSS, stale.close_type)
+
+        fresh = self._executor(stop_loss={"percent": "0.05", "execution": "SINGLE"})
+        self._mid(Decimal("0.085"))
+        self._open_entry(fresh)
+        self._run(fresh.control_task())
+        fresh._last_fill_timestamp = self.now
+        self.connector.account_positions = {
+            "aiot": SimpleNamespace(
+                trading_pair="AIOT-USDT",
+                position_side=PositionSide.LONG,
+                amount=Decimal("0"),
+                update_timestamp=self.now + 1,
+            )
+        }
+        self._mid(Decimal("0.07"))
+        before = len(self._close_calls())
+        self._run(fresh.control_task())
+        self.assertEqual(before, len(self._close_calls()))
+        self.assertEqual(CloseType.STOP_LOSS, fresh.close_type)
+        self.assertEqual("DONE", fresh.get_custom_info()["exit_state"])
+
+        queried = self._executor(stop_loss={"percent": "0.05", "execution": "SINGLE"})
+        self._mid(Decimal("0.085"))
+        self._open_entry(queried)
+        self._run(queried.control_task())
+        self.connector.account_positions = {}
+
+        async def read_stop(order_id):
+            return {"state": 3}
+
+        self.connector.get_position_stop_order = read_stop
+        self._mid(Decimal("0.07"))
+        before = len(self._close_calls())
+        self._run(queried.control_task())
+        self.assertEqual(before, len(self._close_calls()))
+        self.assertEqual(CloseType.STOP_LOSS, queried.close_type)
+        self.assertEqual(Decimal("0"), Decimal(queried.get_custom_info()["open_base"]))
+
+    def test_fired_exchange_stop_credits_its_own_size(self):
+        _, cancelled = self._install_exchange_stop(
+            cancel_result={"success": False, "message": "already triggered"},
+        )
+        self._mid(Decimal("0.085"))
+        executor = self._executor(stop_loss={"percent": "0.05", "execution": "SINGLE"})
+        self._open_entry(executor)
+        self._run(executor.control_task())
+        executor._exchange_stop_amount = Decimal("40")
+        self.connector.account_positions = {
+            "aiot": SimpleNamespace(
+                trading_pair="AIOT-USDT",
+                position_side=PositionSide.LONG,
+                amount=Decimal("0"),
+                update_timestamp=None,
+            )
+        }
+        self._mid(Decimal("0.07"))
+        before = len(self._close_calls())
+        self._run(executor.control_task())
+        self.assertEqual(Decimal("40"), Decimal(executor.get_custom_info()["closed_base"]))
+        self.assertEqual(Decimal("60"), Decimal(executor.get_custom_info()["open_base"]))
+        self.assertEqual(before + 1, len(self._close_calls()))
+        self.assertEqual(Decimal("60"), self._close_calls()[-1][1][2])
+        self.assertEqual(OrderType.MARKET, self._close_calls()[-1][1][3])
+        self.assertNotEqual(CloseType.FAILED, executor.close_type)
+        self.assertGreaterEqual(len(cancelled), 1)
+
+    def test_unconfirmed_stop_cancel_backs_off_then_closes_the_remainder(self):
+        calls = []
+
+        async def place_stop(trading_pair, position_id, amount, stop_loss_price=None, **kwargs):
+            return "stop-1"
+
+        async def cancel_stop(order_ids):
+            calls.append(self.now)
+            raise RuntimeError("cancel timed out")
+
+        self.connector.place_position_stop_order = place_stop
+        self.connector.cancel_stop_orders = cancel_stop
+        self.connector._position_id_for_order = lambda trading_pair, trade_type, position_action, reduce_only: 4242
+        self._mid(Decimal("0.085"))
+        executor = self._executor(
+            stop_loss_fallback_seconds=5,
+            stop_loss={"percent": "0.05", "execution": "SINGLE"},
+        )
+        self._open_entry(executor)
+        self._run(executor.control_task())
+        executor._exchange_stop_amount = Decimal("40")
+        self._mid(Decimal("0.07"))
+        for _ in range(8):
+            self._run(executor.control_task())
+        self.assertEqual(1, len(calls))
+        self.assertEqual([], self._close_calls())
+        self.assertEqual("stop-1", executor.get_custom_info()["exchange_stop_order_id"])
+        self.now += 5
+        self._run(executor.control_task())
+        self.assertEqual(2, len(calls))
+        self.assertEqual(1, len(self._close_calls()))
+        self.assertEqual(Decimal("60"), self._close_calls()[-1][1][2])
+        self.assertEqual(OrderType.MARKET, self._close_calls()[-1][1][3])
+        self.assertEqual("stop-1", executor.get_custom_info()["exchange_stop_order_id"])
+        self.assertTrue(executor.get_custom_info()["has_exchange_stop"])
+
+    def test_rejected_stop_closes_replace_the_exchange_stop_before_failed(self):
+        placed = []
+        cancelled = []
+
+        async def place_stop(trading_pair, position_id, amount, stop_loss_price=None, **kwargs):
+            placed.append(f"stop-{len(placed) + 1}")
+            return placed[-1]
+
+        async def cancel_stop(order_ids):
+            cancelled.extend(list(order_ids))
+            return {"success": True}
+
+        self.connector.place_position_stop_order = place_stop
+        self.connector.cancel_stop_orders = cancel_stop
+        self.connector._position_id_for_order = lambda trading_pair, trade_type, position_action, reduce_only: 4242
+        self._mid(Decimal("0.085"))
+        executor = RangeIcebergExecutor(
+            self.strategy,
+            self._config(stop_loss={"percent": "0.05", "execution": "SINGLE"}),
+            update_interval=0.1,
+            max_retries=0,
+        )
+        executor._status = RunnableStatus.RUNNING
+        self._open_entry(executor)
+        self._run(executor.control_task())
+        self.assertEqual(["stop-1"], placed)
+        self._mid(Decimal("0.07"))
+        self._run(executor.control_task())
+        self.assertIn("stop-1", cancelled)
+        self.assertEqual(OrderType.MARKET, self._close_calls()[-1][1][3])
+        market_id = self.buy_ids[-1][0]
+        executor.process_order_failed_event(
+            0, None, MarketOrderFailureEvent(self.now, market_id, OrderType.MARKET),
+        )
+        self.assertNotEqual(CloseType.FAILED, executor.close_type)
+        self.now += 1
+        self._run(executor.control_task())
+        self.assertEqual(OrderType.MARKET, self._close_calls()[-1][1][3])
+        second = self.buy_ids[-1][0]
+        executor.process_order_failed_event(
+            0, None, MarketOrderFailureEvent(self.now, second, OrderType.MARKET),
+        )
+        self.assertNotEqual(CloseType.FAILED, executor.close_type)
+        self._run(executor.control_task())
+        third = self.buy_ids[-1][0]
+        self.assertEqual(OrderType.MARKET, self._close_calls()[-1][1][3])
+        executor.process_order_failed_event(
+            0, None, MarketOrderFailureEvent(self.now, third, OrderType.MARKET),
+        )
+        self.assertNotEqual(CloseType.FAILED, executor.close_type)
+        self.assertNotEqual(RunnableStatus.TERMINATED, executor.status)
+        self.assertIn("Re-placing", executor.get_custom_info()["exit_error"])
+        self._run(executor.control_task())
+        self.assertEqual(CloseType.FAILED, executor.close_type)
+        self.assertEqual("stop-2", executor.get_custom_info()["exchange_stop_order_id"])
+        self.assertTrue(executor.get_custom_info()["has_exchange_stop"])
+        self.assertNotIn("stop-2", cancelled)
+        self.assertEqual(RunnableStatus.TERMINATED, executor.status)
