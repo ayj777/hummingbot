@@ -1555,6 +1555,75 @@ class MexcPerpetualReviewFixTests(IsolatedAsyncioWrapperTestCase):
         self.assertEqual(CONSTANTS.OPEN_TYPE_ISOLATED, captured[0]["openType"])
         self.assertNotEqual(CONSTANTS.POSITION_TYPE_SHORT, captured[0].get("positionType"))
 
+    def _orders_open(self, read, error: Exception):
+        self.exchange._position_mode_confirmed = True
+        self.exchange._perpetual_trading.set_position_mode(PositionMode.HEDGE)
+        self.exchange._api_get = read
+
+        async def post(path_url, data=None, **kwargs):
+            raise error
+
+        self.exchange._api_post = post
+
+    async def test_open_orders_accept_a_matching_leverage_read(self):
+        async def get(path_url, params=None, **kwargs):
+            self.assertEqual(CONSTANTS.POSITION_LEVERAGE_PATH, path_url)
+            return {"data": [
+                {"symbol": "AIOT_USDT", "positionType": 2, "openType": 2, "leverage": 8},
+                {"symbol": "AIOT_USDT", "positionType": 1, "openType": 1, "leverage": 1},
+            ]}
+
+        self._orders_open(get, MexcResponseError(2019, "Leverage adjustment unavailable"))
+        confirmed = await self.exchange.confirm_leverage_and_margin(
+            self.trading_pair, 1, MarginMode.ISOLATED, position_side=PositionSide.LONG,
+        )
+        self.assertTrue(confirmed)
+        self.assertEqual(1, self.exchange.get_leverage(self.trading_pair))
+        self.assertEqual(MarginMode.ISOLATED, self.exchange._position_margin_modes[(self.trading_pair, PositionSide.LONG)])
+        self.assertNotIn((self.trading_pair, PositionSide.SHORT), self.exchange._position_margin_modes)
+
+    async def test_open_orders_refuse_when_the_live_leverage_differs(self):
+        async def get(path_url, params=None, **kwargs):
+            return {"data": [{"symbol": "AIOT_USDT", "positionType": 1, "openType": 2, "leverage": 5}]}
+
+        self._orders_open(get, MexcResponseError(2019, "Leverage adjustment unavailable"))
+        confirmed = await self.exchange.confirm_leverage_and_margin(
+            self.trading_pair, 1, MarginMode.ISOLATED, position_side=PositionSide.LONG,
+        )
+        self.assertFalse(confirmed)
+        self.assertFalse(self.exchange._leverage_explicit)
+        reason = self.exchange.leverage_confirmation_error()
+        self.assertIn("leverage 5", reason)
+        self.assertIn("CROSS", reason)
+        self.assertIn("Refusing to trade", reason)
+
+    async def test_open_orders_refuse_when_the_leverage_read_fails(self):
+        async def get(path_url, params=None, **kwargs):
+            raise IOError("leverage read down")
+
+        self._orders_open(get, IOError("Leverage adjustment unavailable while orders are open"))
+        confirmed = await self.exchange.confirm_leverage_and_margin(
+            self.trading_pair, 1, MarginMode.ISOLATED, position_side=PositionSide.LONG,
+        )
+        self.assertFalse(confirmed)
+        self.assertFalse(self.exchange._leverage_explicit)
+        self.assertIn("live leverage read failed", self.exchange.leverage_confirmation_error())
+
+    async def test_other_leverage_errors_do_not_read_position_leverage(self):
+        called = []
+
+        async def get(path_url, params=None, **kwargs):
+            called.append(path_url)
+            return {"data": []}
+
+        self._orders_open(get, MexcResponseError(2018, "Cannot exceed the maximum reducible margin 2019"))
+        confirmed = await self.exchange.confirm_leverage_and_margin(
+            self.trading_pair, 1, MarginMode.ISOLATED, position_side=PositionSide.LONG,
+        )
+        self.assertFalse(confirmed)
+        self.assertEqual([], called)
+        self.assertFalse(self.exchange._leverage_explicit)
+
     async def test_hedge_close_without_a_position_id_is_refused(self):
         self.exchange._position_mode_confirmed = True
         self.exchange._perpetual_trading.set_position_mode(PositionMode.HEDGE)
