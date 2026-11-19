@@ -1824,6 +1824,82 @@ class RangeIcebergExecutorTests(IsolatedAsyncioWrapperTestCase):
         self.assertEqual(Decimal("10"), resumed.filled_base)
         self.assertEqual(Decimal("30"), resumed._open_unit())
 
+    def test_restart_keeps_the_split_rung_that_has_no_order(self):
+        self._fine_step()
+        executor = self._executor(
+            size_unit=SizeUnit.BASE,
+            total_amount=Decimal("100"),
+            levels=2,
+            iceberg=False,
+            visible_count=2,
+            schedule_interval=25,
+            schedule_slices=4,
+            duration=None,
+            schedule_start=ScheduleStart.SUBMIT,
+        )
+        self._run(executor.control_task())
+        self.assertEqual(Decimal("25"), self.buy_ids[0][1])
+        payload = json.loads(executor.executor_info.model_dump_json())
+        resumed = self._executor(
+            size_unit=SizeUnit.BASE,
+            total_amount=Decimal("100"),
+            levels=2,
+            iceberg=False,
+            visible_count=2,
+            schedule_interval=25,
+            schedule_slices=4,
+            duration=None,
+            schedule_start=ScheduleStart.SUBMIT,
+        )
+        resumed.restore_from_custom_info(payload["custom_info"])
+        targets = sum((slot.target_amount for slot in resumed._slices), Decimal("0"))
+        self.assertEqual(Decimal("100"), targets)
+        for _ in range(16):
+            self._run(resumed.control_task())
+            if resumed.filled_base >= Decimal("100"):
+                break
+            resting = [
+                row for row in self.buy_ids
+                if self.orders[row[0]].current_state != OrderState.FILLED
+            ]
+            if resting:
+                order_id, amount, _price, _order_type, _action = resting[-1]
+                self._fill(order_id, amount)
+                continue
+            self.now += 25
+        self.assertEqual(Decimal("100"), resumed.filled_base)
+
+    def test_late_fill_on_a_restored_order_is_not_counted_twice(self):
+        self._book(Decimal("0.084"), Decimal("0.085"))
+        executor = self._up_to(
+            total_amount=Decimal("80"),
+            slice_amount=Decimal("40"),
+            duration=100,
+            schedule_slices=2,
+            schedule_start=ScheduleStart.SUBMIT,
+        )
+        self._run(executor.control_task())
+        self._fill("buy-1", Decimal("10"), Decimal("0.85"), OrderState.PARTIALLY_FILLED)
+        self._run(executor.control_task())
+        payload = json.loads(executor.executor_info.model_dump_json())
+        self.orders["buy-1"].executed_amount_base = Decimal("0")
+        self.orders["buy-1"].executed_amount_quote = Decimal("0")
+        resumed = self._up_to(
+            total_amount=Decimal("80"),
+            slice_amount=Decimal("40"),
+            duration=100,
+            schedule_slices=2,
+            schedule_start=ScheduleStart.SUBMIT,
+        )
+        resumed.restore_from_custom_info(payload["custom_info"])
+        self.assertEqual(Decimal("10"), resumed.filled_base)
+        self.assertEqual(Decimal("30"), resumed._open_unit())
+        self.orders["buy-1"].executed_amount_base = Decimal("10")
+        self.orders["buy-1"].executed_amount_quote = Decimal("0.85")
+        self.assertEqual(Decimal("10"), resumed.filled_base)
+        self.assertEqual(Decimal("30"), resumed._open_unit())
+        self.assertEqual(Decimal("40"), resumed.filled_base + resumed._open_unit())
+
     def test_range_rungs_release_from_the_anchor(self):
         executor = self._executor(
             size_unit=SizeUnit.BASE,

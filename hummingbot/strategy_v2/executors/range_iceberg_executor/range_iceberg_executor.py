@@ -282,6 +282,8 @@ class RangeIcebergExecutor(ExecutorBase):
         self._schedule_last_full_fill_at: Optional[float] = None
         self._schedule_completed_slices = 0
         self._fill_gate_pauses: List[tuple] = []
+        self._snapshotted_entry_base: Dict[str, Decimal] = {}
+        self._snapshotted_entry_quote: Dict[str, Decimal] = {}
         self._entry_pause_started: Optional[float] = None
         self._last_place_timestamp = Decimal("-1")
         self._rng = random.Random(config.random_seed)
@@ -2761,7 +2763,11 @@ class RangeIcebergExecutor(ExecutorBase):
 
     def _slot_open_unit(self, slot: _Slice) -> Decimal:
         if slot.tracked and slot.tracked.order is not None:
-            remaining_base = slot.tracked.order.amount - slot.tracked.executed_amount_base
+            covered = slot.tracked.executed_amount_base
+            seen = self._snapshotted_entry_base.get(slot.order_id or "", Decimal("0"))
+            if seen > covered:
+                covered = seen
+            remaining_base = slot.tracked.order.amount - covered
             if remaining_base < 0:
                 remaining_base = Decimal("0")
         else:
@@ -3661,9 +3667,27 @@ class RangeIcebergExecutor(ExecutorBase):
             if self._is_exit_order(order_id):
                 continue
             part_base, part_quote = self._best_fill(order_id)
+            part_base, part_quote = self._fill_beyond_snapshot(order_id, part_base, part_quote)
             base += part_base
             quote += part_quote
         return base, quote
+
+    def _fill_beyond_snapshot(self, order_id: str, base: Decimal, quote: Decimal):
+        """
+        A restored order's snapshotted fill already sits in restored-entry.
+
+        Only the size reported after that snapshot counts again.
+        """
+        if order_id not in self._snapshotted_entry_base:
+            return base, quote
+        seen = self._snapshotted_entry_base[order_id]
+        seen_quote = self._snapshotted_entry_quote.get(order_id, Decimal("0"))
+        if base <= seen:
+            return Decimal("0"), Decimal("0")
+        extra_quote = quote - seen_quote
+        if extra_quote < 0:
+            extra_quote = Decimal("0")
+        return base - seen, extra_quote
 
     @property
     def total_base(self) -> Decimal:
@@ -3714,6 +3738,20 @@ class RangeIcebergExecutor(ExecutorBase):
         if remainder < 0:
             return Decimal("0")
         return remainder
+
+    def _level_view(self, slot: _Slice) -> dict:
+        executed_base = Decimal("0")
+        executed_quote = Decimal("0")
+        if slot.order_id and slot.order_id != "skipped":
+            executed_base, executed_quote = self._best_fill(slot.order_id)
+        return {
+            "price": str(slot.target_price),
+            "amount": str(slot.target_amount),
+            "order_id": slot.order_id,
+            "filled": slot.is_filled,
+            "executed_base": str(executed_base),
+            "executed_quote": str(executed_quote),
+        }
 
     def get_custom_info(self) -> dict:
         return {
@@ -3778,15 +3816,7 @@ class RangeIcebergExecutor(ExecutorBase):
             "exit_average_price": str(self._exit_average_price()),
             "realized_pnl_quote": str(self._realized_pnl_quote()),
             "exit": self._exit_snapshot(),
-            "levels": [
-                {
-                    "price": str(slot.target_price),
-                    "amount": str(slot.target_amount),
-                    "order_id": slot.order_id,
-                    "filled": slot.is_filled,
-                }
-                for slot in self._slices
-            ],
+            "levels": [self._level_view(slot) for slot in self._slices],
         }
 
     def _exits_configured(self) -> bool:
@@ -6860,21 +6890,58 @@ class RangeIcebergExecutor(ExecutorBase):
         levels = info.get("levels")
         if not isinstance(levels, list):
             return
-        for level in levels:
+        saved = self._slices_from_levels(levels)
+        if self.config.mode == ExecutionMode.RANGE and saved:
+            self._slices = saved
+        for index, level in enumerate(levels):
             if not isinstance(level, dict):
                 continue
             order_id = level.get("order_id")
             if order_id in (None, "", "skipped"):
                 continue
             text = str(order_id)
+            self._remember_snapshotted_fill(text, level)
             if self._is_exit_order(text) or any(slot.order_id == text for slot in self._slices):
                 continue
             order = self.get_in_flight_order(self.config.connector_name, text)
             if order is None or order.is_done:
                 continue
-            self._attach_restored_entry(text, order, level)
+            slot = None
+            if index < len(self._slices) and self._slices[index].tracked is None:
+                slot = self._slices[index]
+            self._attach_restored_entry(text, order, level, slot)
 
-    def _attach_restored_entry(self, order_id: str, order, level: dict) -> None:
+    def _slices_from_levels(self, levels: list) -> List[_Slice]:
+        rebuilt = []
+        for level in levels:
+            if not isinstance(level, dict):
+                continue
+            price = Decimal(str(level.get("price") or "0"))
+            amount = Decimal(str(level.get("amount") or "0"))
+            if price <= 0 or amount <= 0:
+                continue
+            slot = _Slice(LadderLevel(price=price, base_amount=amount))
+            if level.get("order_id") == "skipped":
+                slot.tracked = TrackedOrder(order_id="skipped")
+            rebuilt.append(slot)
+        return rebuilt
+
+    def _remember_snapshotted_fill(self, order_id: str, level: dict) -> None:
+        if "executed_base" not in level:
+            return
+        base = Decimal(str(level.get("executed_base") or "0"))
+        if base <= 0:
+            return
+        self._snapshotted_entry_base[order_id] = base
+        self._snapshotted_entry_quote[order_id] = Decimal(str(level.get("executed_quote") or "0"))
+
+    def _attach_restored_entry(
+        self,
+        order_id: str,
+        order,
+        level: dict,
+        slot: Optional[_Slice] = None,
+    ) -> None:
         if order.price in (None, 0):
             price = Decimal(str(level.get("price") or "0"))
         else:
@@ -6882,8 +6949,8 @@ class RangeIcebergExecutor(ExecutorBase):
         amount = Decimal(str(order.amount or level.get("amount") or "0"))
         if amount <= 0 or price <= 0:
             return
-        slot = None
-        if self.config.mode == ExecutionMode.RANGE:
+        keep_target = slot is not None
+        if slot is None and self.config.mode == ExecutionMode.RANGE:
             slot = next(
                 (
                     item for item in self._slices
@@ -6899,26 +6966,38 @@ class RangeIcebergExecutor(ExecutorBase):
         if slot is None:
             slot = _Slice(LadderLevel(price=price, base_amount=amount))
             self._slices.append(slot)
+        if not keep_target:
+            slot.target_amount = amount
         slot.target_price = price
-        slot.target_amount = amount
         slot.pre_jitter_price = price
         slot.tracked = TrackedOrder(order_id=order_id)
         slot.tracked.order = order
         if order_id not in self._submitted_order_ids:
             self._submitted_order_ids.append(order_id)
+        if "executed_base" not in level:
+            self._subtract_live_fill_from_restored_entry(order)
+
+    def _subtract_live_fill_from_restored_entry(self, order) -> None:
+        """
+        Old snapshots have no per-order executed size.
+
+        If the live order already shows the fill, drop that size from the
+        aggregate so it is not counted twice.
+        """
         executed = Decimal(str(order.executed_amount_base or 0))
-        executed_quote = Decimal(str(order.executed_amount_quote or 0))
         rest = self._accounted_fill_by_order.get("restored-entry", Decimal("0"))
+        if executed <= 0 or rest <= 0:
+            return
+        executed_quote = Decimal(str(order.executed_amount_quote or 0))
         rest_quote = self._accounted_quote_by_order.get("restored-entry", Decimal("0"))
-        if executed > 0 and rest > 0:
-            self._accounted_fill_by_order["restored-entry"] = rest - min(rest, executed)
-            kept_quote = rest_quote - min(rest_quote, executed_quote)
-            self._accounted_quote_by_order["restored-entry"] = kept_quote
-            if self._accounted_fill_by_order["restored-entry"] <= 0:
-                self._accounted_fill_by_order.pop("restored-entry", None)
-                self._accounted_quote_by_order.pop("restored-entry", None)
-            self._accounted_fill_base = sum(self._accounted_fill_by_order.values(), Decimal("0"))
-            self._accounted_fill_quote = sum(self._accounted_quote_by_order.values(), Decimal("0"))
+        self._accounted_fill_by_order["restored-entry"] = rest - min(rest, executed)
+        kept_quote = rest_quote - min(rest_quote, executed_quote)
+        self._accounted_quote_by_order["restored-entry"] = kept_quote
+        if self._accounted_fill_by_order["restored-entry"] <= 0:
+            self._accounted_fill_by_order.pop("restored-entry", None)
+            self._accounted_quote_by_order.pop("restored-entry", None)
+        self._accounted_fill_base = sum(self._accounted_fill_by_order.values(), Decimal("0"))
+        self._accounted_fill_quote = sum(self._accounted_quote_by_order.values(), Decimal("0"))
 
     def _restore_scheduled_entry_fill(self, blob: dict) -> None:
         """
