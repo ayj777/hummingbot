@@ -288,6 +288,9 @@ class RangeIcebergExecutor(ExecutorBase):
         self._pending_restored_entries: Dict[str, tuple] = {}
         self._saved_exchange_order_ids: Dict[str, str] = {}
         self._legacy_entries_halted = False
+        self._snapshot_rest_saved = False
+        self._snapshot_rest_base = Decimal("0")
+        self._snapshot_rest_quote = Decimal("0")
         self._entry_pause_started: Optional[float] = None
         self._last_place_timestamp = Decimal("-1")
         self._rng = random.Random(config.random_seed)
@@ -3675,12 +3678,6 @@ class RangeIcebergExecutor(ExecutorBase):
         return self._sum_best_fills()[1]
 
     def _sum_best_fills(self):
-        # A legacy snapshot cannot say which saved order a fill belongs to.
-        # Keep the saved total and do not add those orders' live fills on top.
-        if self._legacy_entries_halted:
-            base = self._accounted_fill_by_order.get("restored-entry", Decimal("0"))
-            quote = self._accounted_quote_by_order.get("restored-entry", Decimal("0"))
-            return base, quote
         order_ids = set(self._counted_fill_base)
         order_ids.update(self._accounted_fill_by_order)
         for slot in self._slices:
@@ -4233,9 +4230,13 @@ class RangeIcebergExecutor(ExecutorBase):
         full-size close reduces the closable quantity the stop is checked
         against. When a percent trigger moves with the average, the whole
         resting limit is cancelled and replaced once, then left alone until
-        the reprice interval has passed.
+        the reprice interval has passed. A resting close larger than the
+        managed size is cancelled and replaced at that size.
         """
         self._refresh_exit_orders()
+        if self._resting_reduce_only_close_base() > self._managed_base():
+            self._cancel_exit_orders()
+            return
         self._exit_active = "take_profit"
         self._exit_trigger_price = self._trigger_price_for("take_profit")
         if self._exit_done_closing():
@@ -5232,12 +5233,8 @@ class RangeIcebergExecutor(ExecutorBase):
         A sibling_base hint caps it at live minus the size the other
         icebergs still claim. That cap sticks until the next hint, so a
         later drop is not taken from this iceberg. Without a successful
-        read, the own net fill is used. A legacy snapshot with saved orders
-        closes no more than its recorded size, and no more than the live
-        position or a sibling hint when that is smaller.
+        read, the own net fill is used.
         """
-        if self._legacy_entries_halted:
-            return self._legacy_exit_base()
         own = self._position_base()
         if self._hinted_close_base is not None:
             room = self._hinted_close_base
@@ -5254,31 +5251,6 @@ class RangeIcebergExecutor(ExecutorBase):
         if live < 0:
             return own
         return live
-
-    def _legacy_exit_base(self) -> Decimal:
-        """
-        Exit size for a legacy snapshot whose orders cannot be attributed.
-
-        The close is the recorded size. A live position or a sibling hint
-        can only make it smaller. Until a read succeeds, the recorded size
-        is the close.
-        """
-        saved = self._accounted_fill_by_order.get("restored-entry", Decimal("0"))
-        saved -= self._exit_filled_base()
-        if saved < 0:
-            saved = Decimal("0")
-        size = saved
-        if self._position_sync_ok and self._live_position_base is not None:
-            live = self._live_position_base
-            if live < 0:
-                live = Decimal("0")
-            if live < size:
-                size = live
-        if self._hinted_close_base is not None and self._hinted_close_base < size:
-            size = self._hinted_close_base
-            if size < 0:
-                size = Decimal("0")
-        return size
 
     async def _reconcile_exchange_state(self) -> str:
         """
@@ -6928,9 +6900,10 @@ class RangeIcebergExecutor(ExecutorBase):
         order. An older snapshot with a saved entry order cannot say which
         order a fill belongs to, so it places no new entries and says
         legacy_snapshot_entries_halted. That halt stays until a new executor
-        starts. The close is the recorded size, and no larger than the live
-        position or a sibling hint. A saved id the tracker does not have is
-        queried, then backed off and paused like any other unknown order.
+        starts. Each saved order's executed size comes from the tracker or
+        from the same order lookup as any other restore. After that it is
+        the per-order size. A saved id the tracker does not have is queried,
+        then backed off and paused like any other unknown order.
         """
         if isinstance(info, dict) and info.get("legacy_entries_halted"):
             self._legacy_entries_halted = True
@@ -6953,12 +6926,12 @@ class RangeIcebergExecutor(ExecutorBase):
             has_saved_order = True
             if "executed_base" not in level:
                 legacy = True
+                self._snapshot_tracked_legacy_fill(str(order_id))
                 continue
             self._remember_snapshotted_fill(str(order_id), level)
         if legacy and has_saved_order:
             self._legacy_entries_halted = True
-        if not legacy and not self._legacy_entries_halted:
-            self._keep_snapshot_fills_on_their_orders()
+        self._keep_snapshot_fills_on_their_orders()
         for index, level in enumerate(levels):
             if not isinstance(level, dict):
                 continue
@@ -6996,6 +6969,19 @@ class RangeIcebergExecutor(ExecutorBase):
             rebuilt.append(slot)
         return rebuilt
 
+    def _snapshot_tracked_legacy_fill(self, order_id: str) -> None:
+        """
+        A legacy level has no executed size. The tracker is that size.
+        """
+        order = self.get_in_flight_order(self.config.connector_name, order_id)
+        if order is None:
+            return
+        base = Decimal(str(order.executed_amount_base or 0))
+        if base <= 0:
+            return
+        self._snapshotted_entry_base[order_id] = base
+        self._snapshotted_entry_quote[order_id] = Decimal(str(order.executed_amount_quote or 0))
+
     def _remember_snapshotted_fill(self, order_id: str, level: dict) -> None:
         if "executed_base" not in level:
             return
@@ -7017,19 +7003,22 @@ class RangeIcebergExecutor(ExecutorBase):
             self._accounted_fill_by_order[order_id] = base
             quote = self._snapshotted_entry_quote.get(order_id, Decimal("0"))
             self._accounted_quote_by_order[order_id] = quote
-        rest = self._accounted_fill_by_order.get("restored-entry", Decimal("0"))
-        if rest > 0:
-            covered = sum(self._snapshotted_entry_base.values(), Decimal("0"))
-            covered_quote = sum(self._snapshotted_entry_quote.values(), Decimal("0"))
+        if not self._snapshot_rest_saved:
+            rest = self._accounted_fill_by_order.get("restored-entry", Decimal("0"))
             rest_quote = self._accounted_quote_by_order.get("restored-entry", Decimal("0"))
-            kept = rest - min(rest, covered)
-            kept_quote = rest_quote - min(rest_quote, covered_quote)
-            if kept <= 0:
-                self._accounted_fill_by_order.pop("restored-entry", None)
-                self._accounted_quote_by_order.pop("restored-entry", None)
-            else:
-                self._accounted_fill_by_order["restored-entry"] = kept
-                self._accounted_quote_by_order["restored-entry"] = kept_quote
+            self._snapshot_rest_base = rest
+            self._snapshot_rest_quote = rest_quote
+            self._snapshot_rest_saved = True
+        covered = sum(self._snapshotted_entry_base.values(), Decimal("0"))
+        covered_quote = sum(self._snapshotted_entry_quote.values(), Decimal("0"))
+        kept = self._snapshot_rest_base - min(self._snapshot_rest_base, covered)
+        kept_quote = self._snapshot_rest_quote - min(self._snapshot_rest_quote, covered_quote)
+        if kept <= 0:
+            self._accounted_fill_by_order.pop("restored-entry", None)
+            self._accounted_quote_by_order.pop("restored-entry", None)
+        else:
+            self._accounted_fill_by_order["restored-entry"] = kept
+            self._accounted_quote_by_order["restored-entry"] = kept_quote
         self._accounted_fill_base = sum(self._accounted_fill_by_order.values(), Decimal("0"))
         self._accounted_fill_quote = sum(self._accounted_quote_by_order.values(), Decimal("0"))
 
@@ -7098,13 +7087,28 @@ class RangeIcebergExecutor(ExecutorBase):
                 self._pending_restored_entries.pop(order_id, None)
                 self._unresolved_entry_ids.discard(order_id)
                 self._clear_open_retry(order_id)
+                self._adopt_resolved_entry_size(order_id)
                 continue
             if self._restored_entry_size_is_known(order_id, state):
+                self._adopt_resolved_entry_size(order_id)
                 self._close_unresolved_entry(order_id)
                 self._unresolved_entry_ids.discard(order_id)
                 self._clear_open_retry(order_id)
                 continue
             self._backoff_or_halt_unknown(order_id, self._unknown_restore_reason(state))
+
+    def _adopt_resolved_entry_size(self, order_id: str) -> None:
+        """
+        A resolved legacy order keeps its executed size, like executed_base.
+        """
+        if order_id in self._snapshotted_entry_base:
+            return
+        base, quote = self._best_fill(order_id)
+        if base <= 0:
+            return
+        self._snapshotted_entry_base[order_id] = base
+        self._snapshotted_entry_quote[order_id] = quote
+        self._keep_snapshot_fills_on_their_orders()
 
     def _restored_entry_size_is_known(self, order_id: str, state) -> bool:
         if self._is_confirmed_absent(state) or state == OrderState.CANCELED:

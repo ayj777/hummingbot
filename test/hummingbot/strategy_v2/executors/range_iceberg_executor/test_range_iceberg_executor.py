@@ -2010,8 +2010,6 @@ class RangeIcebergExecutorTests(IsolatedAsyncioWrapperTestCase):
         for level in payload["custom_info"]["levels"]:
             level.pop("executed_base", None)
             level.pop("executed_quote", None)
-        self.orders["buy-1"].executed_amount_base = Decimal("0")
-        self.orders["buy-1"].executed_amount_quote = Decimal("0")
         resumed = self._up_to(
             total_amount=Decimal("80"),
             slice_amount=Decimal("40"),
@@ -2251,7 +2249,7 @@ class RangeIcebergExecutorTests(IsolatedAsyncioWrapperTestCase):
         self.now += 4
         self._run(resumed.control_task())
         self.assertEqual(2, len(self._entry_orders()))
-        self.assertEqual(Decimal("25"), resumed._managed_base())
+        self.assertEqual(Decimal("50"), resumed._managed_base())
 
     def _legacy_saved_rung(self, live_amount):
         self._fine_step()
@@ -2300,6 +2298,77 @@ class RangeIcebergExecutorTests(IsolatedAsyncioWrapperTestCase):
         resumed = self._executor(**kwargs)
         resumed.restore_from_custom_info(payload["custom_info"])
         return resumed, held
+
+    def test_a_fill_while_down_on_a_saved_order_is_protected(self):
+        self._fine_step()
+        self._book(Decimal("0.08000"), Decimal("0.08010"))
+        exits = dict(
+            take_profit=RangeIcebergExitConfig(percent=Decimal("0.02")),
+            stop_loss=RangeIcebergExitConfig(percent=Decimal("0.02")),
+        )
+        kwargs = dict(
+            size_unit=SizeUnit.BASE,
+            total_amount=Decimal("100"),
+            levels=4,
+            iceberg=False,
+            visible_count=4,
+            schedule_interval=25,
+            schedule_slices=2,
+            duration=None,
+            schedule_start=ScheduleStart.SUBMIT,
+            **exits,
+        )
+        executor = self._executor(**kwargs)
+        self._run(executor.control_task())
+        self._run(executor.control_task())
+        self._fill("buy-2", Decimal("25"))
+        payload = json.loads(executor.executor_info.model_dump_json())
+        for level in payload["custom_info"]["levels"]:
+            level.pop("executed_base", None)
+            level.pop("executed_quote", None)
+        self._fill("buy-1", Decimal("25"))
+        held = {"amount": Decimal("50")}
+
+        async def update():
+            self.connector.account_positions = {
+                "long": SimpleNamespace(
+                    trading_pair="AIOT-USDT",
+                    position_side=PositionSide.LONG,
+                    amount=held["amount"],
+                ),
+            }
+
+        self.connector._update_positions = update
+        resumed = self._executor(**kwargs)
+        resumed.restore_from_custom_info(payload["custom_info"])
+        self._book(Decimal("0.07"), Decimal("0.07"))
+        self._run(resumed.control_task())
+        closes = [row for row in self.buy_ids if row[4] == PositionAction.CLOSE]
+        self.assertEqual(Decimal("50"), resumed.filled_base)
+        self.assertEqual(Decimal("50"), resumed._managed_base())
+        self.assertEqual([Decimal("50")], [row[1] for row in closes])
+        self.assertNotEqual(CloseType.STOP_LOSS, resumed.close_type)
+
+    def test_a_resting_close_shrinks_when_the_managed_size_drops(self):
+        resumed, held = self._legacy_saved_rung(Decimal("25"))
+        self._book(Decimal("0.08300"), Decimal("0.08310"))
+        self._run(resumed.control_task())
+        closes = [row for row in self.buy_ids if row[4] == PositionAction.CLOSE]
+        self.assertEqual([(Decimal("25"), OrderType.LIMIT)], [(row[1], row[3]) for row in closes])
+        held["amount"] = Decimal("40")
+        resumed.set_sibling_base(Decimal("30"))
+        self.now += 4
+        self._run(resumed.control_task())
+        self.assertEqual(Decimal("10"), resumed._managed_base())
+        self.now += 1
+        self._run(resumed.control_task())
+        closes = [row for row in self.buy_ids if row[4] == PositionAction.CLOSE]
+        self.assertEqual((Decimal("10"), OrderType.LIMIT), (closes[-1][1], closes[-1][3]))
+        working = [
+            slot for slot in resumed._exit_slices
+            if slot.is_working and not slot.cancel_requested
+        ]
+        self.assertEqual([Decimal("10")], [slot.target_amount for slot in working])
 
     def test_a_legacy_halt_does_not_close_a_sibling_long(self):
         resumed, held = self._legacy_saved_rung(Decimal("75"))
