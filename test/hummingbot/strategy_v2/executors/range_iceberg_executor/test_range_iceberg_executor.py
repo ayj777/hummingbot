@@ -1894,6 +1894,7 @@ class RangeIcebergExecutorTests(IsolatedAsyncioWrapperTestCase):
             schedule_start=ScheduleStart.SUBMIT,
         )
         resumed.restore_from_custom_info(payload["custom_info"])
+        self.assertFalse(resumed.get_custom_info()["entry_paused"])
         self.assertEqual(Decimal("10"), resumed.filled_base)
         self.assertEqual(Decimal("30"), resumed._open_unit())
         self.orders["buy-1"].executed_amount_base = Decimal("10")
@@ -2179,7 +2180,7 @@ class RangeIcebergExecutorTests(IsolatedAsyncioWrapperTestCase):
         self.assertIsNotNone(report["stop_loss_trigger_price"])
         self.assertEqual(1, len(self.buy_ids))
 
-    def test_a_legacy_floor_keeps_later_fills(self):
+    def test_a_legacy_snapshot_does_not_buy_the_other_saved_rung_again(self):
         self._fine_step()
         self._book(Decimal("0.08000"), Decimal("0.08010"))
         exits = dict(
@@ -2189,23 +2190,24 @@ class RangeIcebergExecutorTests(IsolatedAsyncioWrapperTestCase):
         executor = self._executor(
             size_unit=SizeUnit.BASE,
             total_amount=Decimal("100"),
-            levels=2,
+            levels=4,
             iceberg=False,
-            visible_count=2,
+            visible_count=4,
             schedule_interval=25,
-            schedule_slices=4,
+            schedule_slices=2,
             duration=None,
             schedule_start=ScheduleStart.SUBMIT,
             **exits,
         )
         self._run(executor.control_task())
-        self.assertEqual(Decimal("25"), self.buy_ids[0][1])
-        self._fill("buy-1", Decimal("25"))
+        self._run(executor.control_task())
+        self.assertEqual([Decimal("25"), Decimal("25")], [row[1] for row in self.buy_ids])
+        self._fill("buy-2", Decimal("25"))
         payload = json.loads(executor.executor_info.model_dump_json())
         for level in payload["custom_info"]["levels"]:
             level.pop("executed_base", None)
             level.pop("executed_quote", None)
-        self.orders.pop("buy-1")
+        self.orders.pop("buy-2")
         held = {"amount": Decimal("25")}
 
         async def resolve(trading_pair, client_order_id, exchange_order_id=None):
@@ -2225,43 +2227,28 @@ class RangeIcebergExecutorTests(IsolatedAsyncioWrapperTestCase):
         resumed = self._executor(
             size_unit=SizeUnit.BASE,
             total_amount=Decimal("100"),
-            levels=2,
+            levels=4,
             iceberg=False,
-            visible_count=2,
+            visible_count=4,
             schedule_interval=25,
-            schedule_slices=4,
+            schedule_slices=2,
             duration=None,
             schedule_start=ScheduleStart.SUBMIT,
             **exits,
         )
         resumed.restore_from_custom_info(payload["custom_info"])
         self._run(resumed.control_task())
-        self.assertEqual(Decimal("25"), resumed.filled_base)
-        self.assertEqual(1, len(self.buy_ids))
-        self.now += 25
-        self._run(resumed.control_task())
+        report = resumed.get_custom_info()
         self.assertEqual(2, len(self.buy_ids))
-        self.assertEqual(Decimal("25"), self.buy_ids[1][1])
-        self._fill("buy-2", Decimal("25"))
+        self.assertTrue(report["entry_paused"])
+        self.assertIn("legacy_snapshot_entries_halted", report["status_reason"])
+        self.assertEqual(Decimal("25"), resumed._managed_base())
+        self._fill("buy-1", Decimal("25"))
         held["amount"] = Decimal("50")
         self.now += 4
         self._run(resumed.control_task())
-        self.assertEqual(Decimal("50"), resumed.filled_base)
-        self.assertEqual(Decimal("50"), resumed._position_base())
-        self.assertEqual(Decimal("50"), resumed._managed_base())
         self.assertEqual(2, len(self.buy_ids))
-        self.now += 25
-        self._run(resumed.control_task())
-        self.assertEqual(3, len(self.buy_ids))
-        self.assertEqual(Decimal("25"), self.buy_ids[2][1])
-        self._fill("buy-3", Decimal("25"))
-        held["amount"] = Decimal("75")
-        self.now += 4
-        self._run(resumed.control_task())
-        self.assertEqual(Decimal("75"), resumed.filled_base)
-        self.assertEqual(Decimal("75"), resumed._position_base())
-        self.assertEqual(Decimal("75"), resumed._managed_base())
-        self.assertEqual(3, len(self.buy_ids))
+        self.assertEqual(Decimal("50"), resumed._managed_base())
 
     def test_range_rungs_release_from_the_anchor(self):
         executor = self._executor(

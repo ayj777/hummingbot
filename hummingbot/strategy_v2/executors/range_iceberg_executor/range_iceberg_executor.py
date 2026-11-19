@@ -287,8 +287,7 @@ class RangeIcebergExecutor(ExecutorBase):
         self._unresolved_entry_ids: Set[str] = set()
         self._pending_restored_entries: Dict[str, tuple] = {}
         self._saved_exchange_order_ids: Dict[str, str] = {}
-        self._legacy_entry_snapshot = False
-        self._legacy_saved_ids: Set[str] = set()
+        self._legacy_entries_halted = False
         self._entry_pause_started: Optional[float] = None
         self._last_place_timestamp = Decimal("-1")
         self._rng = random.Random(config.random_seed)
@@ -3396,6 +3395,8 @@ class RangeIcebergExecutor(ExecutorBase):
             return self._cap_block_reason
         if self._exit_error:
             return self._exit_error
+        if self._entry_pause_reason == "legacy_snapshot_entries_halted":
+            return self._entry_pause_reason
         return ""
 
     def to_format_status(self):
@@ -3653,6 +3654,12 @@ class RangeIcebergExecutor(ExecutorBase):
         return self._sum_best_fills()[1]
 
     def _sum_best_fills(self):
+        # A legacy snapshot cannot say which saved order a fill belongs to.
+        # Keep the saved total and do not add those orders' live fills on top.
+        if self._legacy_entries_halted:
+            base = self._accounted_fill_by_order.get("restored-entry", Decimal("0"))
+            quote = self._accounted_quote_by_order.get("restored-entry", Decimal("0"))
+            return base, quote
         order_ids = set(self._counted_fill_base)
         order_ids.update(self._accounted_fill_by_order)
         for slot in self._slices:
@@ -3660,31 +3667,13 @@ class RangeIcebergExecutor(ExecutorBase):
                 order_ids.add(slot.order_id)
         base = Decimal("0")
         quote = Decimal("0")
-        saved_base = Decimal("0")
-        saved_quote = Decimal("0")
-        prior_base = Decimal("0")
-        prior_quote = Decimal("0")
         for order_id in order_ids:
             if self._is_exit_order(order_id):
                 continue
             part_base, part_quote = self._best_fill(order_id)
-            # The saved total covers only the orders in that snapshot. Fills on
-            # orders placed after the restore are added on top.
-            if self._legacy_entry_snapshot and order_id == "restored-entry":
-                saved_base = part_base
-                saved_quote = part_quote
-                continue
-            if self._legacy_entry_snapshot and order_id in self._legacy_saved_ids:
-                prior_base += part_base
-                prior_quote += part_quote
-                continue
             base += part_base
             quote += part_quote
-        if not self._legacy_entry_snapshot:
-            return base, quote
-        if saved_base >= prior_base:
-            return saved_base + base, saved_quote + quote
-        return prior_base + base, prior_quote + quote
+        return base, quote
 
     @property
     def total_base(self) -> Decimal:
@@ -5221,8 +5210,12 @@ class RangeIcebergExecutor(ExecutorBase):
         A sibling_base hint caps it at live minus the size the other
         icebergs still claim. That cap sticks until the next hint, so a
         later drop is not taken from this iceberg. Without a successful
-        read, the own net fill is used.
+        read, the own net fill is used. A legacy snapshot with saved orders
+        uses the live read, capped to this executor, and never below the
+        saved total.
         """
+        if self._legacy_entries_halted:
+            return self._legacy_exit_base()
         own = self._position_base()
         if self._hinted_close_base is not None:
             room = self._hinted_close_base
@@ -5239,6 +5232,30 @@ class RangeIcebergExecutor(ExecutorBase):
         if live < 0:
             return own
         return live
+
+    def _legacy_exit_base(self) -> Decimal:
+        """
+        Exit size for a legacy snapshot whose orders cannot be attributed.
+
+        The live position is capped to this executor. It is never below the
+        saved total. Until a read succeeds, the saved total is the size.
+        """
+        saved = self._accounted_fill_by_order.get("restored-entry", Decimal("0"))
+        saved -= self._exit_filled_base()
+        if saved < 0:
+            saved = Decimal("0")
+        if not self._position_sync_ok or self._live_position_base is None:
+            return saved
+        live = self._live_position_base
+        if live < 0:
+            live = Decimal("0")
+        cap = self._target_base()
+        if self._hinted_close_base is not None:
+            cap = self._hinted_close_base if cap <= 0 else min(cap, self._hinted_close_base)
+        size = Decimal("0") if cap <= 0 else min(live, cap)
+        if size < saved:
+            return saved
+        return size
 
     async def _reconcile_exchange_state(self) -> str:
         """
@@ -6884,12 +6901,11 @@ class RangeIcebergExecutor(ExecutorBase):
         Saved entry orders stay unresolved until their state and size are known.
 
         A snapshot that records executed size keeps max(snapshot, live) on that
-        order.         An older snapshot has no per-order size. Its fill is the larger of the
-        saved total and the live size of those saved orders, never the sum, and
-        never below the saved total. Fills on orders placed after the restore
-        are added. The position and the managed size use that fill, so the take
-        profit and the stop cover it. A saved id the tracker does not have is
-        queried, then backed off and paused like any other unknown order.
+        order. An older snapshot with a saved entry order cannot say which
+        order a fill belongs to, so it places no new entries and says
+        legacy_snapshot_entries_halted. Exits keep running off the live
+        position. A saved id the tracker does not have is queried, then backed
+        off and paused like any other unknown order.
         """
         if not self._resume_entries or self._schedule is None or not isinstance(info, dict):
             return
@@ -6900,21 +6916,19 @@ class RangeIcebergExecutor(ExecutorBase):
         if self.config.mode == ExecutionMode.RANGE and saved:
             self._slices = saved
         legacy = False
-        saved_ids = set()
+        has_saved_order = False
         for level in levels:
             if not isinstance(level, dict):
                 continue
             order_id = level.get("order_id")
             if order_id in (None, "", "skipped"):
                 continue
-            saved_ids.add(str(order_id))
+            has_saved_order = True
             if "executed_base" not in level:
                 legacy = True
                 continue
             self._remember_snapshotted_fill(str(order_id), level)
-        self._legacy_entry_snapshot = legacy
-        if legacy:
-            self._legacy_saved_ids = saved_ids
+        self._legacy_entries_halted = legacy and has_saved_order
         if not legacy:
             self._keep_snapshot_fills_on_their_orders()
         for index, level in enumerate(levels):
@@ -6936,6 +6950,8 @@ class RangeIcebergExecutor(ExecutorBase):
                 self._pending_restored_entries[text] = (level, slot)
                 continue
             self._attach_restored_entry(text, order, level, slot)
+        if self._legacy_entries_halted and not self._entry_paused:
+            self.set_entry_paused(True, "legacy_snapshot_entries_halted")
 
     def _slices_from_levels(self, levels: list) -> List[_Slice]:
         rebuilt = []
