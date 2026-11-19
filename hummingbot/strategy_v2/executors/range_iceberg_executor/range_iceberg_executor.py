@@ -1871,8 +1871,9 @@ class RangeIcebergExecutor(ExecutorBase):
         True while a same-side iceberg has just filled its own exit.
 
         A flat read in that window is not counted, so one tier's exit does
-        not end the others. After the grace, a book that stays flat still
-        ends every tier.
+        not end the others. The fill also stamps the connector, so the grace
+        still holds after that tier is removed from the active list. After
+        the grace, a book that stays flat still ends every tier.
         """
         slot = self._side_slot()
         for peer in self._range_iceberg_peers():
@@ -1880,7 +1881,35 @@ class RangeIcebergExecutor(ExecutorBase):
                 continue
             if peer._exit_fill_grace_active():
                 return True
-        return False
+        connector = self.connectors[self.config.connector_name]
+        stamps = getattr(connector, "_hb_range_iceberg_exit_grace_until", None)
+        if not isinstance(stamps, dict):
+            return False
+        deadline = stamps.get(slot)
+        if not isinstance(deadline, (int, float)) or isinstance(deadline, bool):
+            return False
+        now = float(self._strategy.current_timestamp)
+        return now <= float(deadline)
+
+    def _note_shared_exit_grace(self) -> None:
+        """
+        Remember this side's exit fill until the grace window ends.
+
+        The stamp lives on the connector. A later store of the finished
+        executor does not erase it.
+        """
+        if self._exit_last_fill_at is None:
+            return
+        connector = self.connectors[self.config.connector_name]
+        stamps = getattr(connector, "_hb_range_iceberg_exit_grace_until", None)
+        if not isinstance(stamps, dict):
+            stamps = {}
+            connector._hb_range_iceberg_exit_grace_until = stamps
+        deadline = float(self._exit_last_fill_at) + float(self._POSITION_SYNC_SECONDS)
+        slot = self._side_slot()
+        previous = stamps.get(slot)
+        if isinstance(previous, bool) or not isinstance(previous, (int, float)) or deadline > float(previous):
+            stamps[slot] = deadline
 
     def _drop_stop_ids_claimed_by_peers(self, keep_lower_id: bool = False) -> None:
         """
@@ -3338,6 +3367,7 @@ class RangeIcebergExecutor(ExecutorBase):
                 self._exit_retry_after = None
                 self._exit_error = ""
                 self._exit_last_fill_at = float(getattr(event, "timestamp", None) or self._strategy.current_timestamp)
+                self._note_shared_exit_grace()
                 self._exit_seen_fill_base = self._exit_filled_base()
             if self._slot_for(order_id) is not None or order_id in self._submitted_order_ids:
                 self._current_retries = 0
@@ -4423,6 +4453,7 @@ class RangeIcebergExecutor(ExecutorBase):
         if filled > self._exit_seen_fill_base:
             self._exit_seen_fill_base = filled
             self._exit_last_fill_at = float(self._strategy.current_timestamp)
+            self._note_shared_exit_grace()
 
     def _stop_quiet_seconds(self) -> float:
         mark = self._exit_last_fill_at if self._exit_last_fill_at is not None else self._exit_started_at
@@ -4977,6 +5008,7 @@ class RangeIcebergExecutor(ExecutorBase):
             and not isinstance(stamp, bool)
             and now + 1e-9 < float(stamp) + float(self._POSITION_SYNC_SECONDS)
         )
+        self._position_read_refreshed = not fresh
         if not fresh:
             try:
                 result = updater()
@@ -5040,6 +5072,10 @@ class RangeIcebergExecutor(ExecutorBase):
 
     def _capture_sibling_hint(self, live: Decimal):
         if not self._sibling_base_fresh or self._sibling_base is None:
+            return
+        # A cached read can still be the other tiers only. Keep the hint
+        # until a refresh shows at least this tier's own open base.
+        if live < self._position_base() and not getattr(self, "_position_read_refreshed", False):
             return
         room = live - self._sibling_base
         if room < 0:
@@ -5928,6 +5964,8 @@ class RangeIcebergExecutor(ExecutorBase):
         position = self._managed_base()
         if trigger is None or position < self._min_order_size():
             return False
+        if self._sibling_book_blocks_stop_replace():
+            return False
         saved = [dict(stop) for stop in self._exchange_stops]
         if self._exchange_stop_order_ids():
             outcome = await self._request_exchange_stop_cancel(backoff=False)
@@ -6191,6 +6229,27 @@ class RangeIcebergExecutor(ExecutorBase):
             total += peer._resting_reduce_only_close_base()
         return total
 
+    def _sibling_book_blocks_stop_replace(self) -> bool:
+        """
+        Keep a live stop when the replacement vol does not fit beside siblings.
+
+        The resize path cancels first. If the new place then fails the room
+        check, the restore place fails it too, and the working stop is gone.
+        Sibling orders are left alone.
+        """
+        if not self._exchange_stop_order_ids():
+            return False
+        amount = self._closable_stop_amount()
+        if amount < self._min_order_size():
+            amount = self._exchange_stop_amount
+        if amount < self._min_order_size():
+            return False
+        short = self._sibling_stop_room_short(amount)
+        if short is None:
+            return False
+        self._note_exchange_stop_failure(RuntimeError(short))
+        return True
+
     def _sibling_stop_room_short(self, amount: Decimal) -> Optional[str]:
         reserved = self._peer_reserved_close_base()
         if reserved <= 0 or not self._position_sync_ok or self._live_position_base is None:
@@ -6333,6 +6392,13 @@ class RangeIcebergExecutor(ExecutorBase):
             self._choose_exit() == "stop_loss" or self._exit_active == "stop_loss"
         ):
             return
+        if (
+            self._exchange_stop_order_ids()
+            and self._hinted_close_base is not None
+            and self._hinted_close_base < self._min_order_size()
+        ):
+            await self._request_exchange_stop_cancel()
+            return
         if self._exit_active == "take_profit" and self._exchange_stop_needs_resize():
             return
         if not self._protective_stop_supported():
@@ -6354,6 +6420,12 @@ class RangeIcebergExecutor(ExecutorBase):
         trigger = self._exchange_stop_trigger_price()
         position = self._managed_base()
         if trigger is None or position < self._min_order_size():
+            if (
+                self._exchange_stop_order_ids()
+                and self._hinted_close_base is not None
+                and self._hinted_close_base < self._min_order_size()
+            ):
+                await self._request_exchange_stop_cancel()
             return
         if self._exchange_stop_order_ids() and not await self._align_exchange_stop_prices():
             if (
@@ -6372,6 +6444,8 @@ class RangeIcebergExecutor(ExecutorBase):
             return
         saved = [dict(stop) for stop in self._exchange_stops]
         if self._exchange_stop_order_ids():
+            if self._sibling_book_blocks_stop_replace():
+                return
             outcome = await self._request_exchange_stop_cancel()
             if outcome == "failed" or outcome == "partial":
                 return

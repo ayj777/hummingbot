@@ -4563,3 +4563,89 @@ class RangeIcebergExitTests(IsolatedAsyncioWrapperTestCase):
         self.assertEqual("idle", restored.get_custom_info()["exit_status"])
         self.assertEqual(entries + 1, len(self.buy_ids))
         self.assertEqual(Decimal("100"), self.buy_ids[-1][1])
+
+    def test_a_full_sibling_book_does_not_cancel_the_live_stop(self):
+        state = self._install_mexc_stop_book()
+        self._mid(Decimal("0.085"))
+        executor = self._executor(stop_loss={"price": "0.07", "execution": "SINGLE"})
+        self._open_entry(executor)
+        self._run(executor.control_task())
+        self.assertEqual("stop-1", executor.get_custom_info()["exchange_stop_order_id"])
+        executor._exchange_stops[0]["price"] = Decimal("0.01")
+        executor._exchange_stop_price = Decimal("0.01")
+        peer = self._executor(stop_loss={"price": "0.05", "execution": "SINGLE"})
+        peer._exchange_stops = [{"id": "stop-peer", "amount": Decimal("100"), "price": Decimal("0.05")}]
+        peer._exchange_stop_order_id = "stop-peer"
+        peer._exchange_stop_amount = Decimal("100")
+        self._register_executors(executor, peer)
+        self._install_position_source({"amount": Decimal("100")})
+        cancelled = len(state["cancelled"])
+        placed = len(state["placed"])
+        self.now += 4
+        self._run(executor.control_task())
+        self.assertEqual("stop-1", executor.get_custom_info()["exchange_stop_order_id"])
+        self.assertEqual(cancelled, len(state["cancelled"]))
+        self.assertEqual(placed, len(state["placed"]))
+        self.assertIn("closable quantity", executor.get_custom_info()["exchange_stop_error"])
+        self.assertIn("stop-1", state["stops"])
+
+    def test_a_cached_read_below_our_fill_does_not_stick_the_hint(self):
+        holder = {"amount": Decimal("40")}
+        self._install_position_source(holder)
+        self._mid(Decimal("0.085"))
+        executor = self._executor(
+            stop_loss={"price": "0.07", "execution": "SINGLE"},
+            protective_exchange_stop=False,
+        )
+        self._open_entry(executor)
+        self.connector.account_positions = {
+            "long": SimpleNamespace(
+                trading_pair="AIOT-USDT",
+                position_side=PositionSide.LONG,
+                amount=Decimal("40"),
+                update_timestamp=self.now + 1,
+            )
+        }
+        self.connector._hb_range_iceberg_position_read_at = self.now
+        executor.set_sibling_base(Decimal("40"))
+        self._run(executor.control_task())
+        self.assertTrue(executor._sibling_base_fresh)
+        self.assertIsNone(executor._hinted_close_base)
+        holder["amount"] = Decimal("140")
+        self.now += 4
+        self._run(executor.control_task())
+        self.assertFalse(executor._sibling_base_fresh)
+        self.assertEqual(Decimal("100"), executor._hinted_close_base)
+        self.assertEqual(Decimal("100"), executor._managed_base())
+
+    def test_a_zero_hint_cap_cancels_the_live_stop(self):
+        executor, state = self._arm_protected()
+        self._install_position_source({"amount": Decimal("100")})
+        executor.set_sibling_base(Decimal("100"))
+        self._read_again(executor)
+        self.assertEqual(Decimal("0"), executor._managed_base())
+        self.assertIsNone(executor.get_custom_info()["exchange_stop_order_id"])
+        self.assertNotIn("stop-1", state["stops"])
+
+    def test_exit_grace_survives_after_the_tier_is_removed(self):
+        executors, _state = self._arm_tiers()
+        self._register_executors(*executors)
+        executors[0].stop()
+        executors[0]._exit_last_fill_at = self.now
+        executors[0]._note_shared_exit_grace()
+        self.strategy.executor_orchestrator.active_executors["main"] = executors[1:]
+        self._install_position_source({"amount": None})
+        others = executors[1:]
+        self.now += 4
+        for executor in others:
+            self._run(executor.control_task())
+            self.assertFalse(executor.get_custom_info()["external_close"])
+        self.now += 4
+        for executor in others:
+            self._run(executor.control_task())
+            self.assertFalse(executor.get_custom_info()["external_close"])
+            self.assertEqual(RunnableStatus.RUNNING, executor.status)
+        self.now += 4
+        for executor in others:
+            self._run(executor.control_task())
+            self.assertEqual(CloseType.POSITION_CLOSED_EXTERNALLY, executor.close_type)
