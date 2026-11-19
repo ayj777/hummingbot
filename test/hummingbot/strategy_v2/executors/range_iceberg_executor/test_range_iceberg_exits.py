@@ -2940,6 +2940,8 @@ class RangeIcebergExitTests(IsolatedAsyncioWrapperTestCase):
         self.assertEqual({"accepted": True, "reason": ""}, result)
         self.assertEqual("200", executor.get_custom_info()["total_amount"])
         self._run(executor.control_task())
+        self.orders[self.buy_ids[0][0]].current_state = OrderState.CANCELED
+        self._run(executor.control_task())
         self.assertEqual(Decimal("200"), executor.config.total_amount)
         placed = [
             amount for _order_id, amount, _price, _order_type, action in self.buy_ids
@@ -2985,7 +2987,7 @@ class RangeIcebergExitTests(IsolatedAsyncioWrapperTestCase):
         self.assertEqual(Decimal("0.091"), self.buy_ids[-1][2])
         self.assertGreaterEqual(self.strategy.cancel.call_count, 1)
 
-    def test_update_config_reprices_one_slice_per_rate_limit_window(self):
+    def test_update_config_cancels_every_slice_nearest_to_the_market_first(self):
         executor = self._executor(levels=2, min_order_interval=2)
         self._run(executor.control_task())
         self.now += 2
@@ -2995,10 +2997,8 @@ class RangeIcebergExitTests(IsolatedAsyncioWrapperTestCase):
         result = executor.update_config({"price_low": "0.11", "price_high": "0.12"})
         self.assertTrue(result["accepted"], result)
         self._run(executor.control_task())
-        self.assertEqual(1, self.strategy.cancel.call_count)
-        self._run(executor.control_task())
-        self.assertEqual(1, self.strategy.cancel.call_count)
-        self.now += 2
+        cancelled = [call.args[2] for call in self.strategy.cancel.call_args_list]
+        self.assertEqual([self.buy_ids[1][0], self.buy_ids[0][0]], cancelled)
         self._run(executor.control_task())
         self.assertEqual(2, self.strategy.cancel.call_count)
 
@@ -3110,15 +3110,22 @@ class RangeIcebergExitTests(IsolatedAsyncioWrapperTestCase):
         self.assertFalse(result["accepted"])
         self.assertEqual("a parked position hold cannot be edited", result["reason"])
 
-    def test_update_config_rejects_a_ladder_that_cannot_be_built(self):
+    def test_update_config_accepts_a_remainder_below_the_minimum_order_size(self):
         executor = self._executor(total_amount=Decimal("100"))
         self._run(executor.control_task())
         result = executor.update_config({"total_amount": "5"})
-        self.assertFalse(result["accepted"])
+        self.assertTrue(result["accepted"], result)
+        self.assertIn("entries are complete", result["reason"])
         self.assertIn("minimum order size", result["reason"])
-        self.assertEqual(Decimal("100"), executor.config.total_amount)
-        self.assertFalse(executor.get_custom_info()["pending_config_edit"])
-        self.assertEqual(0, self.strategy.cancel.call_count)
+        self._run(executor.control_task())
+        self.orders[self.buy_ids[0][0]].current_state = OrderState.CANCELED
+        self._run(executor.control_task())
+        self.assertEqual(Decimal("5"), executor.config.total_amount)
+        open_amount = sum(
+            (order.amount - order.executed_amount_base for order in self.orders.values() if order.is_open),
+            Decimal("0"),
+        )
+        self.assertEqual(Decimal("0"), open_amount)
 
     def test_update_config_keeps_the_old_plan_when_apply_cannot_build(self):
         executor = self._executor(total_amount=Decimal("100"))
@@ -3147,6 +3154,8 @@ class RangeIcebergExitTests(IsolatedAsyncioWrapperTestCase):
         self.assertTrue(result["accepted"], result)
         order.executed_amount_base = Decimal("70")
         order.executed_amount_quote = Decimal("70") * order.price
+        self._run(executor.control_task())
+        order.current_state = OrderState.CANCELED
         self._run(executor.control_task())
         info = executor.get_custom_info()
         self.assertEqual(Decimal("70"), executor.config.total_amount)
@@ -3312,66 +3321,44 @@ class RangeIcebergExitTests(IsolatedAsyncioWrapperTestCase):
         )
         return [self.buy_ids[index][0] for index in range(4)]
 
-    def test_d11c_shrink_cancels_slices_beyond_the_new_ladder(self):
-        executor = self._executor(levels=4, total_amount=Decimal("100"))
-        order_ids = self._place_four_rungs(executor)
-        result = executor.update_config({"total_amount": "30"})
-        self.assertTrue(result["accepted"], result)
-        self._run(executor.control_task())
-        self.assertEqual(Decimal("30"), executor.config.total_amount)
-        self.assertLessEqual(
-            sum(slot.target_amount for slot in executor._slices),
-            Decimal("30"),
-        )
-        kept = [
-            slot.order_id
-            for slot in executor._slices
-            if slot.order_id in order_ids
-            and slot.is_working
-            and not slot.cancel_requested
-            and not getattr(slot, "edit_cancel", False)
-        ]
-        self.assertEqual([order_ids[0]], kept)
-        for order_id in order_ids[1:]:
-            slot = next(slot for slot in executor._slices if slot.order_id == order_id)
-            self.assertTrue(slot.cancel_requested or getattr(slot, "edit_cancel", False))
-            self.assertEqual(Decimal("0"), slot.target_amount)
-        for _ in range(6):
-            for order_id in order_ids[1:]:
-                order = self.orders[order_id]
-                if order.is_open:
-                    order.current_state = OrderState.CANCELED
-            self._run(executor.control_task())
-        open_amount = sum(
+    def _open_entry_amount(self) -> Decimal:
+        return sum(
             (
-                order.amount - order.executed_amount_base
-                for order in self.orders.values()
-                if order.is_open
+                self.orders[order_id].amount - self.orders[order_id].executed_amount_base
+                for order_id, _amount, _price, _order_type, action in self.buy_ids
+                if action == PositionAction.OPEN and self.orders[order_id].is_open
             ),
             Decimal("0"),
         )
-        self.assertLessEqual(open_amount + executor.filled_base, Decimal("30"))
-        for order_id in order_ids[1:]:
-            self.assertFalse(self.orders[order_id].is_open)
 
-    def test_d11d_shrink_aborts_when_remaining_targets_exceed_the_total(self):
+    def test_d11c_shrink_cancels_every_rung_then_rebuilds(self):
         executor = self._executor(levels=4, total_amount=Decimal("100"))
         order_ids = self._place_four_rungs(executor)
         result = executor.update_config({"total_amount": "30"})
         self.assertTrue(result["accepted"], result)
-        for order_id in order_ids[:3]:
-            self._fill(order_id)
-        cancels = self.strategy.cancel.call_count
         self._run(executor.control_task())
         self.assertEqual(Decimal("100"), executor.config.total_amount)
-        self.assertIn("against the new total", executor.get_custom_info()["config_edit_error"])
-        self.assertFalse(executor.get_custom_info()["pending_config_edit"])
-        self.assertEqual(cancels, self.strategy.cancel.call_count)
-        self.assertEqual(
-            [Decimal("20"), Decimal("20"), Decimal("20"), Decimal("40")],
-            [slot.target_amount for slot in executor._slices],
-        )
-        self.assertFalse(any(getattr(slot, "edit_cancel", False) for slot in executor._slices))
+        cancelled = [call.args[2] for call in self.strategy.cancel.call_args_list]
+        self.assertEqual(set(order_ids), set(cancelled))
+        for order_id in order_ids:
+            self.orders[order_id].current_state = OrderState.CANCELED
+        self._run(executor.control_task())
+        self.assertEqual(Decimal("30"), executor.config.total_amount)
+        self.assertLessEqual(self._open_entry_amount() + executor.filled_base, Decimal("30"))
+        self.assertFalse(executor._entries_frozen)
+
+    def test_d11d_shrink_counts_a_fill_that_lands_during_the_cancels(self):
+        executor = self._executor(levels=4, total_amount=Decimal("100"))
+        order_ids = self._place_four_rungs(executor)
+        result = executor.update_config({"total_amount": "30"})
+        self.assertTrue(result["accepted"], result)
+        self._run(executor.control_task())
+        self._fill(order_ids[0])
+        for order_id in order_ids[1:]:
+            self.orders[order_id].current_state = OrderState.CANCELED
+        self._run(executor.control_task())
+        self.assertLessEqual(self._open_entry_amount() + executor.filled_base, Decimal("30"))
+        self.assertFalse(executor._entries_frozen)
 
     def test_update_config_rejects_a_grow_when_entries_are_not_placed(self):
         executor = self._executor()
@@ -3402,3 +3389,138 @@ class RangeIcebergExitTests(IsolatedAsyncioWrapperTestCase):
         contract_info = contracts.get_custom_info()
         self.assertEqual("10", contract_info["total_amount"])
         self.assertEqual("CONTRACTS", contract_info["size_unit"])
+
+    def test_up_to_shrink_cancels_the_working_slice_and_stays_within_the_total(self):
+        executor = self._executor(
+            mode=ExecutionMode.UP_TO,
+            limit_price=Decimal("0.09"),
+            price_low=None,
+            price_high=None,
+            total_amount=Decimal("100"),
+            slice_amount=Decimal("30"),
+            iceberg=True,
+            visible_count=2,
+            levels=1,
+        )
+        self._run(executor.control_task())
+        self._run(executor.control_task())
+        self.assertEqual([Decimal("30"), Decimal("30")], [self.buy_ids[0][1], self.buy_ids[1][1]])
+        self._fill(self.buy_ids[0][0])
+        result = executor.update_config({"total_amount": "40"})
+        self.assertTrue(result["accepted"], result)
+        self._run(executor.control_task())
+        self.orders[self.buy_ids[1][0]].current_state = OrderState.CANCELED
+        self._run(executor.control_task())
+        self.assertFalse(executor._entries_frozen)
+        self.assertLessEqual(self._open_entry_amount() + executor.filled_base, Decimal("40"))
+
+    def test_iceberg_shrink_rebuilds_and_fills_to_the_new_total(self):
+        executor = self._executor(
+            iceberg=True,
+            visible_count=2,
+            levels=6,
+            total_amount=Decimal("120"),
+        )
+        self._run(executor.control_task())
+        self._run(executor.control_task())
+        self.assertEqual([Decimal("20"), Decimal("20")], [self.buy_ids[0][1], self.buy_ids[1][1]])
+        result = executor.update_config({"total_amount": "50"})
+        self.assertTrue(result["accepted"], result)
+        self._run(executor.control_task())
+        for index in range(2):
+            self.orders[self.buy_ids[index][0]].current_state = OrderState.CANCELED
+        self._run(executor.control_task())
+        self.assertFalse(executor._entries_frozen)
+        placed = [amount for _order_id, amount, _price, _order_type, action in self.buy_ids if action == PositionAction.OPEN]
+        self.assertEqual(Decimal("50"), placed[-1])
+        self._fill(self.buy_ids[-1][0])
+        self._run(executor.control_task())
+        self.assertEqual(Decimal("50"), executor.filled_base)
+        self.assertEqual(Decimal("0"), self._open_entry_amount())
+
+    def test_shrink_during_the_take_profit_hold_leaves_the_exit_alone(self):
+        self._install_mexc_stop_book(fail_times=50)
+        self._mid(Decimal("0.085"))
+        executor = self._executor(
+            levels=2,
+            exit_arming="ON_ANY_FILL",
+            take_profit={"percent": "0.10", "execution": "SINGLE", "order_type": "LIMIT"},
+            stop_loss={"percent": "0.05", "execution": "SINGLE"},
+        )
+        self._run(executor.control_task())
+        self._run(executor.control_task())
+        self._fill(self.buy_ids[0][0])
+        self._run(executor.control_task())
+        self.assertEqual([], [call for call in self._close_calls() if call[1][3] == OrderType.LIMIT])
+        self.assertIn("Next try", executor.get_custom_info()["exchange_stop_error"])
+        failures = executor._exchange_stop_failures
+        result = executor.update_config({"total_amount": "60"})
+        self.assertTrue(result["accepted"], result)
+        self._run(executor.control_task())
+        for order_id, _amount, _price, _order_type, action in self.buy_ids:
+            if action == PositionAction.OPEN and self.orders[order_id].is_open:
+                self.orders[order_id].current_state = OrderState.CANCELED
+        self._run(executor.control_task())
+        self.assertEqual([], [call for call in self._close_calls() if call[1][3] == OrderType.LIMIT])
+        self.assertIn("Next try", executor.get_custom_info()["exchange_stop_error"])
+        self.assertGreaterEqual(executor._exchange_stop_failures, failures)
+        self.assertLessEqual(self._open_entry_amount() + executor.filled_base, Decimal("60"))
+        self.assertFalse(executor._entries_frozen)
+
+    def test_shrink_during_the_slow_stop_retry_keeps_the_take_profit(self):
+        self._install_mexc_stop_book(fail_times=100)
+        self._mid(Decimal("0.085"))
+        executor = self._executor(
+            levels=2,
+            exit_arming="ON_ANY_FILL",
+            take_profit={"price": "0.10", "execution": "SINGLE", "order_type": "LIMIT"},
+            stop_loss={"price": "0.07", "execution": "SINGLE"},
+        )
+        self._run(executor.control_task())
+        self._run(executor.control_task())
+        self._fill(self.buy_ids[0][0])
+        self._run(executor.control_task())
+        for _ in range(12):
+            delay = executor._exchange_stop_retry_after
+            if delay is not None and delay > self.now:
+                self.now = delay
+            else:
+                self.now += 1
+            self._run(executor.control_task())
+            if executor._exchange_stop_failures >= 4 and self._open_limit_closes():
+                break
+        self.assertGreaterEqual(executor._exchange_stop_failures, 4)
+        self.assertTrue(self._open_limit_closes())
+        take_profit = self._open_limit_closes()[0]
+        retry_after = executor._exchange_stop_retry_after
+        self.assertIsNotNone(retry_after)
+        result = executor.update_config({"total_amount": "60"})
+        self.assertTrue(result["accepted"], result)
+        self._run(executor.control_task())
+        for order_id, _amount, _price, _order_type, action in list(self.buy_ids):
+            if action == PositionAction.OPEN and self.orders[order_id].is_open:
+                self.orders[order_id].current_state = OrderState.CANCELED
+        self._run(executor.control_task())
+        self.assertEqual(retry_after, executor._exchange_stop_retry_after)
+        self.assertTrue(take_profit.is_open)
+        self.assertLessEqual(self._open_entry_amount() + executor.filled_base, Decimal("60"))
+        self.assertFalse(executor._entries_frozen)
+
+    def test_entry_rebuild_stays_frozen_when_cancels_time_out(self):
+        executor = self._executor(total_amount=Decimal("100"))
+        self._run(executor.control_task())
+        order_id = self.buy_ids[0][0]
+        result = executor.update_config({"total_amount": "40"})
+        self.assertTrue(result["accepted"], result)
+        self._run(executor.control_task())
+        self.assertTrue(executor._entries_frozen)
+        self.now += 30
+        self._run(executor.control_task())
+        self.assertTrue(executor._entries_frozen)
+        self.assertEqual(Decimal("100"), executor.config.total_amount)
+        self.assertIn("entries stay frozen", executor.get_custom_info()["config_edit_error"])
+        self.assertTrue(self.orders[order_id].is_open)
+        self.assertEqual(1, len([row for row in self.buy_ids if row[4] == PositionAction.OPEN]))
+        self._run(executor.control_task())
+        self.assertTrue(executor._entries_frozen)
+        self.assertEqual(1, len([row for row in self.buy_ids if row[4] == PositionAction.OPEN]))

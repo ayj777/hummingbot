@@ -173,16 +173,18 @@ class RangeIcebergExecutor(ExecutorBase):
     side that this executor does not own is left alone and the software
     stop covers the position.
     update_config edits this executor in place while it is RUNNING: total
-    amount, the range, and take profit or stop loss. The control loop applies
-    the edit before it places or syncs, so the change cannot race a fill.
-    Accepted edits are stored in custom_info config_edits, in this executor's
-    size unit. Resume reads that object only. The reported total_amount,
-    price_low, price_high, take_profit, and stop_loss are the live values
-    and are not applied again. custom_info also reports size_unit beside
-    total_amount. A shrink that leaves fewer rungs cancels the extra working
-    slices instead of parking them on the last price. total_amount cannot
-    grow while entries are not being placed. A second iceberg on the same
-    side is not required.
+    amount, the range, and take profit or stop loss. Take profit and stop
+    loss apply on the next tick. A new total or a new range freezes entry
+    placement, cancels every working entry (nearest to the market first,
+    at most 5 cancels in any 2 seconds), and builds a fresh plan for the
+    size still to buy only after those orders are off the book. Exits keep
+    running during that wait. Accepted edits are stored in custom_info
+    config_edits, in this executor's size unit. Resume reads that object
+    only. The reported total_amount, price_low, price_high, take_profit,
+    and stop_loss are the live values and are not applied again. custom_info
+    also reports size_unit beside total_amount. total_amount cannot grow
+    while entries are not being placed. A second iceberg on the same side
+    is not required.
     A moved percent trigger is repriced with change_stop_plan_price, then resized at
     that same price. Cancel-and-place is only the fallback when the reprice
     fails. protective_exchange_stop defaults to on only if
@@ -344,6 +346,10 @@ class RangeIcebergExecutor(ExecutorBase):
         self._queued_edit_keys: Set[str] = set()
         self._queued_clears_stop = False
         self._clear_exchange_stop = False
+        self._entries_frozen = False
+        self._entry_rebuild_started_at: Optional[float] = None
+        self._edit_cancel_times: List[float] = []
+        self._exit_edits_sent: Set[str] = set()
         self._config_edits: dict = {}
         self._config_edit_error = ""
         self._last_config_edit_applied_at: Optional[float] = None
@@ -668,7 +674,6 @@ class RangeIcebergExecutor(ExecutorBase):
             outcome = await self._request_exchange_stop_cancel()
             if outcome == "confirmed" or not self._exchange_stop_order_ids():
                 self._clear_exchange_stop = False
-        self._service_config_edit_cancels()
         if self._shutdown_pending:
             await self._finish_shutdown()
             return
@@ -685,6 +690,7 @@ class RangeIcebergExecutor(ExecutorBase):
         self._refresh_tracked_orders()
         self._release_cancelled_rungs()
         self._release_cancelled_exit_rungs()
+        self._service_entry_rebuild()
         self._capture_schedule_anchor()
         if self._exit_phase == "done":
             await self._sync_exchange_stop()
@@ -719,7 +725,7 @@ class RangeIcebergExecutor(ExecutorBase):
                 await self._sync_exchange_stop()
                 return
         await self._sync_exchange_stop()
-        if not self._resume_entries:
+        if self._entries_frozen or not self._resume_entries:
             return
         if self.status != RunnableStatus.RUNNING or self._paused:
             return
@@ -760,6 +766,13 @@ class RangeIcebergExecutor(ExecutorBase):
         self._begin_shutdown()
 
     _EDITABLE_CONFIG_FIELDS = ("total_amount", "price_low", "price_high", "take_profit", "stop_loss")
+    _ENTRY_EDIT_FIELDS = ("total_amount", "price_low", "price_high")
+    _ENTRY_REBUILD_TIMEOUT_SECONDS = 30.0
+    _CANCEL_BURST_LIMIT = 5
+    _CANCEL_BURST_WINDOW_SECONDS = 2.0
+    _ENTRIES_COMPLETE_REASON = (
+        "entries are complete; the remaining size is below the minimum order size"
+    )
 
     def update_config(self, changes: dict) -> dict:
         """
@@ -768,8 +781,11 @@ class RangeIcebergExecutor(ExecutorBase):
         changes may set total_amount, price_low, price_high, take_profit, and
         stop_loss. take_profit and stop_loss are the same objects the config
         accepts, or null to clear that exit. The returned dict is
-        {"accepted": bool, "reason": str}. Accepted edits are applied on the
-        next control tick, before any place, cancel, or exchange-stop sync.
+        {"accepted": bool, "reason": str}. A rejected edit is what the API
+        turns into HTTP 409. Take profit and stop loss apply on the next
+        control tick. A new total or a new range waits until the working
+        entries are off the book, then builds a fresh plan for the unfilled
+        size.
         """
         if not isinstance(changes, dict):
             return self._edit_result(False, "changes must be an object")
@@ -789,31 +805,24 @@ class RangeIcebergExecutor(ExecutorBase):
         range_reason = self._stop_price_against_range(candidate)
         if range_reason:
             return self._edit_result(False, range_reason)
-        if "total_amount" in changes:
-            if not self._resume_entries and candidate.total_amount > self.config.total_amount:
-                return self._edit_result(
-                    False,
-                    "cannot grow total_amount while entries are not being placed",
-                )
-            filled = self._filled_amount_in_unit(candidate)
-            if candidate.total_amount < filled:
-                return self._edit_result(
-                    False,
-                    f"cannot shrink total_amount to {candidate.total_amount} "
-                    f"below the filled amount {filled}",
-                )
         if candidate.mode != ExecutionMode.RANGE and ("price_low" in changes or "price_high" in changes):
             return self._edit_result(False, "price_low and price_high apply to RANGE mode")
-        try:
-            if candidate.mode == ExecutionMode.RANGE and ({"total_amount", "price_low", "price_high"} & set(changes)):
-                self._ladder_for_config(candidate)
-            elif "total_amount" in changes:
-                self._require_orderable_total(candidate)
-        except ValueError as exc:
-            return self._edit_result(False, str(exc))
-        reason = ""
+        if (
+            "total_amount" in changes
+            and not self._resume_entries
+            and candidate.total_amount > self.config.total_amount
+        ):
+            return self._edit_result(False, "cannot grow total_amount while entries are not being placed")
+        plan_reason = ""
+        if set(changes) & set(self._ENTRY_EDIT_FIELDS):
+            try:
+                plan_reason = self._inspect_entry_plan(candidate, rejecting_shrink="total_amount" in changes)
+            except ValueError as exc:
+                return self._edit_result(False, str(exc))
+        reason = plan_reason
         if "stop_loss" in changes and candidate.stop_loss is None:
-            reason = "clearing stop_loss cancels the protective exchange stop"
+            stop_reason = "clearing stop_loss cancels the protective exchange stop"
+            reason = f"{reason} {stop_reason}".strip() if reason else stop_reason
         self._queued_config = candidate
         self._queued_edit_keys.update(changes.keys())
         self._queued_clears_stop = "stop_loss" in self._queued_edit_keys and candidate.stop_loss is None
@@ -893,65 +902,86 @@ class RangeIcebergExecutor(ExecutorBase):
             and not self._resume_entries
             and candidate.total_amount > self.config.total_amount
         ):
-            self._queued_config = None
-            self._queued_edit_keys = set()
-            self._queued_clears_stop = False
-            self._config_edit_error = "cannot grow total_amount while entries are not being placed"
-            self.logger().warning("Rejected range iceberg edit: %s", self._config_edit_error)
+            self._reject_queued_edit("cannot grow total_amount while entries are not being placed")
             return
-        clamped = ""
-        if "total_amount" in keys:
-            filled = self._filled_amount_in_unit(candidate)
-            if candidate.total_amount < filled:
+        if keys & set(self._ENTRY_EDIT_FIELDS):
+            if not self._entries_frozen:
                 try:
-                    candidate = self._config_with_changes(candidate, {"total_amount": str(filled)})
-                except (ValidationError, ValueError) as exc:
-                    self._queued_config = None
-                    self._queued_edit_keys = set()
-                    self._queued_clears_stop = False
-                    self._config_edit_error = self._validation_reason(exc)
+                    self._inspect_entry_plan(candidate, rejecting_shrink=False)
+                except ValueError as exc:
+                    self._reject_queued_edit(str(exc))
                     self.logger().error("Rejected range iceberg edit at apply: %s", exc)
                     return
-                clamped = f"total_amount clamped to the filled amount {filled}"
-        new_slices = None
-        if candidate.mode == ExecutionMode.RANGE and keys & {"total_amount", "price_low", "price_high"}:
-            try:
-                levels = self._ladder_for_config(candidate)
-                new_slices = self._retarget_slices(candidate, levels)
-            except ValueError as exc:
-                self._queued_config = None
-                self._queued_edit_keys = set()
-                self._queued_clears_stop = False
-                self._config_edit_error = str(exc)
-                self.logger().error("Rejected range iceberg edit at apply: %s", exc)
-                return
+                self._entries_frozen = True
+                self._entry_rebuild_started_at = float(self._strategy.current_timestamp)
+            self._apply_exit_edits_now(candidate, keys)
+            return
+        self._commit_config_edit(candidate, keys, "")
+
+    def _reject_queued_edit(self, reason: str) -> None:
+        self._queued_config = None
+        self._queued_edit_keys = set()
+        self._queued_clears_stop = False
+        self._entries_frozen = False
+        self._entry_rebuild_started_at = None
+        self._exit_edits_sent.clear()
+        self._config_edit_error = reason
+        self.logger().warning("Rejected range iceberg edit: %s", reason)
+
+    def _commit_config_edit(
+        self,
+        candidate: RangeIcebergExecutorConfig,
+        keys: Set[str],
+        clamped: str,
+        *,
+        touch_exits: bool = True,
+    ) -> None:
         clears_stop = self._queued_clears_stop
         self.config = candidate
         self._queued_config = None
         self._queued_edit_keys = set()
         self._queued_clears_stop = False
-        if new_slices is not None:
-            self._slices = new_slices
-        if keys & {"total_amount", "price_low", "price_high"}:
+        if keys & set(self._ENTRY_EDIT_FIELDS):
             self._resize_schedule_amounts()
-        if keys & {"take_profit", "stop_loss"}:
-            self._tp_reprice_after = None
-            self._exit_plan_ready = False
-            self._exchange_stop_last_request = None
-            if self._exit_active == "take_profit" and self._exit_phase == "resting":
-                self._cancel_exit_orders()
-        if clears_stop:
-            self._clear_exchange_stop = True
+        if touch_exits and keys & {"take_profit", "stop_loss"}:
+            self._arm_exit_edit(clears_stop)
         self._remember_applied_edits(keys, candidate)
         self._last_config_edit_applied_at = float(self._strategy.current_timestamp)
         self._config_edit_error = clamped
+        self._entries_frozen = False
+        self._entry_rebuild_started_at = None
+        self._exit_edits_sent.clear()
+
+    def _arm_exit_edit(self, clears_stop: bool) -> None:
+        self._tp_reprice_after = None
+        self._exit_plan_ready = False
+        self._exchange_stop_last_request = None
+        if self._exit_active == "take_profit" and self._exit_phase == "resting":
+            self._cancel_exit_orders()
+        if clears_stop:
+            self._clear_exchange_stop = True
+
+    def _apply_exit_edits_now(self, candidate: RangeIcebergExecutorConfig, keys: Set[str]) -> None:
+        pending = [key for key in ("take_profit", "stop_loss") if key in keys and key not in self._exit_edits_sent]
+        if not pending:
+            return
+        live = self.config.model_dump()
+        dumped = candidate.model_dump()
+        for key in pending:
+            live[key] = dumped[key]
+        self.config = RangeIcebergExecutorConfig.model_validate(live)
+        self._arm_exit_edit(self._queued_clears_stop and "stop_loss" in pending)
+        self._exit_edits_sent.update(pending)
 
     def _drop_queued_config_edit(self, reason: str = "dropped: executor stopped before apply") -> None:
-        if self._queued_config is None and not self._queued_edit_keys:
+        if self._queued_config is None and not self._queued_edit_keys and not self._entries_frozen:
             return
         self._queued_config = None
         self._queued_edit_keys = set()
         self._queued_clears_stop = False
+        self._entries_frozen = False
+        self._entry_rebuild_started_at = None
+        self._exit_edits_sent.clear()
         self._config_edit_error = reason
         self.logger().warning("Dropped range iceberg edit: %s", reason)
 
@@ -998,12 +1028,6 @@ class RangeIcebergExecutor(ExecutorBase):
             contract_size=contract_size,
         )
 
-    def _require_orderable_total(self, config: RangeIcebergExecutorConfig) -> None:
-        rules = self.get_trading_rules(config.connector_name, config.trading_pair)
-        base = self._amount_in_base(config.total_amount, config.size_unit, config)
-        if base < Decimal(str(rules.min_order_size)):
-            raise ValueError("The total is below the minimum order size.")
-
     def _amount_in_base(self, amount: Decimal, unit: SizeUnit, config: RangeIcebergExecutorConfig) -> Decimal:
         if unit == SizeUnit.BASE:
             return amount
@@ -1047,153 +1071,124 @@ class RangeIcebergExecutor(ExecutorBase):
         price = config.limit_price or config.price_low or Decimal("1")
         return base * price
 
-    def _edited_total_base(self, config: RangeIcebergExecutorConfig, levels) -> Decimal:
+    def _inspect_entry_plan(self, candidate: RangeIcebergExecutorConfig, *, rejecting_shrink: bool) -> str:
         """
-        The new total in base, which is the cap for the slices this edit may keep.
-        """
-        if config.size_unit == SizeUnit.BASE:
-            return config.total_amount
-        if config.size_unit == SizeUnit.CONTRACTS:
-            return self._amount_in_base(config.total_amount, config.size_unit, config)
-        return sum((level.base_amount for level in levels), Decimal("0"))
+        Dry-run the unfilled size.
 
-    def _retarget_slices(self, config: RangeIcebergExecutorConfig, levels) -> List[_Slice]:
+        A total below the current fill is impossible. A remainder below the
+        minimum order size means no more entries will be placed. A range
+        ladder that cannot be built for any other reason is also impossible.
         """
-        Map each working slice onto one new rung.
+        filled = self._filled_amount_in_unit(candidate)
+        if rejecting_shrink and candidate.total_amount < filled:
+            raise ValueError(
+                f"cannot shrink total_amount to {candidate.total_amount} "
+                f"below the filled amount {filled}"
+            )
+        remaining = candidate.total_amount - filled
+        if remaining < 0:
+            remaining = Decimal("0")
+        if self._remaining_is_dust(candidate, remaining):
+            return self._ENTRIES_COMPLETE_REASON
+        if candidate.mode != ExecutionMode.RANGE:
+            return ""
+        try:
+            self._ladder_for_config(candidate, total_amount=remaining)
+        except ValueError as exc:
+            if "minimum order size" in str(exc).lower():
+                return self._ENTRIES_COMPLETE_REASON
+            raise
+        return ""
 
-        A slice past the last new rung is cancelled down to its fill. It is not
-        moved onto the last price, and that price does not gain another slice.
-        The plan is checked before any slice is changed. If the fills plus the
-        size still to be bought exceed the new total, the edit is refused and
-        the old slices stay as they were.
-        """
-        rules = self.get_trading_rules(config.connector_name, config.trading_pair)
-        min_amount = Decimal(str(rules.min_order_size))
-        actions = []
-        level_index = 0
-        for slot in self._slices:
-            if slot.order_id == "skipped" or not (slot.is_working or slot.is_filled):
-                continue
-            filled_on_slot = Decimal("0")
-            if slot.order_id and slot.order_id != "skipped":
-                filled_on_slot, _quote = self._best_fill(slot.order_id)
-            if slot.is_filled:
-                actions.append(("filled", slot, filled_on_slot))
-                if level_index < len(levels):
-                    level_index += 1
-                continue
-            if level_index >= len(levels):
-                actions.append(("drop", slot, filled_on_slot))
-                continue
-            desired = levels[level_index]
-            level_index += 1
-            price = self._slot_price(slot)
-            inside = self._price_inside_config_range(price, config)
-            live = self._working_slice_base(slot)
-            room = desired.base_amount - filled_on_slot
-            if room < 0:
-                room = Decimal("0")
-            if not inside:
-                actions.append(("reprice", slot, desired))
-                continue
-            if live > room:
-                actions.append(("shrink", slot, filled_on_slot + room))
-                continue
-            extra = desired.base_amount - filled_on_slot - live
-            extra_level = None
-            if extra >= min_amount:
-                extra_level = LadderLevel(price=desired.price, base_amount=extra)
-            actions.append(("keep", slot, max(slot.target_amount, live), extra_level))
-        while level_index < len(levels):
-            actions.append(("new", levels[level_index]))
-            level_index += 1
-        commitment = Decimal("0")
-        for action in actions:
-            kind = action[0]
-            if kind == "filled":
-                commitment += max(action[1].target_amount, action[2])
-            elif kind == "drop":
-                commitment += action[2]
-            elif kind == "reprice":
-                commitment += action[2].base_amount
-            elif kind == "shrink":
-                commitment += action[2]
-            elif kind == "keep":
-                extra_level = action[3]
-                commitment += action[2]
-                if extra_level is not None:
-                    commitment += extra_level.base_amount
-            elif kind == "new":
-                commitment += action[1].base_amount
-        cap = self._edited_total_base(config, levels)
-        if commitment > cap:
-            raise ValueError(f"edited slices would work {commitment} against the new total {cap}")
-        rebuilt: List[_Slice] = []
-        for action in actions:
-            kind = action[0]
-            if kind == "filled":
-                rebuilt.append(action[1])
-            elif kind == "drop":
-                slot = action[1]
-                slot.target_amount = action[2]
-                slot.edit_cancel = True
-                rebuilt.append(slot)
-            elif kind == "reprice":
-                slot, desired = action[1], action[2]
-                slot.target_price = desired.price
-                slot.target_amount = desired.base_amount
-                slot.pre_jitter_price = None
-                slot.edit_cancel = True
-                rebuilt.append(slot)
-            elif kind == "shrink":
-                slot = action[1]
-                slot.target_amount = action[2]
-                slot.edit_cancel = True
-                rebuilt.append(slot)
-            elif kind == "keep":
-                slot, extra_level = action[1], action[3]
-                slot.target_amount = action[2]
-                rebuilt.append(slot)
-                if extra_level is not None:
-                    rebuilt.append(_Slice(extra_level))
-            elif kind == "new":
-                rebuilt.append(_Slice(action[1]))
-        return rebuilt
-
-    def _price_inside_config_range(self, price: Decimal, config: Optional[RangeIcebergExecutorConfig] = None) -> bool:
-        config = config or self.config
-        low = config.price_low
-        high = config.price_high
-        if low is None or high is None:
+    def _remaining_is_dust(self, config: RangeIcebergExecutorConfig, remaining: Decimal) -> bool:
+        if remaining <= 0:
             return True
-        return low <= price <= high
+        rules = self.get_trading_rules(config.connector_name, config.trading_pair)
+        base = self._amount_in_base(remaining, config.size_unit, config)
+        return base < Decimal(str(rules.min_order_size))
 
-    def _working_slice_base(self, slot: _Slice) -> Decimal:
-        if slot.tracked is not None and slot.tracked.order is not None:
-            remaining = Decimal(str(slot.tracked.order.amount or 0)) - slot.tracked.executed_amount_base
-            if remaining < 0:
-                remaining = Decimal("0")
-            return remaining
-        return slot.target_amount
-
-    def _service_config_edit_cancels(self) -> None:
+    def _service_entry_rebuild(self) -> None:
         """
-        Cancel one entry the edit has to move, then wait out the order interval.
+        Cancel every working entry, then replace the plan once they are gone.
 
-        min_order_interval is the same gap as the 5 requests / 2 seconds cap.
-        One cancel per window keeps a range reprice inside that cap.
+        Cancels go out nearest to the market first, at most 5 in any 2
+        seconds. Until each order is filled, cancelled, or gone, entry
+        placement stays frozen and exits keep their own loop. A cancel that
+        is still open after 30 seconds sets config_edit_error and stays frozen.
         """
-        pending = [
-            slot for slot in self._slices
-            if getattr(slot, "edit_cancel", False) and slot.is_working and not slot.cancel_requested
-        ]
-        if not pending:
+        if not self._entries_frozen or self._queued_config is None:
             return
-        if not self._rate_limit_allows_place():
+        self._burst_cancel_working_entries()
+        if any(slot.is_working for slot in self._slices):
+            started = self._entry_rebuild_started_at
+            if started is None:
+                started = float(self._strategy.current_timestamp)
+                self._entry_rebuild_started_at = started
+            if float(self._strategy.current_timestamp) - started >= self._ENTRY_REBUILD_TIMEOUT_SECONDS:
+                self._config_edit_error = (
+                    "entry cancels were not confirmed within 30s; entries stay frozen"
+                )
             return
-        slot = pending[0]
-        slot.edit_cancel = False
-        self._request_cancel(slot)
+        self._finish_entry_rebuild()
+
+    def _burst_cancel_working_entries(self) -> None:
+        pending = [slot for slot in self._slices if slot.is_working and not slot.cancel_requested]
+        pending.sort(key=self._cancel_market_key)
+        now = float(self._strategy.current_timestamp)
+        window = self._CANCEL_BURST_WINDOW_SECONDS
+        self._edit_cancel_times = [stamp for stamp in self._edit_cancel_times if now - stamp < window]
+        budget = self._CANCEL_BURST_LIMIT - len(self._edit_cancel_times)
+        for slot in pending[: max(budget, 0)]:
+            self._request_cancel(slot)
+            self._edit_cancel_times.append(now)
+
+    def _cancel_market_key(self, slot: _Slice) -> Decimal:
+        price = self._slot_price(slot)
+        if self.config.side == TradeType.BUY:
+            return -price
+        return price
+
+    def _finish_entry_rebuild(self) -> None:
+        candidate = self._queued_config
+        if candidate is None:
+            self._entries_frozen = False
+            return
+        keys = set(self._queued_edit_keys)
+        for slot in list(self._slices):
+            if slot.order_id and slot.order_id != "skipped":
+                self._remember_fill_before_clearing(slot.order_id)
+        clamped = ""
+        filled = self._filled_amount_in_unit(candidate)
+        if candidate.total_amount < filled:
+            try:
+                candidate = self._config_with_changes(candidate, {"total_amount": str(filled)})
+            except (ValidationError, ValueError) as exc:
+                self._reject_queued_edit(self._validation_reason(exc))
+                return
+            clamped = f"total_amount clamped to the filled amount {filled}"
+            filled = self._filled_amount_in_unit(candidate)
+        remaining = candidate.total_amount - filled
+        if remaining < 0:
+            remaining = Decimal("0")
+        self._slices = self._fresh_entry_slices(candidate, remaining)
+        touch_exits = bool(keys & {"take_profit", "stop_loss"} - self._exit_edits_sent)
+        self._commit_config_edit(candidate, keys, clamped, touch_exits=touch_exits)
+
+    def _fresh_entry_slices(self, config: RangeIcebergExecutorConfig, remaining: Decimal) -> List[_Slice]:
+        """
+        A new plan for the unfilled size only.
+
+        Up-to mode keeps no standing rungs. The next place uses the new total
+        minus what already filled. A remainder the ladder cannot order becomes
+        no slices, which is entries complete.
+        """
+        if config.mode != ExecutionMode.RANGE or self._remaining_is_dust(config, remaining):
+            return []
+        try:
+            levels = self._ladder_for_config(config, total_amount=remaining)
+        except ValueError:
+            return []
+        return [_Slice(level) for level in levels]
 
     def _restore_edited_config(self, info: dict) -> None:
         """
@@ -1923,8 +1918,19 @@ class RangeIcebergExecutor(ExecutorBase):
 
     def _all_slices_filled(self) -> bool:
         if not self._slices:
-            return False
+            if self.close_type == CloseType.FAILED:
+                return False
+            # A rebuild that left nothing orderable has finished the entry.
+            return self._unfilled_is_dust()
         return all(slot.is_filled or (slot.order_id == "skipped") for slot in self._slices)
+
+    def _unfilled_is_dust(self) -> bool:
+        rules = self.get_trading_rules(self.config.connector_name, self.config.trading_pair)
+        leftover = self.config.total_amount - self._filled_unit() - self._skipped_amount()
+        if leftover <= 0:
+            return self.filled_base > 0 or self._skipped_amount() >= self.config.total_amount
+        price = self.config.price_low or self.config.limit_price or Decimal("1")
+        return self._unit_to_base(leftover, price) < Decimal(str(rules.min_order_size))
 
     def _advance_schedule(self, force_end: bool = False):
         if self._schedule is None or self._schedule_started_at is None:
