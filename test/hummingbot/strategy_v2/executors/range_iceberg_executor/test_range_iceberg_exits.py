@@ -3301,3 +3301,104 @@ class RangeIcebergExitTests(IsolatedAsyncioWrapperTestCase):
         self.assertEqual(Decimal("8"), same_contracts.config.total_amount)
         self.assertEqual(SizeUnit.CONTRACTS, same_contracts.config.size_unit)
         self.assertNotEqual(CloseType.FAILED, same_contracts.close_type)
+
+    def _place_four_rungs(self, executor: RangeIcebergExecutor):
+        for _ in range(4):
+            self._run(executor.control_task())
+        amounts = [self.buy_ids[index][1] for index in range(4)]
+        self.assertEqual(
+            [Decimal("20"), Decimal("20"), Decimal("20"), Decimal("40")],
+            amounts,
+        )
+        return [self.buy_ids[index][0] for index in range(4)]
+
+    def test_d11c_shrink_cancels_slices_beyond_the_new_ladder(self):
+        executor = self._executor(levels=4, total_amount=Decimal("100"))
+        order_ids = self._place_four_rungs(executor)
+        result = executor.update_config({"total_amount": "30"})
+        self.assertTrue(result["accepted"], result)
+        self._run(executor.control_task())
+        self.assertEqual(Decimal("30"), executor.config.total_amount)
+        self.assertLessEqual(
+            sum(slot.target_amount for slot in executor._slices),
+            Decimal("30"),
+        )
+        kept = [
+            slot.order_id
+            for slot in executor._slices
+            if slot.order_id in order_ids
+            and slot.is_working
+            and not slot.cancel_requested
+            and not getattr(slot, "edit_cancel", False)
+        ]
+        self.assertEqual([order_ids[0]], kept)
+        for order_id in order_ids[1:]:
+            slot = next(slot for slot in executor._slices if slot.order_id == order_id)
+            self.assertTrue(slot.cancel_requested or getattr(slot, "edit_cancel", False))
+            self.assertEqual(Decimal("0"), slot.target_amount)
+        for _ in range(6):
+            for order_id in order_ids[1:]:
+                order = self.orders[order_id]
+                if order.is_open:
+                    order.current_state = OrderState.CANCELED
+            self._run(executor.control_task())
+        open_amount = sum(
+            (
+                order.amount - order.executed_amount_base
+                for order in self.orders.values()
+                if order.is_open
+            ),
+            Decimal("0"),
+        )
+        self.assertLessEqual(open_amount + executor.filled_base, Decimal("30"))
+        for order_id in order_ids[1:]:
+            self.assertFalse(self.orders[order_id].is_open)
+
+    def test_d11d_shrink_aborts_when_remaining_targets_exceed_the_total(self):
+        executor = self._executor(levels=4, total_amount=Decimal("100"))
+        order_ids = self._place_four_rungs(executor)
+        result = executor.update_config({"total_amount": "30"})
+        self.assertTrue(result["accepted"], result)
+        for order_id in order_ids[:3]:
+            self._fill(order_id)
+        cancels = self.strategy.cancel.call_count
+        self._run(executor.control_task())
+        self.assertEqual(Decimal("100"), executor.config.total_amount)
+        self.assertIn("against the new total", executor.get_custom_info()["config_edit_error"])
+        self.assertFalse(executor.get_custom_info()["pending_config_edit"])
+        self.assertEqual(cancels, self.strategy.cancel.call_count)
+        self.assertEqual(
+            [Decimal("20"), Decimal("20"), Decimal("20"), Decimal("40")],
+            [slot.target_amount for slot in executor._slices],
+        )
+        self.assertFalse(any(getattr(slot, "edit_cancel", False) for slot in executor._slices))
+
+    def test_update_config_rejects_a_grow_when_entries_are_not_placed(self):
+        executor = self._executor()
+        executor.restore_from_custom_info({"resume_entries": False})
+        self.assertFalse(executor._resume_entries)
+        grown = executor.update_config({"total_amount": "150"})
+        self.assertFalse(grown["accepted"])
+        self.assertEqual(
+            "cannot grow total_amount while entries are not being placed",
+            grown["reason"],
+        )
+        self.assertEqual(Decimal("100"), executor.config.total_amount)
+        self.assertIsNone(executor._queued_config)
+        shrunk = executor.update_config({"total_amount": "40"})
+        self.assertTrue(shrunk["accepted"], shrunk)
+        self.assertEqual(Decimal("40"), executor._queued_config.total_amount)
+
+    def test_custom_info_reports_size_unit_beside_total_amount(self):
+        base = self._executor()
+        base_info = base.get_custom_info()
+        self.assertEqual("100", base_info["total_amount"])
+        self.assertEqual("BASE", base_info["size_unit"])
+        quote = self._executor(size_unit=SizeUnit.QUOTE, total_amount=Decimal("8.5"))
+        quote_info = quote.get_custom_info()
+        self.assertEqual("8.5", quote_info["total_amount"])
+        self.assertEqual("QUOTE", quote_info["size_unit"])
+        contracts = self._executor(size_unit=SizeUnit.CONTRACTS, total_amount=Decimal("10"))
+        contract_info = contracts.get_custom_info()
+        self.assertEqual("10", contract_info["total_amount"])
+        self.assertEqual("CONTRACTS", contract_info["size_unit"])

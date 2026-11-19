@@ -178,7 +178,11 @@ class RangeIcebergExecutor(ExecutorBase):
     Accepted edits are stored in custom_info config_edits, in this executor's
     size unit. Resume reads that object only. The reported total_amount,
     price_low, price_high, take_profit, and stop_loss are the live values
-    and are not applied again. A second iceberg on the same side is not required.
+    and are not applied again. custom_info also reports size_unit beside
+    total_amount. A shrink that leaves fewer rungs cancels the extra working
+    slices instead of parking them on the last price. total_amount cannot
+    grow while entries are not being placed. A second iceberg on the same
+    side is not required.
     A moved percent trigger is repriced with change_stop_plan_price, then resized at
     that same price. Cancel-and-place is only the fallback when the reprice
     fails. protective_exchange_stop defaults to on only if
@@ -786,6 +790,11 @@ class RangeIcebergExecutor(ExecutorBase):
         if range_reason:
             return self._edit_result(False, range_reason)
         if "total_amount" in changes:
+            if not self._resume_entries and candidate.total_amount > self.config.total_amount:
+                return self._edit_result(
+                    False,
+                    "cannot grow total_amount while entries are not being placed",
+                )
             filled = self._filled_amount_in_unit(candidate)
             if candidate.total_amount < filled:
                 return self._edit_result(
@@ -879,6 +888,17 @@ class RangeIcebergExecutor(ExecutorBase):
             self._drop_queued_config_edit()
             return
         keys = set(self._queued_edit_keys)
+        if (
+            "total_amount" in keys
+            and not self._resume_entries
+            and candidate.total_amount > self.config.total_amount
+        ):
+            self._queued_config = None
+            self._queued_edit_keys = set()
+            self._queued_clears_stop = False
+            self._config_edit_error = "cannot grow total_amount while entries are not being placed"
+            self.logger().warning("Rejected range iceberg edit: %s", self._config_edit_error)
+            return
         clamped = ""
         if "total_amount" in keys:
             filled = self._filled_amount_in_unit(candidate)
@@ -1027,51 +1047,117 @@ class RangeIcebergExecutor(ExecutorBase):
         price = config.limit_price or config.price_low or Decimal("1")
         return base * price
 
+    def _edited_total_base(self, config: RangeIcebergExecutorConfig, levels) -> Decimal:
+        """
+        The new total in base, which is the cap for the slices this edit may keep.
+        """
+        if config.size_unit == SizeUnit.BASE:
+            return config.total_amount
+        if config.size_unit == SizeUnit.CONTRACTS:
+            return self._amount_in_base(config.total_amount, config.size_unit, config)
+        return sum((level.base_amount for level in levels), Decimal("0"))
+
     def _retarget_slices(self, config: RangeIcebergExecutorConfig, levels) -> List[_Slice]:
+        """
+        Map each working slice onto one new rung.
+
+        A slice past the last new rung is cancelled down to its fill. It is not
+        moved onto the last price, and that price does not gain another slice.
+        The plan is checked before any slice is changed. If the fills plus the
+        size still to be bought exceed the new total, the edit is refused and
+        the old slices stay as they were.
+        """
         rules = self.get_trading_rules(config.connector_name, config.trading_pair)
         min_amount = Decimal(str(rules.min_order_size))
-        rebuilt: List[_Slice] = []
+        actions = []
         level_index = 0
         for slot in self._slices:
             if slot.order_id == "skipped" or not (slot.is_working or slot.is_filled):
                 continue
-            if slot.is_filled:
-                rebuilt.append(slot)
-                if level_index < len(levels):
-                    level_index += 1
-                continue
-            desired = levels[min(level_index, len(levels) - 1)]
-            if level_index < len(levels):
-                level_index += 1
-            price = self._slot_price(slot)
-            inside = self._price_inside_config_range(price, config)
-            live = self._working_slice_base(slot)
             filled_on_slot = Decimal("0")
             if slot.order_id and slot.order_id != "skipped":
                 filled_on_slot, _quote = self._best_fill(slot.order_id)
+            if slot.is_filled:
+                actions.append(("filled", slot, filled_on_slot))
+                if level_index < len(levels):
+                    level_index += 1
+                continue
+            if level_index >= len(levels):
+                actions.append(("drop", slot, filled_on_slot))
+                continue
+            desired = levels[level_index]
+            level_index += 1
+            price = self._slot_price(slot)
+            inside = self._price_inside_config_range(price, config)
+            live = self._working_slice_base(slot)
             room = desired.base_amount - filled_on_slot
             if room < 0:
                 room = Decimal("0")
             if not inside:
+                actions.append(("reprice", slot, desired))
+                continue
+            if live > room:
+                actions.append(("shrink", slot, filled_on_slot + room))
+                continue
+            extra = desired.base_amount - filled_on_slot - live
+            extra_level = None
+            if extra >= min_amount:
+                extra_level = LadderLevel(price=desired.price, base_amount=extra)
+            actions.append(("keep", slot, max(slot.target_amount, live), extra_level))
+        while level_index < len(levels):
+            actions.append(("new", levels[level_index]))
+            level_index += 1
+        commitment = Decimal("0")
+        for action in actions:
+            kind = action[0]
+            if kind == "filled":
+                commitment += max(action[1].target_amount, action[2])
+            elif kind == "drop":
+                commitment += action[2]
+            elif kind == "reprice":
+                commitment += action[2].base_amount
+            elif kind == "shrink":
+                commitment += action[2]
+            elif kind == "keep":
+                extra_level = action[3]
+                commitment += action[2]
+                if extra_level is not None:
+                    commitment += extra_level.base_amount
+            elif kind == "new":
+                commitment += action[1].base_amount
+        cap = self._edited_total_base(config, levels)
+        if commitment > cap:
+            raise ValueError(f"edited slices would work {commitment} against the new total {cap}")
+        rebuilt: List[_Slice] = []
+        for action in actions:
+            kind = action[0]
+            if kind == "filled":
+                rebuilt.append(action[1])
+            elif kind == "drop":
+                slot = action[1]
+                slot.target_amount = action[2]
+                slot.edit_cancel = True
+                rebuilt.append(slot)
+            elif kind == "reprice":
+                slot, desired = action[1], action[2]
                 slot.target_price = desired.price
                 slot.target_amount = desired.base_amount
                 slot.pre_jitter_price = None
                 slot.edit_cancel = True
                 rebuilt.append(slot)
-                continue
-            if live > room:
-                slot.target_amount = filled_on_slot + room
+            elif kind == "shrink":
+                slot = action[1]
+                slot.target_amount = action[2]
                 slot.edit_cancel = True
                 rebuilt.append(slot)
-                continue
-            slot.target_amount = max(slot.target_amount, live)
-            rebuilt.append(slot)
-            extra = desired.base_amount - live
-            if extra >= min_amount:
-                rebuilt.append(_Slice(LadderLevel(price=desired.price, base_amount=extra)))
-        while level_index < len(levels):
-            rebuilt.append(_Slice(levels[level_index]))
-            level_index += 1
+            elif kind == "keep":
+                slot, extra_level = action[1], action[3]
+                slot.target_amount = action[2]
+                rebuilt.append(slot)
+                if extra_level is not None:
+                    rebuilt.append(_Slice(extra_level))
+            elif kind == "new":
+                rebuilt.append(_Slice(action[1]))
         return rebuilt
 
     def _price_inside_config_range(self, price: Decimal, config: Optional[RangeIcebergExecutorConfig] = None) -> bool:
@@ -2827,6 +2913,7 @@ class RangeIcebergExecutor(ExecutorBase):
             "total_base": str(self.total_base),
             "target_amount": self._stable_decimal_text(self._reporting_config().total_amount),
             "total_amount": self._stable_decimal_text(self._reporting_config().total_amount),
+            "size_unit": self._reporting_config().size_unit.value,
             "price_low": None if self._reporting_config().price_low is None else self._stable_decimal_text(self._reporting_config().price_low),
             "price_high": None if self._reporting_config().price_high is None else self._stable_decimal_text(self._reporting_config().price_high),
             "config_edits": self._config_edits_view(),
