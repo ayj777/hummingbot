@@ -3159,7 +3159,8 @@ class RangeIcebergExitTests(IsolatedAsyncioWrapperTestCase):
         self._run(executor.control_task())
         info = executor.get_custom_info()
         self.assertEqual(Decimal("70"), executor.config.total_amount)
-        self.assertIn("clamped to the filled amount 70", info["config_edit_error"])
+        self.assertEqual("", info["config_edit_error"])
+        self.assertIn("clamped to the filled amount 70", info["config_edit_note"])
         self.assertEqual("70", info["config_edits"]["total_amount"])
         self.assertFalse(info["pending_config_edit"])
         self.assertIsNotNone(info["last_config_edit_applied_at"])
@@ -3174,6 +3175,7 @@ class RangeIcebergExitTests(IsolatedAsyncioWrapperTestCase):
         info = executor.get_custom_info()
         self.assertFalse(info["pending_config_edit"])
         self.assertEqual("dropped: executor stopped before apply", info["config_edit_error"])
+        self.assertEqual("", info["config_edit_note"])
         self.assertEqual(Decimal("100"), executor.config.total_amount)
         self.assertEqual({}, info["config_edits"])
 
@@ -3518,9 +3520,110 @@ class RangeIcebergExitTests(IsolatedAsyncioWrapperTestCase):
         self._run(executor.control_task())
         self.assertTrue(executor._entries_frozen)
         self.assertEqual(Decimal("100"), executor.config.total_amount)
-        self.assertIn("entries stay frozen", executor.get_custom_info()["config_edit_error"])
+        self.assertEqual("", executor.get_custom_info()["config_edit_error"])
+        self.assertIn("entries stay frozen", executor.get_custom_info()["config_edit_note"])
         self.assertTrue(self.orders[order_id].is_open)
         self.assertEqual(1, len([row for row in self.buy_ids if row[4] == PositionAction.OPEN]))
         self._run(executor.control_task())
         self.assertTrue(executor._entries_frozen)
         self.assertEqual(1, len([row for row in self.buy_ids if row[4] == PositionAction.OPEN]))
+
+    def test_z1_lost_edit_cancel_is_resent_while_the_order_stays_open(self):
+        executor = self._executor(total_amount=Decimal("100"))
+        self._run(executor.control_task())
+        order_id = self.buy_ids[0][0]
+        result = executor.update_config({"total_amount": "40"})
+        self.assertTrue(result["accepted"], result)
+        self._run(executor.control_task())
+        self.assertIn(order_id, executor._unconfirmed_cancels)
+        self.assertEqual(1, self.strategy.cancel.call_count)
+        self._run(executor.control_task())
+        self.assertEqual(1, self.strategy.cancel.call_count)
+        self.assertTrue(self.orders[order_id].is_open)
+        self.now += 2
+        self._run(executor.control_task())
+        self.assertEqual(2, self.strategy.cancel.call_count)
+        self.assertTrue(executor._entries_frozen)
+        self.assertEqual(Decimal("100"), executor.config.total_amount)
+        self.now += 28
+        self._run(executor.control_task())
+        info = executor.get_custom_info()
+        self.assertEqual("", info["config_edit_error"])
+        self.assertIn("entries stay frozen", info["config_edit_note"])
+        self.assertGreater(self.strategy.cancel.call_count, 2)
+        cancels_at_note = self.strategy.cancel.call_count
+        self.now += 2
+        self._run(executor.control_task())
+        self.assertGreater(self.strategy.cancel.call_count, cancels_at_note)
+        self.assertTrue(executor._entries_frozen)
+        self.assertEqual(1, len([row for row in self.buy_ids if row[4] == PositionAction.OPEN]))
+        self.orders[order_id].current_state = OrderState.CANCELED
+        self._run(executor.control_task())
+        self.assertFalse(executor._entries_frozen)
+        self.assertEqual(Decimal("40"), executor.config.total_amount)
+        self.assertLessEqual(self._open_entry_amount() + executor.filled_base, Decimal("40"))
+
+    def test_z5_untracked_entry_is_gone_after_bounded_lookups(self):
+        executor = self._executor(total_amount=Decimal("100"))
+        self._run(executor.control_task())
+        order_id = self.buy_ids[0][0]
+        result = executor.update_config({"total_amount": "40"})
+        self.assertTrue(result["accepted"], result)
+        self._run(executor.control_task())
+        executor._slices[0].tracked.order = None
+        self.orders.pop(order_id)
+
+        async def resolve(trading_pair, client_order_id, exchange_order_id):
+            return None
+
+        self.connector.resolve_unknown_order = resolve
+        self._run(executor.control_task())
+        self._run(executor.control_task())
+        self.assertTrue(executor._entries_frozen)
+        self.assertEqual(Decimal("100"), executor.config.total_amount)
+        self._run(executor.control_task())
+        self.assertFalse(executor._entries_frozen)
+        self.assertEqual(Decimal("40"), executor.config.total_amount)
+        later = executor.update_config({"total_amount": "30"})
+        self.assertTrue(later["accepted"], later)
+        self._run(executor.control_task())
+        for row in list(self.buy_ids):
+            order = self.orders.get(row[0])
+            if order is not None and row[4] == PositionAction.OPEN and order.is_open:
+                order.current_state = OrderState.CANCELED
+        self._run(executor.control_task())
+        self.assertFalse(executor._entries_frozen)
+        self.assertEqual(Decimal("30"), executor.config.total_amount)
+
+    def test_z2_late_fill_on_a_cleared_order_counts_and_resizes_the_exit(self):
+        executor = self._executor(
+            exit_arming="ON_ANY_FILL",
+            take_profit={"price": "0.10", "execution": "SINGLE", "order_type": "LIMIT"},
+        )
+        self._run(executor.control_task())
+        order_id = self.buy_ids[0][0]
+        result = executor.update_config({"total_amount": "40"})
+        self.assertTrue(result["accepted"], result)
+        self._run(executor.control_task())
+        self.orders[order_id].current_state = OrderState.CANCELED
+        self._run(executor.control_task())
+        self.assertEqual(Decimal("0"), executor._accounted_fill_by_order[order_id])
+        self.assertEqual(Decimal("0"), executor.filled_base)
+        order = self.orders[order_id]
+        order.executed_amount_base = Decimal("30")
+        order.executed_amount_quote = Decimal("30") * order.price
+        self._run(executor.control_task())
+        self.assertEqual(Decimal("30"), executor.filled_base)
+        closes = [call for call in self._close_calls() if call[1][3] == OrderType.LIMIT]
+        self.assertEqual(1, len(closes))
+        self.assertEqual(Decimal("30"), closes[0][1][2])
+
+    def test_config_edit_note_is_separate_from_config_edit_error(self):
+        rejected = self._executor()
+        self._open_entry(rejected)
+        below = rejected.update_config({"total_amount": "50"})
+        self.assertFalse(below["accepted"])
+        self.assertIn("below the filled amount", below["reason"])
+        self.assertEqual("", rejected.get_custom_info()["config_edit_error"])
+        self.assertEqual("", rejected.get_custom_info()["config_edit_note"])
+        self.assertEqual(Decimal("100"), rejected.config.total_amount)

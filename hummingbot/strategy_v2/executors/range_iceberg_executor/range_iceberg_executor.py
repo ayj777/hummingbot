@@ -177,8 +177,13 @@ class RangeIcebergExecutor(ExecutorBase):
     loss apply on the next tick. A new total or a new range freezes entry
     placement, cancels every working entry (nearest to the market first,
     at most 5 cancels in any 2 seconds), and builds a fresh plan for the
-    size still to buy only after those orders are off the book. Exits keep
-    running during that wait. Accepted edits are stored in custom_info
+    size still to buy only after those orders are off the book. A cancel
+    that does not land is sent again on a backoff, including after the 30s
+    wait. An entry the tracker cannot find is queried, then treated as gone
+    after a bounded number of lookups, so a later edit is not stuck. Exits keep
+    running during that wait. A clamp, or cancels that are still pending, is
+    reported on config_edit_note. config_edit_error is only an edit that was
+    not applied and will not be applied. Accepted edits are stored in custom_info
     config_edits, in this executor's size unit. Resume reads that object
     only. The reported total_amount, price_low, price_high, take_profit,
     and stop_loss are the live values and are not applied again. custom_info
@@ -349,9 +354,12 @@ class RangeIcebergExecutor(ExecutorBase):
         self._entries_frozen = False
         self._entry_rebuild_started_at: Optional[float] = None
         self._edit_cancel_times: List[float] = []
+        self._edit_cancel_next_at: Dict[str, float] = {}
+        self._edit_missing_lookups: Dict[str, int] = {}
         self._exit_edits_sent: Set[str] = set()
         self._config_edits: dict = {}
         self._config_edit_error = ""
+        self._config_edit_note = ""
         self._last_config_edit_applied_at: Optional[float] = None
         self._keep_exchange_stop = False
         self._exit_failure_count = 0
@@ -690,7 +698,7 @@ class RangeIcebergExecutor(ExecutorBase):
         self._refresh_tracked_orders()
         self._release_cancelled_rungs()
         self._release_cancelled_exit_rungs()
-        self._service_entry_rebuild()
+        await self._service_entry_rebuild()
         self._capture_schedule_anchor()
         if self._exit_phase == "done":
             await self._sync_exchange_stop()
@@ -770,8 +778,12 @@ class RangeIcebergExecutor(ExecutorBase):
     _ENTRY_REBUILD_TIMEOUT_SECONDS = 30.0
     _CANCEL_BURST_LIMIT = 5
     _CANCEL_BURST_WINDOW_SECONDS = 2.0
+    _EDIT_CANCEL_RETRY_SECONDS = 2.0
     _ENTRIES_COMPLETE_REASON = (
         "entries are complete; the remaining size is below the minimum order size"
+    )
+    _CANCELS_PENDING_NOTE = (
+        "entry cancels were not confirmed within 30s; entries stay frozen"
     )
 
     def update_config(self, changes: dict) -> dict:
@@ -826,6 +838,11 @@ class RangeIcebergExecutor(ExecutorBase):
         self._queued_config = candidate
         self._queued_edit_keys.update(changes.keys())
         self._queued_clears_stop = "stop_loss" in self._queued_edit_keys and candidate.stop_loss is None
+        if self._entries_frozen and set(changes) & set(self._ENTRY_EDIT_FIELDS):
+            # A new total or range must not inherit a freeze that already gave up.
+            self._entry_rebuild_started_at = float(self._strategy.current_timestamp)
+            self._config_edit_note = ""
+            self._config_edit_error = ""
         return self._edit_result(True, reason)
 
     def _edit_result(self, accepted: bool, reason: str) -> dict:
@@ -914,6 +931,8 @@ class RangeIcebergExecutor(ExecutorBase):
                     return
                 self._entries_frozen = True
                 self._entry_rebuild_started_at = float(self._strategy.current_timestamp)
+                self._config_edit_error = ""
+                self._config_edit_note = ""
             self._apply_exit_edits_now(candidate, keys)
             return
         self._commit_config_edit(candidate, keys, "")
@@ -924,8 +943,11 @@ class RangeIcebergExecutor(ExecutorBase):
         self._queued_clears_stop = False
         self._entries_frozen = False
         self._entry_rebuild_started_at = None
+        self._edit_cancel_next_at.clear()
+        self._edit_missing_lookups.clear()
         self._exit_edits_sent.clear()
         self._config_edit_error = reason
+        self._config_edit_note = ""
         self.logger().warning("Rejected range iceberg edit: %s", reason)
 
     def _commit_config_edit(
@@ -947,9 +969,13 @@ class RangeIcebergExecutor(ExecutorBase):
             self._arm_exit_edit(clears_stop)
         self._remember_applied_edits(keys, candidate)
         self._last_config_edit_applied_at = float(self._strategy.current_timestamp)
-        self._config_edit_error = clamped
+        # A clamp was applied. The API treats config_edit_error as "not applied".
+        self._config_edit_error = ""
+        self._config_edit_note = clamped
         self._entries_frozen = False
         self._entry_rebuild_started_at = None
+        self._edit_cancel_next_at.clear()
+        self._edit_missing_lookups.clear()
         self._exit_edits_sent.clear()
 
     def _arm_exit_edit(self, clears_stop: bool) -> None:
@@ -981,8 +1007,11 @@ class RangeIcebergExecutor(ExecutorBase):
         self._queued_clears_stop = False
         self._entries_frozen = False
         self._entry_rebuild_started_at = None
+        self._edit_cancel_next_at.clear()
+        self._edit_missing_lookups.clear()
         self._exit_edits_sent.clear()
         self._config_edit_error = reason
+        self._config_edit_note = ""
         self.logger().warning("Dropped range iceberg edit: %s", reason)
 
     def _resize_schedule_amounts(self) -> None:
@@ -1107,17 +1136,21 @@ class RangeIcebergExecutor(ExecutorBase):
         base = self._amount_in_base(remaining, config.size_unit, config)
         return base < Decimal(str(rules.min_order_size))
 
-    def _service_entry_rebuild(self) -> None:
+    async def _service_entry_rebuild(self) -> None:
         """
         Cancel every working entry, then replace the plan once they are gone.
 
         Cancels go out nearest to the market first, at most 5 in any 2
-        seconds. Until each order is filled, cancelled, or gone, entry
-        placement stays frozen and exits keep their own loop. A cancel that
-        is still open after 30 seconds sets config_edit_error and stays frozen.
+        seconds, and each one is tracked in _unconfirmed_cancels so a lost
+        cancel is retried. Until each order is filled, cancelled, or gone,
+        entry placement stays frozen and exits keep their own loop. A cancel
+        that is still open after 30 seconds is noted and stays frozen, and
+        the retry continues. An entry the tracker cannot find is queried,
+        then treated as gone after a bounded number of lookups.
         """
         if not self._entries_frozen or self._queued_config is None:
             return
+        await self._resolve_untracked_edit_entries()
         self._burst_cancel_working_entries()
         if any(slot.is_working for slot in self._slices):
             started = self._entry_rebuild_started_at
@@ -1125,22 +1158,125 @@ class RangeIcebergExecutor(ExecutorBase):
                 started = float(self._strategy.current_timestamp)
                 self._entry_rebuild_started_at = started
             if float(self._strategy.current_timestamp) - started >= self._ENTRY_REBUILD_TIMEOUT_SECONDS:
-                self._config_edit_error = (
-                    "entry cancels were not confirmed within 30s; entries stay frozen"
-                )
+                self._config_edit_note = self._CANCELS_PENDING_NOTE
+                self._config_edit_error = ""
             return
         self._finish_entry_rebuild()
 
+    async def _resolve_untracked_edit_entries(self) -> None:
+        """
+        An entry with no in-flight order is not proof that it left the book.
+
+        Ask the connector first. Open means keep cancelling. Cancelled, filled,
+        or confirmed absent is gone. After a bounded run of unknown answers,
+        treat it as gone so the freeze can finish and a later edit can apply.
+        """
+        for slot in list(self._slices):
+            if not slot.is_working or slot.tracked is None or slot.tracked.order is not None:
+                if slot.order_id:
+                    self._edit_missing_lookups.pop(slot.order_id, None)
+                continue
+            order_id = slot.order_id
+            if not order_id or order_id == "skipped":
+                self._mark_untracked_entry_gone(slot)
+                continue
+            found = self.get_in_flight_order(self.config.connector_name, order_id)
+            if found is not None:
+                slot.tracked.order = found
+                self._edit_missing_lookups.pop(order_id, None)
+                continue
+            state = await self._lookup_order_state(order_id)
+            self._refresh_tracked_orders()
+            if slot.tracked is not None and slot.tracked.order is not None:
+                self._edit_missing_lookups.pop(order_id, None)
+                continue
+            if state in (OrderState.OPEN, OrderState.PARTIALLY_FILLED):
+                self._edit_missing_lookups[order_id] = 0
+                continue
+            if state in (OrderState.CANCELED, OrderState.FILLED, OrderState.FAILED) or self._is_confirmed_absent(state):
+                self._mark_untracked_entry_gone(slot)
+                continue
+            count = self._edit_missing_lookups.get(order_id, 0) + 1
+            self._edit_missing_lookups[order_id] = count
+            if count >= self._open_lookup_cap:
+                self._mark_untracked_entry_gone(slot)
+
+    def _mark_untracked_entry_gone(self, slot: _Slice) -> None:
+        order_id = slot.order_id
+        if order_id and order_id != "skipped":
+            self._remember_fill_before_clearing(order_id)
+            self._unconfirmed_cancels.discard(order_id)
+            self._resolved_terminal.add(order_id)
+            self._clear_open_retry(order_id)
+            self._edit_missing_lookups.pop(order_id, None)
+            self._edit_cancel_next_at.pop(order_id, None)
+        else:
+            slot.tracked = None
+            slot.cancel_requested = False
+
     def _burst_cancel_working_entries(self) -> None:
-        pending = [slot for slot in self._slices if slot.is_working and not slot.cancel_requested]
+        now = float(self._strategy.current_timestamp)
+        pending = []
+        for slot in self._slices:
+            if not slot.is_working:
+                continue
+            if not slot.cancel_requested:
+                pending.append(slot)
+                continue
+            if not self._edit_cancel_still_open(slot):
+                continue
+            order_id = slot.order_id
+            if (
+                order_id
+                and order_id in self._unconfirmed_cancels
+                and not self._cancel_confirmed(order_id)
+            ):
+                continue
+            if order_id and now < self._edit_cancel_next_at.get(order_id, 0):
+                continue
+            pending.append(slot)
         pending.sort(key=self._cancel_market_key)
+        budget = self._edit_cancel_budget()
+        for slot in pending[:budget]:
+            self._send_edit_cancel(slot)
+
+    def _edit_cancel_still_open(self, slot: _Slice) -> bool:
+        if not slot.is_working:
+            return False
+        order = slot.tracked.order if slot.tracked else None
+        if order is None:
+            return True
+        return not order.is_done
+
+    def _edit_cancel_budget(self) -> int:
         now = float(self._strategy.current_timestamp)
         window = self._CANCEL_BURST_WINDOW_SECONDS
         self._edit_cancel_times = [stamp for stamp in self._edit_cancel_times if now - stamp < window]
-        budget = self._CANCEL_BURST_LIMIT - len(self._edit_cancel_times)
-        for slot in pending[: max(budget, 0)]:
-            self._request_cancel(slot)
-            self._edit_cancel_times.append(now)
+        return max(self._CANCEL_BURST_LIMIT - len(self._edit_cancel_times), 0)
+
+    def _send_edit_cancel(self, slot: _Slice) -> None:
+        order_id = slot.order_id
+        if order_id and order_id != "skipped":
+            self._strategy.cancel(self.config.connector_name, self.config.trading_pair, order_id)
+            self._unconfirmed_cancels.add(order_id)
+            self._note_edit_cancel_sent(order_id)
+        slot.cancel_requested = True
+        self._mark_action()
+
+    def _note_edit_cancel_sent(self, order_id: str) -> None:
+        now = float(self._strategy.current_timestamp)
+        self._edit_cancel_next_at[order_id] = now + self._EDIT_CANCEL_RETRY_SECONDS
+        self._edit_cancel_times.append(now)
+
+    def _edit_cancel_owns(self, order_id: str) -> bool:
+        if not self._entries_frozen:
+            return False
+        slot = self._slot_for(order_id)
+        return slot is not None
+
+    def _edit_cancel_retry_due(self, order_id: str) -> bool:
+        now = float(self._strategy.current_timestamp)
+        return now >= self._edit_cancel_next_at.get(order_id, 0)
 
     def _cancel_market_key(self, slot: _Slice) -> Decimal:
         price = self._slot_price(slot)
@@ -2090,11 +2226,18 @@ class RangeIcebergExecutor(ExecutorBase):
             if order_id in self._unknown_order_ids:
                 continue
             if not self._cancel_confirmed(order_id):
-                if await self._escalate_unresolved_cancel(order_id):
+                edit_cancel = self._edit_cancel_owns(order_id)
+                if await self._escalate_unresolved_cancel(order_id, halt=not edit_cancel):
                     if order_id in self._unknown_order_ids or not self._cancel_confirmed(order_id):
                         continue
                 else:
+                    if edit_cancel and (
+                        not self._edit_cancel_retry_due(order_id) or self._edit_cancel_budget() <= 0
+                    ):
+                        continue
                     self._strategy.cancel(self.config.connector_name, self.config.trading_pair, order_id)
+                    if edit_cancel:
+                        self._note_edit_cancel_sent(order_id)
                     continue
             self._unconfirmed_cancels.discard(order_id)
             if order_id not in self._failed_order_ids:
@@ -2117,6 +2260,10 @@ class RangeIcebergExecutor(ExecutorBase):
                 price = getattr(order, "reported_deal_price", None) or order.price or Decimal("0")
                 base = Decimal(str(reported))
                 quote += Decimal(str(price or 0)) * extra
+        # A cleared order with no fill yet still has to stay in the ledger.
+        # A fill event that arrives after the rebuild otherwise has no id to land on.
+        self._accounted_fill_by_order.setdefault(order_id, Decimal("0"))
+        self._accounted_quote_by_order.setdefault(order_id, Decimal("0"))
         if base > self._accounted_fill_by_order.get(order_id, Decimal("0")):
             self._accounted_fill_by_order[order_id] = base
             self._accounted_quote_by_order[order_id] = quote
@@ -2184,7 +2331,7 @@ class RangeIcebergExecutor(ExecutorBase):
             slot.cancel_requested = False
             slot.target_amount = remainder
 
-    async def _escalate_unresolved_cancel(self, order_id: str) -> bool:
+    async def _escalate_unresolved_cancel(self, order_id: str, halt: bool = True) -> bool:
         """
         Keep canceling until the retry count or the time limit, then look the order up.
         An open result is looked up again on a backoff. True means this tick settled the
@@ -2233,15 +2380,24 @@ class RangeIcebergExecutor(ExecutorBase):
             self._clear_open_retry(order_id)
             return True
         if state is None or state == OrderState.FAILED:
-            self._halt_for_unknown_order(order_id, "The order state is unknown.")
-            return True
+            if halt:
+                self._halt_for_unknown_order(order_id, "The order state is unknown.")
+                return True
+            return False
         self._open_lookup_count[order_id] = self._open_lookup_count.get(order_id, 0) + 1
         self._open_lookup_started.setdefault(order_id, now)
         count = self._open_lookup_count[order_id]
         age = now - self._open_lookup_started[order_id]
         if count >= self._open_lookup_cap or age >= self._open_lookup_max_seconds:
-            self._halt_for_unknown_order(order_id, "The order is still open after repeated lookups.")
-            return True
+            if halt:
+                self._halt_for_unknown_order(order_id, "The order is still open after repeated lookups.")
+                return True
+            delay = min(
+                self._open_lookup_backoff_seconds * (2 ** max(count - 1, 0)),
+                self._open_lookup_backoff_cap_seconds,
+            )
+            self._next_open_lookup_at[order_id] = now + delay
+            return False
         delay = min(
             self._open_lookup_backoff_seconds * (2 ** (count - 1)),
             self._open_lookup_backoff_cap_seconds,
@@ -2926,6 +3082,7 @@ class RangeIcebergExecutor(ExecutorBase):
             "pending_config_edit": self._queued_config is not None,
             "last_config_edit_applied_at": self._last_config_edit_applied_at,
             "config_edit_error": self._config_edit_error,
+            "config_edit_note": self._config_edit_note,
             "filled_amount": str(self._filled_unit()),
             "unfilled_amount": str(self._unfilled_amount()),
             "skipped_amount": str(self._skipped_amount()),
