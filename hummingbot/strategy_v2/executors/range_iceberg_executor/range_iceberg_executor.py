@@ -198,8 +198,13 @@ class RangeIcebergExecutor(ExecutorBase):
     only. The reported total_amount, price_low, price_high, take_profit,
     and stop_loss are the live values and are not applied again. custom_info
     also reports size_unit beside total_amount. total_amount cannot grow
-    while entries are not being placed. A second iceberg on the same side
-    is not required.
+    while entries are not being placed. Several icebergs may share one
+    account, pair, and side. The API enforces how many. group_id is an
+    optional label. A protective stop is volType 1, so it closes only this
+    iceberg's base. A stop at another price is left alone. A stop at the
+    same price is not replaced, because MEXC would overwrite its quantity.
+    sibling_base, when the API sets it, is the live size to leave for the
+    other icebergs.
     A moved percent trigger is repriced with change_stop_plan_price, then resized at
     that same price. Cancel-and-place is only the fallback when the reprice
     fails. protective_exchange_stop defaults to on only if
@@ -335,6 +340,10 @@ class RangeIcebergExecutor(ExecutorBase):
         self._external_close = False
         self._reconcile_error = ""
         self._flat_position_reads = 0
+        self._sibling_base: Optional[Decimal] = None
+        self._sibling_base_fresh = False
+        self._hinted_close_base: Optional[Decimal] = None
+        self.set_sibling_base(config.sibling_base)
         self._tp_grow_cancelling = False
         self._tp_previous_size = Decimal("0")
         self._replace_stop_before_failed = False
@@ -1686,7 +1695,7 @@ class RangeIcebergExecutor(ExecutorBase):
 
     def start(self):
         """
-        Refuse to start when this account, connector, pair, and side is already open.
+        Start this iceberg. Several may share one account, pair, and side.
         """
         if self._reject_duplicate_side():
             return
@@ -1755,22 +1764,34 @@ class RangeIcebergExecutor(ExecutorBase):
         return None
 
     def _reject_duplicate_side(self) -> bool:
+        """
+        Several icebergs may share this side. The API enforces the count.
+        """
         if self._side_guard_error:
             return True
-        if self._duplicate_side_blocker() is None:
-            self._side_guard_checked = True
-            return False
-        message = (
-            f"another range iceberg is already open on "
-            f"{self.config.trading_pair} {self._position_side_label()}"
-        )
-        self._side_guard_error = message
         self._side_guard_checked = True
-        self._exit_error = message
-        self.logger().error(message)
-        self.close_type = CloseType.FAILED
-        self.stop()
-        return True
+        return False
+
+    def set_sibling_base(self, amount) -> None:
+        """
+        Record the live size the other icebergs still claim.
+
+        The next position read caps this iceberg at its own base, or at
+        live minus this amount when that is smaller. The cap then sticks.
+        A later drop in the live position does not tighten it, so a sibling
+        exit is not booked as this iceberg's loss until the API sets the
+        hint again.
+        """
+        if amount is None or amount == "":
+            self._sibling_base = None
+            self._sibling_base_fresh = False
+            self._hinted_close_base = None
+            return
+        value = Decimal(str(amount))
+        if value < 0:
+            value = Decimal("0")
+        self._sibling_base = value
+        self._sibling_base_fresh = True
 
     def evaluate_max_retries(self):
         """
@@ -3348,6 +3369,8 @@ class RangeIcebergExecutor(ExecutorBase):
             "exchange_position_base": None if self._live_position_base is None else str(self._live_position_base),
             "external_close": self._external_close,
             "reconcile_error": self._reconcile_error,
+            "group_id": self.config.group_id,
+            "sibling_base": None if self._sibling_base is None else str(self._sibling_base),
             "exit_error": self._exit_error,
             "exit_status": self._exit_phase,
             "exit_active": self._exit_active,
@@ -4765,9 +4788,19 @@ class RangeIcebergExecutor(ExecutorBase):
 
         That is its own net fill, or the live exchange position when a
         successful read is smaller. A larger exchange position is left alone.
-        Without a successful read, the own net fill is used.
+        A sibling_base hint caps it at live minus the size the other
+        icebergs still claim. That cap sticks until the next hint, so a
+        later drop is not taken from this iceberg. Without a successful
+        read, the own net fill is used.
         """
         own = self._position_base()
+        if self._hinted_close_base is not None:
+            room = self._hinted_close_base
+            if room <= 0:
+                return Decimal("0")
+            if room < own:
+                return room
+            return own
         if not self._position_sync_ok or self._live_position_base is None:
             return own
         live = self._live_position_base
@@ -4864,10 +4897,20 @@ class RangeIcebergExecutor(ExecutorBase):
             self._position_sync_ok = True
             self._begin_external_close()
             return "closed"
+        self._capture_sibling_hint(live)
         self._flat_position_reads = 0
         self._live_position_base = live
         self._position_sync_ok = True
         return "ok"
+
+    def _capture_sibling_hint(self, live: Decimal):
+        if not self._sibling_base_fresh or self._sibling_base is None:
+            return
+        room = live - self._sibling_base
+        if room < 0:
+            room = Decimal("0")
+        self._hinted_close_base = room
+        self._sibling_base_fresh = False
 
     def _exit_fill_grace_active(self) -> bool:
         if self._exit_last_fill_at is None:
@@ -5867,7 +5910,7 @@ class RangeIcebergExecutor(ExecutorBase):
             return None
         if self._live_stop_matches(amount, trigger):
             return self._exchange_stop_order_id
-        foreign = await self._foreign_open_stop_ids()
+        foreign = await self._foreign_open_stop_ids(trigger)
         if foreign:
             self._reject_foreign_position_stop(foreign, restore=restore)
             return None
@@ -5896,13 +5939,15 @@ class RangeIcebergExecutor(ExecutorBase):
             return None
         return order_id
 
-    async def _foreign_open_stop_ids(self) -> Set[str]:
+    async def _foreign_open_stop_ids(self, trigger: Optional[Decimal] = None) -> Set[str]:
         """
         Open position-stop ids on this side that this executor does not own.
 
         An empty set means the list was empty or the connector cannot list.
-        A place is refused when this set is not empty, so a same-price place
-        cannot replace someone else's stop.
+        With a trigger, only a matching price or a row with no price is
+        included. A different price is another iceberg's partial stop and
+        is left alone. MEXC replaces the quantity of a non-final stop at
+        the same price, so that place is refused.
         """
         connector = self.connectors[self.config.connector_name]
         listing = self._real_callable(connector, "list_open_stop_orders")
@@ -5930,9 +5975,30 @@ class RangeIcebergExecutor(ExecutorBase):
             if not self._stop_row_matches_our_side(row):
                 continue
             row_id = self._stop_row_id(row)
-            if row_id and row_id not in owned:
-                foreign.add(row_id)
+            if not row_id or row_id in owned:
+                continue
+            if trigger is not None and not self._stop_row_blocks_trigger(row, trigger):
+                continue
+            foreign.add(row_id)
         return foreign
+
+    def _stop_row_blocks_trigger(self, row, trigger: Decimal) -> bool:
+        price = self._stop_row_price(row)
+        if price is None:
+            return True
+        return price == trigger
+
+    def _stop_row_price(self, row) -> Optional[Decimal]:
+        if not isinstance(row, dict):
+            return None
+        for key in ("stopLossPrice", "stop_loss_price", "price", "triggerPrice"):
+            if key not in row or row.get(key) in (None, ""):
+                continue
+            try:
+                return Decimal(str(row.get(key)))
+            except (TypeError, ValueError, ArithmeticError):
+                return None
+        return None
 
     def _stop_row_id(self, row) -> Optional[str]:
         if not isinstance(row, dict):
