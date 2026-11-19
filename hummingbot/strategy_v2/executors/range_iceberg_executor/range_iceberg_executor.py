@@ -203,8 +203,19 @@ class RangeIcebergExecutor(ExecutorBase):
     optional label. A protective stop is volType 1, so it closes only this
     iceberg's base. A stop at another price is left alone. A stop at the
     same price is not replaced, because MEXC would overwrite its quantity.
+    A place that does not fit beside the other stops and resting closes is
+    left rejected. Those orders are not cancelled, and their ids are not
+    taken. The software stop covers this tier until a later try fits. A
+    flat read during a sibling's exit grace does not end the other tiers.
     sibling_base, when the API sets it, is the live size to leave for the
-    other icebergs.
+    other icebergs. set_entry_paused stops entry orders only. The API uses
+    it so the deepest tier the price qualifies for is the one placing
+    entries. Schedule time keeps accruing while entries are paused, and
+    resume places one normal iceberg slot rather than the carried size as
+    one order. entry_paused and pause_reason are stored in custom_info and
+    restored, so a restart stays paused until the API clears it. A snapshot
+    without those keys stays unpaused. A stop-list error delays the
+    exchange stop instead of placing over an unknown book.
     A moved percent trigger is repriced with change_stop_plan_price, then resized at
     that same price. Cancel-and-place is only the fallback when the reprice
     fails. protective_exchange_stop defaults to on only if
@@ -344,6 +355,10 @@ class RangeIcebergExecutor(ExecutorBase):
         self._sibling_base_fresh = False
         self._hinted_close_base: Optional[Decimal] = None
         self.set_sibling_base(config.sibling_base)
+        self._entry_paused = False
+        self._entry_pause_reason: Optional[str] = None
+        self._restored_group_id: Optional[str] = None
+        self._stop_list_error = ""
         self._tp_grow_cancelling = False
         self._tp_previous_size = Decimal("0")
         self._replace_stop_before_failed = False
@@ -684,6 +699,8 @@ class RangeIcebergExecutor(ExecutorBase):
             self._pause_started = None if pause_started is None else float(pause_started)
         self._restore_edited_config(info)
         self._resume_entries = self._resume_entries_requested(info)
+        self._restore_entry_pause(info)
+        self._restore_shared_side_hint(info)
         self._restore_exit_state(info)
         self._side_guard_checked = False
 
@@ -770,6 +787,9 @@ class RangeIcebergExecutor(ExecutorBase):
                 await self._sync_exchange_stop()
                 return
         await self._sync_exchange_stop()
+        if self._entry_paused:
+            self._cancel_entry_orders_for_exit()
+            return
         if self._entries_frozen or not self._resume_entries:
             return
         if self._filled_reaches_total():
@@ -1780,7 +1800,9 @@ class RangeIcebergExecutor(ExecutorBase):
         live minus this amount when that is smaller. The cap then sticks.
         A later drop in the live position does not tighten it, so a sibling
         exit is not booked as this iceberg's loss until the API sets the
-        hint again.
+        hint again. None clears the cap and the lone-iceberg rule applies
+        again. Zero means the others claim nothing, so the next read caps
+        at the live size, and that cap still sticks.
         """
         if amount is None or amount == "":
             self._sibling_base = None
@@ -1792,6 +1814,95 @@ class RangeIcebergExecutor(ExecutorBase):
             value = Decimal("0")
         self._sibling_base = value
         self._sibling_base_fresh = True
+
+    def set_entry_paused(self, paused: bool, reason: Optional[str] = None) -> None:
+        """
+        Stop or resume entry orders. The exit side is never paused.
+
+        The API calls this so only the deepest tier the current price
+        qualifies for places entries. Paused cancels working entry orders
+        and places no new ones. Fills, the schedule release, the take
+        profit, and the stop keep running. Schedule time keeps accruing, so
+        a long pause does not freeze the clock. Resume keeps the unspent
+        size and places one normal iceberg slot per tick, never more
+        working children than visible_count, and never the carried size as
+        a single order. entry_paused and pause_reason are restored from
+        custom_info. A snapshot that omits them stays unpaused.
+        """
+        self._entry_paused = bool(paused)
+        if not self._entry_paused:
+            self._entry_pause_reason = None
+            return
+        text = reason.strip() if isinstance(reason, str) else ""
+        self._entry_pause_reason = text or None
+        self._cancel_entry_orders_for_exit()
+
+    def _restore_entry_pause(self, info: dict) -> None:
+        if not isinstance(info, dict) or "entry_paused" not in info:
+            return
+        self._entry_paused = bool(info.get("entry_paused"))
+        reason = info.get("pause_reason")
+        if self._entry_paused and isinstance(reason, str) and reason.strip():
+            self._entry_pause_reason = reason.strip()
+        else:
+            self._entry_pause_reason = None
+
+    def _restore_shared_side_hint(self, info: dict) -> None:
+        """
+        A restart keeps the last sibling hint and the group label.
+
+        The sticky cap is not copied. The next position read applies the
+        hint again. group_id on the new config wins. A snapshot label is
+        used only when the config has none.
+        """
+        if not isinstance(info, dict):
+            return
+        if "sibling_base" in info:
+            self.set_sibling_base(info.get("sibling_base"))
+        if self.config.group_id:
+            return
+        label = info.get("group_id")
+        if isinstance(label, str) and label.strip():
+            self._restored_group_id = label.strip()
+
+    def _peer_exit_grace_active(self) -> bool:
+        """
+        True while a same-side iceberg has just filled its own exit.
+
+        A flat read in that window is not counted, so one tier's exit does
+        not end the others. After the grace, a book that stays flat still
+        ends every tier.
+        """
+        slot = self._side_slot()
+        for peer in self._range_iceberg_peers():
+            if peer._side_slot() != slot or peer.status == RunnableStatus.TERMINATED:
+                continue
+            if peer._exit_fill_grace_active():
+                return True
+        return False
+
+    def _drop_stop_ids_claimed_by_peers(self) -> None:
+        """A restored snapshot must not adopt a stop id another tier already holds."""
+        claimed = set()
+        slot = self._side_slot()
+        for peer in self._range_iceberg_peers():
+            if peer._side_slot() != slot:
+                continue
+            claimed.update(peer._exchange_stop_order_ids())
+        if not claimed:
+            return
+        kept = [stop for stop in self._exchange_stops if str(stop.get("id")) not in claimed]
+        if len(kept) == len(self._exchange_stops):
+            return
+        self._exchange_stops = kept
+        if not kept:
+            self._exchange_stop_order_id = None
+            self._exchange_stop_amount = Decimal("0")
+            self._exchange_stop_price = None
+            return
+        self._exchange_stop_order_id = kept[0]["id"]
+        self._exchange_stop_amount = sum((stop["amount"] for stop in kept), Decimal("0"))
+        self._exchange_stop_price = kept[-1].get("price")
 
     def evaluate_max_retries(self):
         """
@@ -3369,8 +3480,10 @@ class RangeIcebergExecutor(ExecutorBase):
             "exchange_position_base": None if self._live_position_base is None else str(self._live_position_base),
             "external_close": self._external_close,
             "reconcile_error": self._reconcile_error,
-            "group_id": self.config.group_id,
+            "group_id": self.config.group_id or self._restored_group_id,
             "sibling_base": None if self._sibling_base is None else str(self._sibling_base),
+            "entry_paused": self._entry_paused,
+            "pause_reason": self._entry_pause_reason,
             "exit_error": self._exit_error,
             "exit_status": self._exit_phase,
             "exit_active": self._exit_active,
@@ -4816,8 +4929,10 @@ class RangeIcebergExecutor(ExecutorBase):
 
         A connector without a position refresh is left on the fill ledger.
         A failed or unreadable read changes nothing and is tried again on
-        the next cadence. Two flat reads are required, and a flat read
-        during the grace after our own exit fill does not count.
+        the next cadence. Executors on the same connector share one
+        successful refresh for about 4 seconds. Two flat reads are required,
+        and a flat read during the grace after our own exit fill does not
+        count.
         """
         if self._external_close:
             return "closed"
@@ -4846,13 +4961,22 @@ class RangeIcebergExecutor(ExecutorBase):
             updater = self._real_callable(connector, "update_positions")
         if updater is None:
             return "unsupported", None
-        try:
-            result = updater()
-            if hasattr(result, "__await__"):
-                await result
-        except Exception as exc:
-            self._reconcile_error = f"position read failed: {exc}"
-            return "error", None
+        now = float(self._strategy.current_timestamp)
+        stamp = getattr(connector, "_hb_range_iceberg_position_read_at", None)
+        fresh = (
+            isinstance(stamp, (int, float))
+            and not isinstance(stamp, bool)
+            and now + 1e-9 < float(stamp) + float(self._POSITION_SYNC_SECONDS)
+        )
+        if not fresh:
+            try:
+                result = updater()
+                if hasattr(result, "__await__"):
+                    await result
+            except Exception as exc:
+                self._reconcile_error = f"position read failed: {exc}"
+                return "error", None
+            connector._hb_range_iceberg_position_read_at = now
         positions = getattr(connector, "account_positions", None)
         if not isinstance(positions, dict):
             self._reconcile_error = "position read failed: unreadable"
@@ -4882,12 +5006,14 @@ class RangeIcebergExecutor(ExecutorBase):
     def _apply_live_position(self, live: Decimal) -> str:
         """
         A positive size is applied at once. A flat size is applied only
-        on the second read, and not during the grace after our own exit fill.
-        Until then the previous managed size stays in place.
+        on the second read, and not during the grace after our own exit fill
+        or a same-side iceberg's exit fill. Until then the previous managed
+        size stays in place. After that grace, a book that stays flat ends
+        every tier.
         """
         own = self._position_base()
         if live <= 0 and own > 0:
-            if self._exit_fill_grace_active():
+            if self._exit_fill_grace_active() or self._peer_exit_grace_active():
                 self._flat_position_reads = 0
                 return "ok"
             self._flat_position_reads += 1
@@ -5910,7 +6036,20 @@ class RangeIcebergExecutor(ExecutorBase):
             return None
         if self._live_stop_matches(amount, trigger):
             return self._exchange_stop_order_id
+        known = await self._foreign_open_stop_ids()
+        if self._stop_list_error:
+            self._note_exchange_stop_failure(
+                RuntimeError(f"could not list open position stops: {self._stop_list_error}"),
+                restore=restore,
+            )
+            return None
         foreign = await self._foreign_open_stop_ids(trigger)
+        if self._stop_list_error:
+            self._note_exchange_stop_failure(
+                RuntimeError(f"could not list open position stops: {self._stop_list_error}"),
+                restore=restore,
+            )
+            return None
         if foreign:
             self._reject_foreign_position_stop(foreign, restore=restore)
             return None
@@ -5934,7 +6073,7 @@ class RangeIcebergExecutor(ExecutorBase):
             )
             return None
         order_id = str(order_id)
-        if order_id not in set(self._exchange_stop_order_ids()) and order_id in foreign:
+        if order_id not in set(self._exchange_stop_order_ids()) and order_id in known:
             self._reject_foreign_position_stop({order_id}, restore=restore)
             return None
         return order_id
@@ -5944,11 +6083,16 @@ class RangeIcebergExecutor(ExecutorBase):
         Open position-stop ids on this side that this executor does not own.
 
         An empty set means the list was empty or the connector cannot list.
-        With a trigger, only a matching price or a row with no price is
-        included. A different price is another iceberg's partial stop and
-        is left alone. MEXC replaces the quantity of a non-final stop at
-        the same price, so that place is refused.
+        A list error is stored on _stop_list_error and the place is refused,
+        so a failed list cannot overwrite another iceberg's quantity. With
+        a trigger, only a matching price or a row with no price is included.
+        A different price is another iceberg's partial stop and is left
+        alone. MEXC replaces the quantity of a non-final stop at the same
+        price, so that place is refused. The caller also keeps the full
+        pre-place set, and does not adopt a returned id that was already
+        there.
         """
+        self._stop_list_error = ""
         connector = self.connectors[self.config.connector_name]
         listing = self._real_callable(connector, "list_open_stop_orders")
         if listing is None:
@@ -5958,6 +6102,7 @@ class RangeIcebergExecutor(ExecutorBase):
             if hasattr(rows, "__await__"):
                 rows = await rows
         except Exception as exc:
+            self._stop_list_error = str(exc)
             self.logger().error(
                 "Could not list open position stops on %s %s before placing: %s",
                 self.config.trading_pair,
@@ -6395,6 +6540,7 @@ class RangeIcebergExecutor(ExecutorBase):
             self._exchange_stop_order_id = stop_ids[0]
             self._exchange_stop_amount = total
             self._exchange_stop_price = price
+            self._drop_stop_ids_claimed_by_peers()
         if self._resume_entries:
             filled_by_order = blob.get("filled_by_order") or {}
             if isinstance(filled_by_order, dict):

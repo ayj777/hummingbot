@@ -301,7 +301,9 @@ class RangeIcebergExecutorConfig(ExecutorConfigBase):
     one account, connector, pair, and position side. The API enforces how
     many. group_id is an optional label. sibling_base is the live size this
     iceberg must leave for the others, and the API refreshes it with
-    set_sibling_base. An open executor is edited in place with update_config
+    set_sibling_base. The API pauses entry orders on the shallower tiers
+    with set_entry_paused. That pause does not stop the schedule clock, the
+    take profit, or the stop. An open executor is edited in place with update_config
     (total amount, price range, take profit, and stop loss). Those edits
     are stored on custom_info config_edits, in the executor's own size unit,
     and resume applies that object only. The reported total_amount, price_low,

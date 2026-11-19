@@ -4147,3 +4147,281 @@ class RangeIcebergExitTests(IsolatedAsyncioWrapperTestCase):
         self.assertEqual(RunnableStatus.RUNNING, executors[2].status)
         open_amounts = sorted(order.amount for order in self._open_limit_closes())
         self.assertEqual([Decimal("20"), Decimal("200"), Decimal("300")], open_amounts)
+
+    def _paused_iceberg_config(self):
+        return dict(
+            mode=ExecutionMode.UP_TO,
+            limit_price=Decimal("0.09"),
+            price_low=None,
+            price_high=None,
+            total_amount=Decimal("200"),
+            slice_amount=Decimal("40"),
+            iceberg=True,
+            visible_count=1,
+            levels=1,
+            duration=100,
+            schedule_slices=5,
+            schedule_start="SUBMIT",
+        )
+
+    def test_entry_pause_cancels_the_child_and_resume_places_one_slot(self):
+        self._mid(Decimal("0.085"))
+        executor = self._executor(**self._paused_iceberg_config())
+        self._run(executor.control_task())
+        child = self.buy_ids[-1][0]
+        self.assertEqual(Decimal("40"), self.buy_ids[-1][1])
+        released = executor._released_amount()
+        executor.set_entry_paused(True, "deeper tier")
+        self.strategy.cancel.assert_called_with("mexc_perpetual", "AIOT-USDT", child)
+        self.orders[child].current_state = OrderState.CANCELED
+        self.now += 80
+        before = len(self.buy_ids)
+        for _ in range(3):
+            self._run(executor.control_task())
+        self.assertEqual(before, len(self.buy_ids))
+        self.assertGreater(executor._released_amount(), released)
+        info = executor.get_custom_info()
+        self.assertTrue(info["entry_paused"])
+        self.assertEqual("deeper tier", info["pause_reason"])
+        self.assertFalse(info["paused"])
+        executor.set_entry_paused(False)
+        self.assertFalse(executor.get_custom_info()["entry_paused"])
+        self.assertIsNone(executor.get_custom_info()["pause_reason"])
+        self._run(executor.control_task())
+        self.assertEqual(before + 1, len(self.buy_ids))
+        self.assertEqual(Decimal("40"), self.buy_ids[-1][1])
+        self.assertEqual(PositionAction.OPEN, self.buy_ids[-1][4])
+
+    def test_entry_pause_does_not_stop_take_profit_or_the_stop(self):
+        state = self._install_mexc_stop_book()
+        self._mid(Decimal("0.085"))
+        executor = self._executor(
+            mode=ExecutionMode.UP_TO,
+            limit_price=Decimal("0.09"),
+            price_low=None,
+            price_high=None,
+            total_amount=Decimal("200"),
+            slice_amount=Decimal("100"),
+            iceberg=True,
+            visible_count=1,
+            levels=1,
+            exit_arming="ON_ANY_FILL",
+            take_profit={"price": "0.11", "execution": "SINGLE", "order_type": "LIMIT"},
+            stop_loss={"price": "0.07", "execution": "SINGLE"},
+        )
+        self._run(executor.control_task())
+        self._fill(self.buy_ids[-1][0])
+        self._run(executor.control_task())
+        self.assertEqual(Decimal("100"), state["stops"]["stop-1"]["amount"])
+        take_profits = self._open_limit_closes()
+        self.assertEqual(1, len(take_profits))
+        working = [
+            order_id
+            for order_id, _amount, _price, _order_type, action in self.buy_ids
+            if action == PositionAction.OPEN and self.orders[order_id].current_state == OrderState.OPEN
+        ]
+        self.assertEqual([self.buy_ids[-1][0]], working)
+        executor.set_entry_paused(True, "deeper tier")
+        self.assertEqual(OrderState.CANCELED, self.orders[working[0]].current_state)
+        self.assertEqual(OrderState.OPEN, take_profits[0].current_state)
+        for _ in range(2):
+            self.now += 1
+            self._run(executor.control_task())
+        self.assertEqual(OrderState.OPEN, take_profits[0].current_state)
+        self.assertEqual(Decimal("100"), state["stops"]["stop-1"]["amount"])
+        self.assertEqual("stop-1", executor.get_custom_info()["exchange_stop_order_id"])
+        self.assertNotIn("stop-1", state["cancelled"])
+        self.assertEqual(Decimal("100"), Decimal(executor.get_custom_info()["open_base"]))
+        self.assertEqual(RunnableStatus.RUNNING, executor.status)
+
+    def test_entry_pause_is_restored_and_a_missing_key_stays_unpaused(self):
+        self._mid(Decimal("0.085"))
+        config = self._paused_iceberg_config()
+        executor = self._executor(**config)
+        executor.set_entry_paused(True, " tier 2 ")
+        snapshot = executor.get_custom_info()
+        restored = self._executor(**config)
+        restored.restore_from_custom_info(snapshot)
+        self.assertTrue(restored.get_custom_info()["entry_paused"])
+        self.assertEqual("tier 2", restored.get_custom_info()["pause_reason"])
+        before = len(self.buy_ids)
+        self._run(restored.control_task())
+        self._run(restored.control_task())
+        self.assertEqual(before, len(self.buy_ids))
+        restored.set_entry_paused(False)
+        self._run(restored.control_task())
+        self.assertEqual(before + 1, len(self.buy_ids))
+        self.assertEqual(Decimal("40"), self.buy_ids[-1][1])
+        resumed = self._executor(**config)
+        resumed.restore_from_custom_info({"schedule_started_at": self.now})
+        self.assertFalse(resumed.get_custom_info()["entry_paused"])
+        self.assertIsNone(resumed.get_custom_info()["pause_reason"])
+        placed = len(self.buy_ids)
+        self._run(resumed.control_task())
+        self.assertEqual(placed + 1, len(self.buy_ids))
+
+    def test_sibling_base_zero_sticks_and_none_follows_the_live_size(self):
+        executor, state = self._arm_protected()
+        holder = {"amount": Decimal("80")}
+        self._install_position_source(holder)
+        executor.set_sibling_base(Decimal("0"))
+        self._read_again(executor)
+        for _ in range(3):
+            self.now += 1
+            self._run(executor.control_task())
+        self.assertEqual(Decimal("80"), state["stops"]["stop-1"]["amount"])
+        holder["amount"] = Decimal("50")
+        self._read_again(executor)
+        for _ in range(3):
+            self.now += 1
+            self._run(executor.control_task())
+        self.assertEqual(Decimal("80"), state["stops"]["stop-1"]["amount"])
+        self.assertEqual(Decimal("80"), executor._managed_base())
+        executor.set_sibling_base(None)
+        self.assertIsNone(executor.get_custom_info()["sibling_base"])
+        self._read_again(executor)
+        for _ in range(3):
+            self.now += 1
+            self._run(executor.control_task())
+        self.assertEqual(Decimal("50"), state["stops"]["stop-1"]["amount"])
+        self.assertEqual(Decimal("50"), executor._managed_base())
+        self.assertFalse(executor.get_custom_info()["external_close"])
+
+    def test_shared_position_read_is_once_per_window(self):
+        calls = self._install_position_source({"amount": Decimal("200")})
+        specs = dict(
+            protective_exchange_stop=False,
+            stop_loss={"price": "0.07", "execution": "SINGLE"},
+        )
+        first = self._executor(**specs)
+        second = self._executor(**specs)
+        self._open_entry(first)
+        self._open_entry(second)
+        self._run(first.control_task())
+        self._run(second.control_task())
+        self.assertEqual(1, calls["n"])
+        self.assertEqual("200", first.get_custom_info()["exchange_position_base"])
+        self.assertEqual("200", second.get_custom_info()["exchange_position_base"])
+        self.now += 4
+        self._run(first.control_task())
+        self.assertEqual(2, calls["n"])
+
+    def test_stop_list_error_does_not_place_over_an_unknown_book(self):
+        state = self._install_mexc_stop_book()
+
+        async def list_open(trading_pair=None):
+            raise RuntimeError("list down")
+
+        self.connector.list_open_stop_orders = list_open
+        self._mid(Decimal("0.085"))
+        executor = self._executor(stop_loss={"price": "0.07", "execution": "SINGLE"})
+        self._open_entry(executor)
+        self._run(executor.control_task())
+        self.assertEqual([], state["placed"])
+        self.assertIsNone(executor.get_custom_info()["exchange_stop_order_id"])
+        self.assertIn("could not list open position stops", executor.get_custom_info()["exchange_stop_error"])
+
+    def test_returned_foreign_stop_id_is_not_adopted(self):
+        state = self._install_mexc_stop_book()
+        state["stops"]["stop-foreign"] = {"amount": Decimal("80"), "price": Decimal("0.05")}
+
+        async def list_open(trading_pair=None):
+            return [{
+                "id": "stop-foreign",
+                "positionType": 1,
+                "symbol": "AIOT_USDT",
+                "stopLossPrice": "0.05",
+            }]
+
+        async def place_stop(trading_pair, position_id, amount, stop_loss_price=None, **kwargs):
+            state["placed"].append(str(position_id))
+            return "stop-foreign"
+
+        self.connector.list_open_stop_orders = list_open
+        self.connector.place_position_stop_order = place_stop
+        self._mid(Decimal("0.085"))
+        executor = self._executor(stop_loss={"price": "0.07", "execution": "SINGLE"})
+        self._open_entry(executor)
+        self._run(executor.control_task())
+        self.assertEqual(["4242"], state["placed"])
+        self.assertIsNone(executor.get_custom_info()["exchange_stop_order_id"])
+        self.assertEqual([], executor.get_custom_info()["exchange_stop_order_ids"])
+        self.assertIn("stop-foreign", executor.get_custom_info()["exchange_stop_error"])
+        self.assertEqual(Decimal("80"), state["stops"]["stop-foreign"]["amount"])
+        self.assertNotIn("stop-foreign", state["cancelled"])
+
+    def test_later_tier_stop_does_not_resize_the_earlier_stop_when_closable_is_short(self):
+        state = self._install_mexc_stop_book()
+        self._mid(Decimal("0.085"))
+        first = self._executor(
+            total_amount=Decimal("100"),
+            exit_arming="ON_ANY_FILL",
+            take_profit={"price": "0.11", "execution": "SINGLE", "order_type": "LIMIT"},
+            stop_loss={"price": "0.07", "execution": "SINGLE"},
+            group_id="aiot-long",
+        )
+        self._open_entry(first)
+        self._run(first.control_task())
+        self.assertEqual("stop-1", first.get_custom_info()["exchange_stop_order_id"])
+        self.assertEqual(Decimal("100"), state["stops"]["stop-1"]["amount"])
+        second = self._executor(
+            total_amount=Decimal("100"),
+            price_low=Decimal("0.07"),
+            price_high=Decimal("0.08"),
+            exit_arming="ON_ANY_FILL",
+            take_profit={"price": "0.11", "execution": "SINGLE", "order_type": "LIMIT"},
+            stop_loss={"price": "0.06", "execution": "SINGLE"},
+            group_id="aiot-long",
+        )
+        self._open_entry(second)
+        self._run(second.control_task())
+        self.assertEqual(Decimal("100"), state["stops"]["stop-1"]["amount"])
+        self.assertEqual("stop-1", first.get_custom_info()["exchange_stop_order_id"])
+        self.assertIsNone(second.get_custom_info()["exchange_stop_order_id"])
+        self.assertIn("closable quantity", second.get_custom_info()["exchange_stop_error"])
+        self.assertEqual(Decimal("100"), Decimal(second.get_custom_info()["open_base"]))
+        self.assertEqual(RunnableStatus.RUNNING, first.status)
+        self.assertEqual(RunnableStatus.RUNNING, second.status)
+
+    def test_flat_read_during_a_sibling_exit_does_not_end_the_others(self):
+        executors, _state = self._arm_tiers()
+        self._register_executors(*executors)
+        executors[0]._exit_last_fill_at = self.now
+        self._install_position_source({"amount": None})
+        self.now += 4
+        for executor in executors:
+            self._run(executor.control_task())
+            self.assertFalse(executor.get_custom_info()["external_close"])
+        self.now += 4
+        for executor in executors:
+            self._run(executor.control_task())
+            self.assertFalse(executor.get_custom_info()["external_close"])
+            self.assertEqual(RunnableStatus.RUNNING, executor.status)
+        self.now += 4
+        for executor in executors:
+            self._run(executor.control_task())
+            self.assertEqual(CloseType.POSITION_CLOSED_EXTERNALLY, executor.close_type)
+
+    def test_restored_stop_id_is_not_claimed_by_a_sibling(self):
+        executors, _state = self._arm_tiers()
+        executors[0].set_sibling_base(Decimal("500"))
+        snapshots = [executor.get_custom_info() for executor in executors[:2]]
+        specs = self._tier_specs()
+        restored = [self._executor(**spec) for spec in specs[:2]]
+        self._register_executors(*restored)
+        restored[0].restore_from_custom_info(snapshots[0])
+        restored[1].restore_from_custom_info(snapshots[1])
+        self.assertEqual("stop-1", restored[0].get_custom_info()["exchange_stop_order_id"])
+        self.assertEqual("stop-2", restored[1].get_custom_info()["exchange_stop_order_id"])
+        self.assertEqual("500", restored[0].get_custom_info()["sibling_base"])
+        self.assertTrue(restored[0]._sibling_base_fresh)
+        clash = self._executor(total_amount=Decimal("100"))
+        self._register_executors(restored[0], clash)
+        clash.restore_from_custom_info(snapshots[0])
+        self.assertIsNone(clash.get_custom_info()["exchange_stop_order_id"])
+        self.assertEqual([], clash.get_custom_info()["exchange_stop_order_ids"])
+        self.assertEqual("stop-1", restored[0].get_custom_info()["exchange_stop_order_id"])
+        labeled = self._executor()
+        labeled.restore_from_custom_info({"group_id": "aiot-long", "sibling_base": "40"})
+        self.assertEqual("aiot-long", labeled.get_custom_info()["group_id"])
+        self.assertEqual("40", labeled.get_custom_info()["sibling_base"])
