@@ -74,14 +74,16 @@ class RangeIcebergExecutor(ExecutorBase):
 
     RANGE keeps every child inside [price_low, price_high]. UP_TO prices a buy at the
     best ask, or a sell at the best bid, and never crosses limit_price. Iceberg shows
-    only a few slices and replaces each one after it fills. A duration releases the
-    total on the same offset clock as TWAP and cancels leftovers when the clock ends.
+    only a few slices and replaces each one after it fills. A duration stops new
+    entries when that clock ends, even if size is left.
 
-    By default that clock starts at the first fill. A partial fill counts. Until then
-    only the first slice is placed, except a range rung larger than that slice is
-    allowed out so it can fill and start the clock. Nothing is skipped or carried
-    before the anchor. schedule_start SUBMIT keeps the previous clock, which starts
-    when the executor starts.
+    The duration clock starts at the first fill. A partial fill starts it. SUBMIT
+    starts it when the executor is created. The first entry slice is placed at the
+    start, and a range rung larger than that slice may still go out. Each later
+    slice waits until the previous slice is fully filled and one jittered interval
+    has passed since that fill. A partial fill does not release the next slice.
+    CARRY and SKIP do not change this. Paused time, including an entry pause, does
+    not count toward that wait. The duration clock still counts entry-pause time.
     expiry_seconds is always measured from the executor start, so an order that never
     fills can still expire.
 
@@ -104,10 +106,9 @@ class RangeIcebergExecutor(ExecutorBase):
     kept the same way entry fees are kept.
 
     An iceberg exit schedule starts when that exit triggers. It does not wait for
-    the first exit fill. The entry rule that holds later rungs until a fill exists
-    only so that fill can start the entry clock. A close does not need it, so the
-    first exit window is open at the trigger and later windows count from then,
-    even while the first close order is still unfilled.
+    the first exit fill. Exit windows still open on the offset clock. A close does
+    not use the entry fill gate, so the first exit window is open at the trigger
+    and later windows count from then, even while the first close order is unfilled.
 
     The exit is reduce-only: closing a long is a sell with position action CLOSE
     (MEXC hedge side 4) and closing a short is a buy with position action CLOSE
@@ -277,6 +278,10 @@ class RangeIcebergExecutor(ExecutorBase):
         self._schedule_paused_seconds = 0.0
         self._started_at = self._strategy.current_timestamp
         self._schedule_started_at: Optional[float] = None
+        self._schedule_last_full_fill_at: Optional[float] = None
+        self._schedule_completed_slices = 0
+        self._fill_gate_pauses: List[tuple] = []
+        self._entry_pause_started: Optional[float] = None
         self._last_place_timestamp = Decimal("-1")
         self._rng = random.Random(config.random_seed)
         self._schedule = self._make_schedule()
@@ -424,13 +429,27 @@ class RangeIcebergExecutor(ExecutorBase):
             return None
         count, interval = resolved
         total = self.config.total_amount
-        share = total / Decimal(count)
-        amounts = []
-        remaining = total
-        for index in range(count):
-            piece = remaining if index == count - 1 else share
-            amounts.append(piece)
-            remaining -= piece
+        if (
+            self.config.duration_seconds is None
+            and self.config.schedule_slices is None
+            and self.config.slice_amount is not None
+        ):
+            amounts = []
+            remaining = total
+            while remaining > 0:
+                piece = self.config.slice_amount
+                if remaining < piece:
+                    piece = remaining
+                amounts.append(piece)
+                remaining -= piece
+        else:
+            share = total / Decimal(count)
+            amounts = []
+            remaining = total
+            for index in range(count):
+                piece = remaining if index == count - 1 else share
+                amounts.append(piece)
+                remaining -= piece
         offsets = release_timestamps(0.0, count, interval)
         offsets = self._apply_timing_jitter(offsets, interval, self.config.duration_seconds)
         return SliceSchedule(
@@ -440,10 +459,11 @@ class RangeIcebergExecutor(ExecutorBase):
             skip_unplaced=self.config.catch_up == CatchUpPolicy.SKIP,
         )
 
-    def _apply_timing_jitter(self, offsets, interval: float, duration: float):
+    def _apply_timing_jitter(self, offsets, interval: float, duration: Optional[float]):
         """
         The same release-clock jitter the entry schedule uses. A zero jitter percent
-        returns the nominal offsets and does not draw random numbers.
+        returns the nominal offsets and does not draw random numbers. A blank
+        duration does not clamp the offsets.
         """
         if self.config.timing_jitter_pct <= 0 or interval <= 0:
             return list(offsets)
@@ -452,7 +472,10 @@ class RangeIcebergExecutor(ExecutorBase):
             swing = (self._rng.random() * 2) - 1
             delta = swing * float(self.config.timing_jitter_pct) * interval
             low = 0.0 if index == 0 else jittered[-1]
-            jittered.append(min(max(low, nominal + delta), duration))
+            value = max(low, nominal + delta)
+            if duration is not None:
+                value = min(value, float(duration))
+            jittered.append(value)
         return jittered
 
     def _build_plan(self):
@@ -541,6 +564,7 @@ class RangeIcebergExecutor(ExecutorBase):
             self._paused_seconds += now - started
             if self._schedule_started_at is not None:
                 self._schedule_paused_seconds += max(0.0, now - max(started, self._schedule_started_at))
+            self._remember_fill_gate_pause(started, now)
             if self._exit_started_at is not None:
                 self._exit_paused_seconds += max(0.0, now - max(started, self._exit_started_at))
             self._pause_started = None
@@ -660,6 +684,11 @@ class RangeIcebergExecutor(ExecutorBase):
                 "executor_paused_seconds": self._paused_seconds,
                 "paused": self._paused,
                 "pause_started": self._pause_started,
+                "last_full_fill_at": self._schedule_last_full_fill_at,
+                "fill_gate_paused_seconds": self._merged_pause_seconds(self._fill_gate_pauses),
+                "fill_gate_pauses": [[start, end] for start, end in self._fill_gate_pauses],
+                "completed_slices": self._schedule_completed_slices,
+                "entry_pause_started": self._entry_pause_started,
             }
         )
         return state
@@ -689,6 +718,15 @@ class RangeIcebergExecutor(ExecutorBase):
             self._schedule_paused_seconds = float(clock["paused_seconds"])
         if self._schedule is not None and clock.get("closed") is not None:
             self._schedule.restore_state(clock)
+        if self._schedule is not None and (
+            "schedule_last_full_fill_at" in info or "last_full_fill_at" in clock
+        ):
+            stamp = info.get("schedule_last_full_fill_at", clock.get("last_full_fill_at"))
+            self._schedule_last_full_fill_at = None if stamp is None else float(stamp)
+        if self._schedule is not None:
+            self._restore_fill_gate_pauses(clock)
+        if self._schedule is not None and clock.get("completed_slices") is not None:
+            self._schedule_completed_slices = int(clock["completed_slices"])
         if clock.get("executor_started_at") is not None:
             self._started_at = float(clock["executor_started_at"])
         if clock.get("executor_paused_seconds") is not None:
@@ -755,6 +793,7 @@ class RangeIcebergExecutor(ExecutorBase):
         if await self._reconcile_exchange_state() == "closed":
             return
         self._capture_schedule_anchor()
+        self._note_completed_entry_slices()
         if self._exit_phase == "done":
             await self._sync_exchange_stop()
             return
@@ -762,7 +801,6 @@ class RangeIcebergExecutor(ExecutorBase):
             await self._control_exit()
             await self._sync_exchange_stop()
             return
-        self._advance_schedule()
         if await self._handle_entry_clock():
             await self._sync_exchange_stop()
             return
@@ -1822,14 +1860,20 @@ class RangeIcebergExecutor(ExecutorBase):
 
         The API calls this so only the deepest tier the current price
         qualifies for places entries. Paused cancels working entry orders
-        and places no new ones. Fills, the schedule release, the take
-        profit, and the stop keep running. Schedule time keeps accruing, so
-        a long pause does not freeze the clock. Resume keeps the unspent
-        size and places one normal iceberg slot per tick, never more
-        working children than visible_count, and never the carried size as
-        a single order. entry_paused and pause_reason are restored from
-        custom_info. A snapshot that omits them stays unpaused.
+        and places no new ones. Fills, the take profit, and the stop keep
+        running. The duration clock keeps accruing. Time spent entry-paused
+        does not count toward the wait between a full fill and the next slice.
+        Resume keeps the unspent size and places one normal iceberg slot per
+        tick, never more working children than visible_count. entry_paused
+        and pause_reason are restored from custom_info. A snapshot that omits
+        them stays unpaused.
         """
+        now = float(self._strategy.current_timestamp)
+        if paused and not self._entry_paused:
+            self._entry_pause_started = now
+        elif not paused and self._entry_paused:
+            self._remember_fill_gate_pause(self._entry_pause_started, now)
+            self._entry_pause_started = None
         self._entry_paused = bool(paused)
         if not self._entry_paused:
             self._entry_pause_reason = None
@@ -1842,6 +1886,13 @@ class RangeIcebergExecutor(ExecutorBase):
         if not isinstance(info, dict) or "entry_paused" not in info:
             return
         self._entry_paused = bool(info.get("entry_paused"))
+        if self._entry_paused and self._entry_pause_started is None:
+            started = info.get("entry_pause_started")
+            if started is None and isinstance(info.get("schedule_clock"), dict):
+                started = info["schedule_clock"].get("entry_pause_started")
+            if started is None:
+                started = self._strategy.current_timestamp
+            self._entry_pause_started = float(started)
         reason = info.get("pause_reason")
         if self._entry_paused and isinstance(reason, str) and reason.strip():
             self._entry_pause_reason = reason.strip()
@@ -2069,6 +2120,16 @@ class RangeIcebergExecutor(ExecutorBase):
         price = self._clamp_limit(self._jitter_up_to_price(price))
         step = rules.min_base_amount_increment
         slice_unit = min(self._slice_unit_amount(), placeable_unit)
+        last_slice = (
+            self._schedule is not None
+            and self._completed_entry_slices() + 1 >= self._schedule.count
+        )
+        dust = self._base_to_unit(self._min_order_size(), price)
+        # The last slice absorbs leftover size that is below one more child.
+        # A smaller slice_amount still places child-sized orders until that leftover.
+        if last_slice and (self.config.slice_amount is None or placeable_unit - slice_unit < dust):
+            self._rounding_remainder_base = Decimal("0")
+            slice_unit = placeable_unit
         raw_base = self._unit_to_base(slice_unit, price)
         amount = self._bounded_amount(raw_base, price, step, rules.min_order_size)
         amount = await self._cap_child_amount(amount, price, step, rules.min_order_size)
@@ -2463,46 +2524,220 @@ class RangeIcebergExecutor(ExecutorBase):
         price = self.config.price_low or self.config.limit_price or Decimal("1")
         return self._unit_to_base(leftover, price) < Decimal(str(rules.min_order_size))
 
-    def _advance_schedule(self, force_end: bool = False):
-        if self._schedule is None or self._schedule_started_at is None:
+    def _entry_release_limit(self) -> int:
+        if self._schedule is None:
+            return 0
+        if self.config.mode == ExecutionMode.RANGE and self._slices:
+            return len(self._slices)
+        return len(self._schedule.amounts)
+
+    def _entry_release_piece(self, index: int) -> Decimal:
+        """
+        Size of one released entry slice.
+
+        The first range rung may be larger than the first schedule amount.
+        Later pieces are the rung or the schedule amount.
+        """
+        if self._schedule is None:
+            return Decimal("0")
+        if self.config.mode == ExecutionMode.RANGE and index < len(self._slices):
+            slot = self._slices[index]
+            piece = self._base_to_unit(slot.target_amount, slot.target_price)
+            if index == 0 and self._schedule.amounts and piece < self._schedule.amounts[0]:
+                piece = self._schedule.amounts[0]
+            return piece
+        if index < len(self._schedule.amounts):
+            return self._schedule.amounts[index]
+        return Decimal("0")
+
+    def _tranches_covered_by_fill(self) -> int:
+        """
+        How many released slices the filled size already covers.
+
+        One schedule slice can be several child orders. Counting filled orders
+        would open the next slice early. Quantization leftover counts as covered
+        so a 410 fill of a 416.67 slice does not stall the gate.
+        """
+        if self._schedule is None:
+            return 0
+        filled = self._filled_unit()
+        if filled <= 0:
+            return 0
+        price = self.config.limit_price or self.config.price_low or Decimal("1")
+        credit = filled + self._base_to_unit(self._rounding_remainder_base, price)
+        dust = self._base_to_unit(self._min_order_size(), price)
+        budget = Decimal("0")
+        total = self.config.total_amount
+        completed = 0
+        for index in range(self._entry_release_limit()):
+            piece = self._entry_release_piece(index)
+            if piece <= 0:
+                break
+            budget += piece
+            if budget > total:
+                budget = total
+            if credit + dust <= budget:
+                break
+            completed += 1
+            if budget >= total:
+                break
+        return completed
+
+    def _completed_entry_slices(self) -> int:
+        if self._schedule is None:
+            return 0
+        covered = self._tranches_covered_by_fill()
+        # A restart keeps the saved count once the filled size is loaded.
+        # The saved count does not open a slice when that size is still missing.
+        if self._filled_unit() > 0 and self._schedule_completed_slices > covered:
+            return self._schedule_completed_slices
+        return covered
+
+    def _note_completed_entry_slices(self) -> None:
+        """
+        Record the time the newest entry slice became fully filled.
+
+        A restored count is not raised again when the same fills are loaded,
+        so the saved timestamp stays.
+        """
+        if self._schedule is None:
             return
-        elapsed = self.config.duration_seconds if force_end else self._schedule_elapsed()
-        self._schedule.advance(elapsed, self._filled_unit(), self._open_unit(), self._outside_cap())
+        completed = self._completed_entry_slices()
+        if completed <= self._schedule_completed_slices:
+            return
+        self._schedule_completed_slices = completed
+        self._schedule_last_full_fill_at = float(self._strategy.current_timestamp)
+        self._fill_gate_pauses = []
+
+    def _remember_fill_gate_pause(self, started: Optional[float], now: float) -> None:
+        origin = self._schedule_last_full_fill_at
+        if origin is None or started is None:
+            return
+        start = max(float(started), float(origin))
+        end = float(now)
+        if end > start:
+            self._fill_gate_pauses.append((start, end))
+
+    def _fill_gate_pause_spans(self, now: float) -> list:
+        origin = self._schedule_last_full_fill_at
+        spans = list(self._fill_gate_pauses)
+        if origin is None:
+            return spans
+        if self._entry_paused and self._entry_pause_started is not None:
+            start = max(float(self._entry_pause_started), float(origin))
+            if now > start:
+                spans.append((start, now))
+        if self._paused and self._pause_started is not None:
+            start = max(float(self._pause_started), float(origin))
+            if now > start:
+                spans.append((start, now))
+        return spans
+
+    def _merged_pause_seconds(self, spans) -> float:
+        """
+        Union of pause spans. An entry pause and an executor pause that overlap
+        are counted once.
+        """
+        if not spans:
+            return 0.0
+        ordered = sorted(spans)
+        total = 0.0
+        start, end = ordered[0]
+        for left, right in ordered[1:]:
+            if left <= end:
+                end = max(end, right)
+            else:
+                total += end - start
+                start, end = left, right
+        return total + (end - start)
+
+    def _fill_gate_elapsed(self) -> float:
+        """
+        Time since the last full entry fill, excluding executor pauses and entry pauses.
+        """
+        origin = self._schedule_last_full_fill_at
+        if origin is None:
+            return 0.0
+        now = float(self._strategy.current_timestamp)
+        paused = self._merged_pause_seconds(self._fill_gate_pause_spans(now))
+        return max(0.0, now - float(origin) - paused)
+
+    def _restore_fill_gate_pauses(self, clock: dict) -> None:
+        pauses = clock.get("fill_gate_pauses")
+        if isinstance(pauses, list):
+            restored = []
+            for item in pauses:
+                if isinstance(item, (list, tuple)) and len(item) >= 2:
+                    restored.append((float(item[0]), float(item[1])))
+            self._fill_gate_pauses = restored
+            return
+        seconds = clock.get("fill_gate_paused_seconds")
+        if seconds is None:
+            return
+        amount = float(seconds)
+        origin = self._schedule_last_full_fill_at or 0.0
+        self._fill_gate_pauses = [(origin, origin + amount)] if amount > 0 else []
+
+    def _next_entry_slice_unlocked(self, completed: int) -> bool:
+        if completed <= 0 or self._schedule_last_full_fill_at is None:
+            return False
+        return self._fill_gate_elapsed() + 1e-9 >= self._fill_gate_gap(completed)
+
+    def _fill_gate_gap(self, completed: int) -> float:
+        offsets = self._schedule.offsets if self._schedule is not None else []
+        if completed <= 0 or not offsets:
+            return 0.0
+        if completed < len(offsets):
+            return max(0.0, offsets[completed] - offsets[completed - 1])
+        if len(offsets) >= 2:
+            return max(0.0, offsets[-1] - offsets[-2])
+        return 0.0
 
     def _released_amount(self) -> Decimal:
         """
-        Size the schedule has released.
+        Size the entry schedule has released.
 
-        Before the anchor that is the first slice, including when timing jitter
-        pushed its offset forward. A range rung larger than that slice is released
-        too, so the first order can rest and fill, which is what starts the clock.
-        The allowance never exceeds the total. After the anchor, release offsets
-        are measured from the anchor.
+        The first slice is released immediately. A range rung larger than that
+        slice is released too. Each later slice is released only after the
+        previous one is fully filled and one jittered interval has passed
+        since that fill. The total is the cap. CARRY and SKIP do not add size
+        and do not drop size.
         """
         if self._schedule is None:
             return self.config.total_amount
-        if self._schedule_started_at is None:
-            released = self._schedule.amounts[0]
-            if self.config.mode == ExecutionMode.RANGE and self._slices:
-                first = self._slices[0]
-                rung = self._base_to_unit(first.target_amount, first.target_price)
-                if rung > released:
-                    released = rung
-            if released > self.config.total_amount:
-                released = self.config.total_amount
-            return released
-        return self._schedule.opened(self._schedule_elapsed())
+        self._note_completed_entry_slices()
+        completed = self._completed_entry_slices()
+        unlocked = 1
+        if completed > 0 and self._next_entry_slice_unlocked(completed):
+            unlocked = completed + 1
+        elif completed > 0:
+            unlocked = completed
+        limit = self._entry_release_limit()
+        if unlocked > limit:
+            unlocked = limit
+        budget = Decimal("0")
+        total = self.config.total_amount
+        for index in range(unlocked):
+            piece = self._entry_release_piece(index)
+            if piece <= 0:
+                break
+            budget += piece
+            if budget > total:
+                return total
+        return budget
 
     def _placeable(self) -> Decimal:
         if self._schedule is None:
             opened = self.config.total_amount
-            skipped = Decimal("0")
         else:
             opened = self._released_amount()
-            skipped = self._schedule.skipped
-        remaining = opened - skipped - self._filled_unit() - self._open_unit()
+        remaining = opened - self._filled_unit() - self._open_unit()
         if remaining < 0:
             return Decimal("0")
+        if self._schedule is not None and self._open_unit() <= 0:
+            completed = self._completed_entry_slices()
+            if completed > 0 and not self._next_entry_slice_unlocked(completed):
+                return Decimal("0")
         return remaining
 
     def _filled_unit(self) -> Decimal:
@@ -2602,7 +2837,12 @@ class RangeIcebergExecutor(ExecutorBase):
         return slot.tracked.executed_amount_base + Decimal("0.00000001") < Decimal(str(reported))
 
     def _counts_as_open(self, slot: _Slice) -> bool:
-        return slot.is_working or self._holds_unaccounted_fill(slot)
+        if slot.is_working or self._holds_unaccounted_fill(slot):
+            return True
+        # A scheduled slice must not be bought again while its fill size is missing.
+        if self._schedule is None:
+            return False
+        return bool(slot.is_filled and slot.order_id and not self._known_fill_size(slot.order_id))
 
     def _replacement_blocked(self) -> bool:
         return bool(self._unconfirmed_cancels) or bool(self._unknown_order_ids) or bool(self._open_lookup_count)
@@ -3474,6 +3714,7 @@ class RangeIcebergExecutor(ExecutorBase):
             "mode": self.config.mode.value,
             "paused": self._paused,
             "schedule_started_at": self._schedule_started_at,
+            "schedule_last_full_fill_at": self._schedule_last_full_fill_at,
             "schedule_time_remaining": self._schedule_time_remaining(),
             "schedule_clock": self._schedule_clock_state(),
             "unknown_order_halt": bool(self._unknown_order_ids),
@@ -3651,8 +3892,6 @@ class RangeIcebergExecutor(ExecutorBase):
         close_type = self._entry_clock_close_type()
         if close_type is None:
             return False
-        if close_type == CloseType.TIME_LIMIT:
-            self._advance_schedule(force_end=True)
         if self.filled_base > 0 and self._exits_configured():
             self._entry_clock_handled = True
             self._cancel_entry_orders_for_exit()
@@ -6602,6 +6841,29 @@ class RangeIcebergExecutor(ExecutorBase):
         self._exit_accounted_quote.clear()
         self._last_fill_timestamp = float(self._strategy.current_timestamp)
 
+    def _restore_scheduled_entry_fill(self, blob: dict) -> None:
+        """
+        Put a scheduled entry's filled size back when the exit is still idle.
+
+        Entry slices are rebuilt empty, so the fill gate would place the first
+        slice again unless this size is loaded. A snapshot with no schedule
+        keeps the previous idle restore.
+        """
+        if not self._resume_entries or self._schedule is None:
+            return
+        if "restored-entry" in self._accounted_fill_by_order:
+            return
+        if not isinstance(blob, dict):
+            return
+        entry_base = Decimal(str(blob.get("entry_filled_base") or "0"))
+        entry_quote = Decimal(str(blob.get("entry_filled_quote") or "0"))
+        if entry_base <= 0:
+            return
+        self._accounted_fill_by_order["restored-entry"] = entry_base
+        self._accounted_quote_by_order["restored-entry"] = entry_quote
+        self._accounted_fill_base = sum(self._accounted_fill_by_order.values(), Decimal("0"))
+        self._accounted_fill_quote = sum(self._accounted_quote_by_order.values(), Decimal("0"))
+
     def _restore_idle_exchange_stop(self, custom_info: dict, blob: dict) -> None:
         """
         Keep a stop that was placed before any exit was chosen.
@@ -6692,6 +6954,7 @@ class RangeIcebergExecutor(ExecutorBase):
             active = None
         if status == "idle" and active is None and not blob.get("filled_by_order"):
             self._restore_idle_exchange_stop(custom_info, blob)
+            self._restore_scheduled_entry_fill(blob)
             return
         if status not in ("idle", "armed", "resting", "cancelling_entry", "executing", "done"):
             status = "idle"

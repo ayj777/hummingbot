@@ -1,4 +1,4 @@
-from decimal import Decimal
+from decimal import ROUND_CEILING, Decimal
 from enum import Enum
 from typing import Literal, Optional, Union
 
@@ -42,7 +42,12 @@ class CapBehavior(str, Enum):
 
 
 class CatchUpPolicy(str, Enum):
-    """What happens to a scheduled slice that did not get placed because of the cap."""
+    """
+    Accepted so existing configs still load.
+
+    Entry release does not use it. The next entry slice waits until the previous
+    slice is fully filled, so a missed clock window is neither carried nor skipped.
+    """
 
     CARRY = "CARRY"
     SKIP = "SKIP"
@@ -249,9 +254,15 @@ class RangeIcebergExecutorConfig(ExecutorConfigBase):
 
     RANGE spreads limit orders across [price_low, price_high]. UP_TO keeps buying at the
     best ask (or selling at the best bid) and never crosses limit_price. With iceberg on,
-    only visible_count slices are shown. A duration releases that total on a clock and
-    stops when the clock ends, even if size is left. The clock starts at the first fill
-    unless schedule_start is SUBMIT, which starts it when the executor is created.
+    only visible_count slices are shown. A duration stops new entries when it ends,
+    even if size is left. That clock starts at the first fill unless schedule_start
+    is SUBMIT, which starts it when the executor is created. The interval between
+    entry slices is not that clock. The first slice goes out at the start. Each
+    later slice waits until the previous slice is fully filled and one interval
+    has passed since that fill. A blank duration has no time limit. The slice
+    count then comes from schedule_slices, slice_amount, or levels, and
+    schedule_interval is the wait between fills. catch_up does not change
+    entry release.
 
     take_profit and stop_loss are optional and default to off. When either is set, the
     filled position is closed with a single order or with another iceberg. See
@@ -302,8 +313,9 @@ class RangeIcebergExecutorConfig(ExecutorConfigBase):
     many. group_id is an optional label. sibling_base is the live size this
     iceberg must leave for the others, and the API refreshes it with
     set_sibling_base. The API pauses entry orders on the shallower tiers
-    with set_entry_paused. That pause does not stop the schedule clock, the
-    take profit, or the stop. An open executor is edited in place with update_config
+    with set_entry_paused. That pause does not stop the duration clock, the
+    take profit, or the stop. It does not count toward the wait between fills.
+    An open executor is edited in place with update_config
     (total amount, price range, take profit, and stop loss). Those edits
     are stored on custom_info config_edits, in the executor's own size unit,
     and resume applies that object only. The reported total_amount, price_low,
@@ -440,16 +452,34 @@ class RangeIcebergExecutorConfig(ExecutorConfigBase):
 
     def resolved_schedule(self) -> Optional[tuple]:
         """
-        (slice count, interval seconds) for a duration, or None when the whole size is released at once.
+        (slice count, interval seconds), or None when the whole size is released at once.
+
+        A duration with slices uses duration/count as the interval. A duration
+        with an interval uses floor(duration/interval) slices. A blank duration
+        keeps the interval and takes the count from schedule_slices, from
+        slice_amount, or from levels.
         """
         seconds = self.duration_seconds
         if seconds is None:
-            return None
+            if self.schedule_interval is None:
+                return None
+            interval = parse_duration(self.schedule_interval)
+            return self._amount_slice_count(), interval
         if self.schedule_slices is not None:
             count = int(self.schedule_slices)
             return count, seconds / count
         interval = parse_duration(self.schedule_interval)
         return max(1, int(seconds / interval)), interval
+
+    def _amount_slice_count(self) -> int:
+        if self.schedule_slices is not None:
+            return max(1, int(self.schedule_slices))
+        if self.slice_amount is not None and self.slice_amount > 0:
+            count = (self.total_amount / self.slice_amount).to_integral_value(
+                rounding=ROUND_CEILING
+            )
+            return max(1, int(count))
+        return max(1, int(self.levels))
 
     @model_validator(mode="after")
     def validate_range(self):
@@ -510,11 +540,25 @@ class RangeIcebergExecutorConfig(ExecutorConfigBase):
                     interval = parse_duration(self.schedule_interval)
                 except ValueError as exc:
                     raise ValueError(
-                        f"schedule_interval ({self.schedule_interval}) must be seconds or a value like 1h"
+                        f"schedule_interval ({self.schedule_interval}) "
+                        "must be seconds or a value like 1h"
                     ) from exc
                 require_positive("schedule_interval", interval)
-        elif self.schedule_slices is not None or self.schedule_interval is not None:
-            raise ValueError("schedule_slices and schedule_interval need a duration")
+        elif self.schedule_interval is not None or self.schedule_slices is not None:
+            if self.schedule_interval is None:
+                raise ValueError(
+                    "schedule_slices needs a schedule_interval when duration is blank"
+                )
+            try:
+                interval = parse_duration(self.schedule_interval)
+            except ValueError as exc:
+                raise ValueError(
+                    f"schedule_interval ({self.schedule_interval}) "
+                    "must be seconds or a value like 1h"
+                ) from exc
+            require_positive("schedule_interval", interval)
+            if self.schedule_slices is not None:
+                require_at_least("schedule_slices", self.schedule_slices, 1)
         require_positive("stop_loss_fallback_seconds", self.stop_loss_fallback_seconds)
         require_positive("exchange_stop_hold_seconds", self.exchange_stop_hold_seconds)
         require_positive("protective_stop_buffer_pct", self.protective_stop_buffer_pct)
