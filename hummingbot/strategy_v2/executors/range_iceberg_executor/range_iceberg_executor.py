@@ -47,6 +47,7 @@ class _Slice:
         self.tracked: Optional[TrackedOrder] = None
         self.cancel_requested = False
         self.retired = False
+        self.overfill_trim: Optional[Decimal] = None
 
     @property
     def order_id(self) -> Optional[str]:
@@ -182,8 +183,13 @@ class RangeIcebergExecutor(ExecutorBase):
     wait. Never-sent cancels go out before any retry, and retries take turns.
     An entry the tracker cannot find is queried on a 10/20/40 second backoff
     and is not dropped before 120 seconds unless the connector reports it
-    filled, cancelled, or not found after it was confirmed placed. Exits keep
-    running during that wait. A clamp, or cancels that are still pending, is
+    filled, cancelled, or not found after it was confirmed placed. After that
+    window, cancel-by-id continues on the same backoff and each pass looks the
+    order up again. A cancelled or filled answer stops that loop, and the fill
+    is recorded so the exits resize. A later fill that pushes filled plus the
+    working entries over the total cancels or trims those entries. No new entry
+    is placed once filled has reached the total. Exits keep running during that
+    wait. A clamp, or cancels that are still pending, is
     reported on config_edit_note. config_edit_error is only an edit that was
     not applied and will not be applied. Accepted edits are stored in custom_info
     config_edits, in this executor's size unit. Resume reads that object
@@ -708,7 +714,8 @@ class RangeIcebergExecutor(ExecutorBase):
         self._release_cancelled_rungs()
         self._release_cancelled_exit_rungs()
         await self._service_entry_rebuild()
-        self._send_keepalive_cancels()
+        await self._send_keepalive_cancels()
+        self._trim_excess_entries()
         self._capture_schedule_anchor()
         if self._exit_phase == "done":
             await self._sync_exchange_stop()
@@ -744,6 +751,8 @@ class RangeIcebergExecutor(ExecutorBase):
                 return
         await self._sync_exchange_stop()
         if self._entries_frozen or not self._resume_entries:
+            return
+        if self._filled_reaches_total():
             return
         if self.status != RunnableStatus.RUNNING or self._paused:
             return
@@ -1298,11 +1307,11 @@ class RangeIcebergExecutor(ExecutorBase):
         self._edit_keepalive_count[order_id] = 0
         self._edit_keepalive_next[order_id] = float(self._strategy.current_timestamp) + self._missing_lookup_delay(1)
 
-    def _burst_cancel_working_entries(self) -> None:
+    def _burst_cancel_working_entries(self, slots: Optional[List[_Slice]] = None) -> None:
         now = float(self._strategy.current_timestamp)
         fresh = []
         retries = []
-        for slot in self._slices:
+        for slot in self._slices if slots is None else slots:
             if not slot.is_working:
                 continue
             if not slot.cancel_requested:
@@ -1332,8 +1341,14 @@ class RangeIcebergExecutor(ExecutorBase):
         self._edit_retry_cursor = (start + len(chosen)) % len(ordered)
         return chosen
 
-    def _send_keepalive_cancels(self) -> None:
-        """Cancel-by-id for an entry given up after the 120 second window."""
+    async def _send_keepalive_cancels(self) -> None:
+        """
+        Cancel-by-id for an entry given up after the 120 second window.
+
+        Each pass looks the order up on that same 10/20/40 second backoff.
+        Cancelled or filled stops the loop. A fill is copied into the ledger
+        before the exits run, so they resize to it.
+        """
         if not self._edit_keepalive_cancels:
             return
         if self._entries_frozen and any(
@@ -1349,17 +1364,79 @@ class RangeIcebergExecutor(ExecutorBase):
         for order_id in due:
             if self._edit_cancel_budget() <= 0:
                 return
+            state = await self._lookup_order_state(order_id)
             order = self.get_in_flight_order(self.config.connector_name, order_id)
-            if order is not None and order.is_done:
+            if state in (OrderState.CANCELED, OrderState.FILLED) or (order is not None and order.is_done):
                 self._absorb_keepalive_fill(order_id)
-                self._edit_keepalive_cancels.discard(order_id)
-                self._edit_keepalive_next.pop(order_id, None)
+                self._stop_keepalive(order_id)
                 continue
             self._strategy.cancel(self.config.connector_name, self.config.trading_pair, order_id)
-            count = self._edit_keepalive_count.get(order_id, 0) + 1
-            self._edit_keepalive_count[order_id] = count
-            self._edit_keepalive_next[order_id] = now + self._missing_lookup_delay(count)
+            self._schedule_keepalive(order_id, now)
             self._edit_cancel_times.append(now)
+
+    def _schedule_keepalive(self, order_id: str, now: float) -> None:
+        count = self._edit_keepalive_count.get(order_id, 0) + 1
+        self._edit_keepalive_count[order_id] = count
+        self._edit_keepalive_next[order_id] = now + self._missing_lookup_delay(count)
+
+    def _stop_keepalive(self, order_id: str) -> None:
+        self._edit_keepalive_cancels.discard(order_id)
+        self._edit_keepalive_next.pop(order_id, None)
+        self._edit_keepalive_count.pop(order_id, None)
+
+    def _filled_reaches_total(self) -> bool:
+        return self._filled_unit() >= self.config.total_amount
+
+    def _trim_excess_entries(self) -> None:
+        """
+        Cancel or shrink working entries once they no longer fit beside the fill.
+
+        The room is total minus filled. Orders nearest the market keep that room.
+        Anything past it is cancelled through the same first-cancel burst. A
+        cancelled order is replaced only with the size that still fits, and a
+        full total places nothing further.
+        """
+        if self._entries_frozen or self._shutdown_pending:
+            return
+        room = self.config.total_amount - self._filled_unit()
+        if room < 0:
+            room = Decimal("0")
+        working = [slot for slot in self._slices if slot.is_working]
+        if not working:
+            return
+        commitment = sum((self._slot_open_unit(slot) for slot in working), Decimal("0"))
+        if self._filled_unit() + commitment <= self.config.total_amount:
+            return
+        left = room
+        cancel: List[_Slice] = []
+        for slot in sorted(working, key=self._cancel_market_key):
+            if slot.overfill_trim is not None:
+                cancel.append(slot)
+                kept = self._base_to_unit(slot.overfill_trim, slot.target_price)
+                if kept > 0:
+                    left -= kept
+                    if left < 0:
+                        left = Decimal("0")
+                continue
+            size = self._slot_open_unit(slot)
+            if size <= left:
+                left -= size
+                continue
+            slot.overfill_trim = self._trim_base_for_room(left, slot.target_price) if left > 0 else Decimal("0")
+            left = Decimal("0")
+            cancel.append(slot)
+        if cancel:
+            self._burst_cancel_working_entries(cancel)
+
+    def _trim_base_for_room(self, room_unit: Decimal, price: Decimal) -> Decimal:
+        base = self._unit_to_base(room_unit, price)
+        rules = self.get_trading_rules(self.config.connector_name, self.config.trading_pair)
+        step = Decimal(str(rules.min_base_amount_increment or 0))
+        if step > 0:
+            base = (base // step) * step
+        if base < Decimal(str(rules.min_order_size)):
+            return Decimal("0")
+        return base
 
     def _absorb_keepalive_fill(self, order_id: str) -> None:
         base, quote = self._best_fill(order_id)
@@ -1782,6 +1859,8 @@ class RangeIcebergExecutor(ExecutorBase):
         await self._place_up_to_slice(desired, placeable)
 
     async def _place_slice(self, slot: _Slice):
+        if self._filled_reaches_total():
+            return
         rules = self.get_trading_rules(self.config.connector_name, self.config.trading_pair)
         planned = slot.target_price
         price = self._jitter_price(planned, rules.min_price_increment)
@@ -1802,6 +1881,8 @@ class RangeIcebergExecutor(ExecutorBase):
         self._mark_action()
 
     async def _place_up_to_slice(self, price: Decimal, placeable_unit: Decimal):
+        if self._filled_reaches_total():
+            return
         rules = self.get_trading_rules(self.config.connector_name, self.config.trading_pair)
         planned = price
         price = self._clamp_limit(self._jitter_up_to_price(price))
@@ -2025,7 +2106,7 @@ class RangeIcebergExecutor(ExecutorBase):
     def _next_slot(self) -> Optional[_Slice]:
         if self._working_count() >= self._visible_limit():
             return None
-        return next((slot for slot in self._slices if slot.tracked is None), None)
+        return next((slot for slot in self._slices if slot.tracked is None and not slot.retired), None)
 
     def _range_slot_released(self, slot: _Slice) -> bool:
         if self._schedule is None:
@@ -2255,18 +2336,21 @@ class RangeIcebergExecutor(ExecutorBase):
             return self.filled_base / size
         return self.filled_base
 
+    def _slot_open_unit(self, slot: _Slice) -> Decimal:
+        if slot.tracked and slot.tracked.order is not None:
+            remaining_base = slot.tracked.order.amount - slot.tracked.executed_amount_base
+            if remaining_base < 0:
+                remaining_base = Decimal("0")
+        else:
+            remaining_base = slot.target_amount
+        return self._base_to_unit(remaining_base, slot.target_price)
+
     def _open_unit(self) -> Decimal:
         total = Decimal("0")
         for slot in self._slices:
             if not self._counts_as_open(slot):
                 continue
-            if slot.tracked and slot.tracked.order is not None:
-                remaining_base = slot.tracked.order.amount - slot.tracked.executed_amount_base
-                if remaining_base < 0:
-                    remaining_base = Decimal("0")
-            else:
-                remaining_base = slot.target_amount
-            total += self._base_to_unit(remaining_base, slot.target_price)
+            total += self._slot_open_unit(slot)
         return total
 
     def _skipped_amount(self) -> Decimal:
@@ -2432,7 +2516,18 @@ class RangeIcebergExecutor(ExecutorBase):
             remainder = slot.target_amount - filled_base
             if remainder < 0:
                 remainder = Decimal("0")
+            trim = slot.overfill_trim
             self._remember_fill_before_clearing(slot.order_id)
+            if trim is not None:
+                slot.overfill_trim = None
+                slot.cancel_requested = False
+                if trim <= 0:
+                    slot.target_amount = Decimal("0")
+                    slot.tracked = TrackedOrder(order_id="skipped")
+                    slot.retired = True
+                    continue
+                slot.target_amount = trim
+                continue
             slot.target_amount = remainder
 
     def _release_cancelled_exit_rungs(self) -> None:

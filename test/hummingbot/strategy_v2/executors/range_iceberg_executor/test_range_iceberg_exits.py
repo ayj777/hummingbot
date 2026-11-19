@@ -3684,6 +3684,46 @@ class RangeIcebergExitTests(IsolatedAsyncioWrapperTestCase):
             first_five,
         )
 
+    def test_z10_canceled_lookup_stops_the_keepalive_cancel(self):
+        executor = self._executor(total_amount=Decimal("100"))
+        self._run(executor.control_task())
+        order_id = self.buy_ids[0][0]
+        result = executor.update_config({"total_amount": "40"})
+        self.assertTrue(result["accepted"], result)
+        self._run(executor.control_task())
+        executor._slices[0].tracked.order = None
+        self.orders.pop(order_id)
+        phase = {"answer": None, "calls": 0}
+
+        async def resolve(trading_pair, client_order_id, exchange_order_id):
+            phase["calls"] += 1
+            return phase["answer"]
+
+        self.connector.resolve_unknown_order = resolve
+        self._run(executor.control_task())
+        self.now += 120
+        self._run(executor.control_task())
+        self.assertIn(order_id, executor._edit_keepalive_cancels)
+        self.now += 10
+        cancels = self.strategy.cancel.call_count
+        calls = phase["calls"]
+        self._run(executor.control_task())
+        self.assertGreater(phase["calls"], calls)
+        self.assertGreater(self.strategy.cancel.call_count, cancels)
+        self.assertIn(order_id, [call.args[2] for call in self.strategy.cancel.call_args_list[cancels:]])
+        phase["answer"] = OrderState.CANCELED
+        self.now += 10
+        cancels = self.strategy.cancel.call_count
+        calls = phase["calls"]
+        self._run(executor.control_task())
+        self.assertEqual(calls + 1, phase["calls"])
+        self.assertEqual(cancels, self.strategy.cancel.call_count)
+        self.assertNotIn(order_id, executor._edit_keepalive_cancels)
+        self.now += 40
+        self._run(executor.control_task())
+        self.assertEqual(calls + 1, phase["calls"])
+        self.assertEqual(cancels, self.strategy.cancel.call_count)
+
     def test_z2_late_fill_on_a_cleared_order_counts_and_resizes_the_exit(self):
         executor = self._executor(
             exit_arming="ON_ANY_FILL",
@@ -3706,6 +3746,44 @@ class RangeIcebergExitTests(IsolatedAsyncioWrapperTestCase):
         closes = [call for call in self._close_calls() if call[1][3] == OrderType.LIMIT]
         self.assertEqual(1, len(closes))
         self.assertEqual(Decimal("30"), closes[0][1][2])
+
+    def test_z13_late_fill_to_the_total_cancels_the_replacement(self):
+        executor = self._executor(
+            exit_arming="ON_ANY_FILL",
+            take_profit={"price": "0.10", "execution": "SINGLE", "order_type": "LIMIT"},
+        )
+        self._run(executor.control_task())
+        order_id = self.buy_ids[0][0]
+        result = executor.update_config({"total_amount": "40"})
+        self.assertTrue(result["accepted"], result)
+        self._run(executor.control_task())
+        self.orders[order_id].current_state = OrderState.CANCELED
+        self._run(executor.control_task())
+        replacement = next(
+            row[0]
+            for row in self.buy_ids
+            if row[4] == PositionAction.OPEN and row[0] != order_id
+        )
+        order = self.orders[order_id]
+        order.executed_amount_base = Decimal("40")
+        order.executed_amount_quote = Decimal("40") * order.price
+        self._run(executor.control_task())
+        self.assertIn(replacement, [call.args[2] for call in self.strategy.cancel.call_args_list])
+        self.assertEqual(Decimal("0"), self.orders[replacement].executed_amount_base)
+        self.orders[replacement].current_state = OrderState.CANCELED
+        placed = len(self.buy_ids)
+        self._run(executor.control_task())
+        open_ids = [
+            row[0]
+            for row in self.buy_ids[placed:]
+            if row[4] == PositionAction.OPEN
+        ]
+        self.assertEqual([], open_ids)
+        self.assertEqual(Decimal("0"), self.orders[replacement].executed_amount_base)
+        self.assertEqual(Decimal("40"), executor.filled_base)
+        self.assertEqual(Decimal("0"), self._open_entry_amount())
+        closes = [call for call in self._close_calls() if call[1][3] == OrderType.LIMIT]
+        self.assertEqual([Decimal("40")], [call[1][2] for call in closes])
 
     def test_config_edit_note_is_separate_from_config_edit_error(self):
         rejected = self._executor()

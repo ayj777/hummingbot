@@ -310,8 +310,12 @@ class RangeIcebergExecutorConfig(ExecutorConfigBase):
     retry. A lost cancel is retried. An entry the tracker cannot find is
     queried on a 10/20/40 second backoff and is not dropped before 120 seconds
     unless the connector reports it filled, cancelled, or not found after it
-    was confirmed placed. After that window, cancel-by-id continues and the
-    id stays in the fill ledger. config_edit_note carries a clamp or a
+    was confirmed placed. After that window, cancel-by-id continues on the
+    same backoff and each pass looks the order up. A cancelled or filled
+    answer stops that loop, and the fill stays in the ledger so the exits
+    resize. A later fill that pushes filled plus the working entries over
+    the total cancels or trims those entries, and no new entry is placed
+    once filled has reached the total. config_edit_note carries a clamp or a
     still-pending cancel. config_edit_error
     is set only when the edit was not applied and will not be applied.
     resume_entries false
