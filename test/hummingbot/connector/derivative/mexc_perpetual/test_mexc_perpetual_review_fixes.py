@@ -1555,13 +1555,13 @@ class MexcPerpetualReviewFixTests(IsolatedAsyncioWrapperTestCase):
         self.assertEqual(CONSTANTS.OPEN_TYPE_ISOLATED, captured[0]["openType"])
         self.assertNotEqual(CONSTANTS.POSITION_TYPE_SHORT, captured[0].get("positionType"))
 
-    def _orders_open(self, read, message: str):
+    def _orders_open(self, read, error: Exception):
         self.exchange._position_mode_confirmed = True
         self.exchange._perpetual_trading.set_position_mode(PositionMode.HEDGE)
         self.exchange._api_get = read
 
         async def post(path_url, data=None, **kwargs):
-            raise IOError(message)
+            raise error
 
         self.exchange._api_post = post
 
@@ -1573,7 +1573,7 @@ class MexcPerpetualReviewFixTests(IsolatedAsyncioWrapperTestCase):
                 {"symbol": "AIOT_USDT", "positionType": 1, "openType": 1, "leverage": 1},
             ]}
 
-        self._orders_open(get, "Error: 2019 - Leverage adjustment unavailable while orders are open")
+        self._orders_open(get, MexcResponseError(2019, "Leverage adjustment unavailable"))
         confirmed = await self.exchange.confirm_leverage_and_margin(
             self.trading_pair, 1, MarginMode.ISOLATED, position_side=PositionSide.LONG,
         )
@@ -1586,7 +1586,7 @@ class MexcPerpetualReviewFixTests(IsolatedAsyncioWrapperTestCase):
         async def get(path_url, params=None, **kwargs):
             return {"data": [{"symbol": "AIOT_USDT", "positionType": 1, "openType": 2, "leverage": 5}]}
 
-        self._orders_open(get, "Error: 2019 - Leverage adjustment unavailable while orders are open")
+        self._orders_open(get, MexcResponseError(2019, "Leverage adjustment unavailable"))
         confirmed = await self.exchange.confirm_leverage_and_margin(
             self.trading_pair, 1, MarginMode.ISOLATED, position_side=PositionSide.LONG,
         )
@@ -1601,7 +1601,7 @@ class MexcPerpetualReviewFixTests(IsolatedAsyncioWrapperTestCase):
         async def get(path_url, params=None, **kwargs):
             raise IOError("leverage read down")
 
-        self._orders_open(get, "Leverage adjustment unavailable while orders are open")
+        self._orders_open(get, IOError("Leverage adjustment unavailable while orders are open"))
         confirmed = await self.exchange.confirm_leverage_and_margin(
             self.trading_pair, 1, MarginMode.ISOLATED, position_side=PositionSide.LONG,
         )
@@ -1616,7 +1616,7 @@ class MexcPerpetualReviewFixTests(IsolatedAsyncioWrapperTestCase):
             called.append(path_url)
             return {"data": []}
 
-        self._orders_open(get, "Error: 2006 - Leverage multiplier must be within the upper limit")
+        self._orders_open(get, MexcResponseError(2018, "Cannot exceed the maximum reducible margin 2019"))
         confirmed = await self.exchange.confirm_leverage_and_margin(
             self.trading_pair, 1, MarginMode.ISOLATED, position_side=PositionSide.LONG,
         )

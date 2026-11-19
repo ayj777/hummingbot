@@ -1865,10 +1865,16 @@ class MexcPerpetualDerivative(PerpetualDerivativePyBase):
                         is_auth_required=True,
                     )
                 except Exception as exception:
-                    text = str(exception).lower()
+                    text = str(exception)
+                    head = text.split("-", 1)[0].replace("Error:", "").strip()
+                    try:
+                        parsed_code = int(head)
+                    except (TypeError, ValueError):
+                        parsed_code = None
                     orders_open = (
-                        self._exception_contains_code(exception, CONSTANTS.LEVERAGE_OPEN_ORDER_ERROR_CODES)
-                        or "orders are open" in text
+                        self._response_error_code(exception) in CONSTANTS.LEVERAGE_OPEN_ORDER_ERROR_CODES
+                        or parsed_code in CONSTANTS.LEVERAGE_OPEN_ORDER_ERROR_CODES
+                        or "orders are open" in text.lower()
                     )
                     if not orders_open:
                         raise
