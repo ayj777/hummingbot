@@ -4511,3 +4511,55 @@ class RangeIcebergExitTests(IsolatedAsyncioWrapperTestCase):
         owners = [copy.get_custom_info()["exchange_stop_order_id"] for copy in copies]
         self.assertEqual(["stop-1"], [owner for owner in owners if owner])
         self.assertEqual(placed, len(state["placed"]))
+
+    def test_idle_exit_still_restores_the_exchange_stop(self):
+        state = self._install_mexc_stop_book()
+        self._mid(Decimal("0.085"))
+        executor = self._executor(
+            total_amount=Decimal("200"),
+            levels=1,
+            exit_arming="ON_ANY_FILL",
+            stop_loss={"price": "0.07", "execution": "SINGLE"},
+        )
+        self._run(executor.control_task())
+        order = self.orders[self.buy_ids[-1][0]]
+        order.executed_amount_base = Decimal("100")
+        order.executed_amount_quote = Decimal("100") * order.price
+        order.current_state = OrderState.PARTIALLY_FILLED
+        self._run(executor.control_task())
+        info = executor.get_custom_info()
+        self.assertEqual("idle", info["exit_status"])
+        self.assertEqual("ARMED", info["exit_state"])
+        self.assertEqual("stop-1", info["exchange_stop_order_id"])
+        restored = self._executor(
+            total_amount=Decimal("200"),
+            levels=1,
+            exit_arming="ON_ANY_FILL",
+            stop_loss={"price": "0.07", "execution": "SINGLE"},
+        )
+        restored.restore_from_custom_info(info)
+        self.assertEqual("stop-1", restored.get_custom_info()["exchange_stop_order_id"])
+        self.assertEqual(Decimal("100"), restored._position_base())
+        self.assertEqual("idle", restored.get_custom_info()["exit_status"])
+        held = self._executor(
+            total_amount=Decimal("200"),
+            levels=1,
+            exit_arming="ON_ANY_FILL",
+            stop_loss={"price": "0.07", "execution": "SINGLE"},
+        )
+        held_info = dict(info)
+        held_info["resume_entries"] = False
+        held.restore_from_custom_info(held_info)
+        self.assertEqual("stop-1", held.get_custom_info()["exchange_stop_order_id"])
+        self.assertEqual(Decimal("100"), held._position_base())
+        placed = len(state["placed"])
+        self._run(held.control_task())
+        self.assertEqual(placed, len(state["placed"]))
+        self.assertEqual("stop-1", held.get_custom_info()["exchange_stop_order_id"])
+        entries = len(self.buy_ids)
+        self._run(restored.control_task())
+        self.assertEqual(placed, len(state["placed"]))
+        self.assertEqual("stop-1", restored.get_custom_info()["exchange_stop_order_id"])
+        self.assertEqual("idle", restored.get_custom_info()["exit_status"])
+        self.assertEqual(entries + 1, len(self.buy_ids))
+        self.assertEqual(Decimal("100"), self.buy_ids[-1][1])

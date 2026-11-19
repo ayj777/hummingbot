@@ -6528,6 +6528,47 @@ class RangeIcebergExecutor(ExecutorBase):
         self._exit_accounted_quote.clear()
         self._last_fill_timestamp = float(self._strategy.current_timestamp)
 
+    def _restore_idle_exchange_stop(self, custom_info: dict, blob: dict) -> None:
+        """
+        Keep a stop that was placed before any exit was chosen.
+
+        The public state can already say ARMED while the phase is idle. Leaving
+        the phase idle lets the next tick place entries. The entry fill is put
+        back first so the restored stop amount is this tier's own base.
+        """
+        stop_ids = custom_info.get("exchange_stop_order_ids", blob.get("exchange_stop_order_ids"))
+        stop_id = custom_info.get("exchange_stop_order_id", blob.get("exchange_stop_order_id"))
+        if not isinstance(stop_ids, list) or not stop_ids:
+            stop_ids = [] if stop_id in (None, "") else [stop_id]
+        stop_ids = [str(item) for item in stop_ids if item not in (None, "")]
+        released = custom_info.get("exchange_stop_released", blob.get("exchange_stop_released"))
+        if isinstance(released, str):
+            released = released.strip().lower() in ("true", "1", "yes")
+        if released or not stop_ids:
+            return
+        if self._resume_entries:
+            entry_base = Decimal(str(blob.get("entry_filled_base") or "0"))
+            entry_quote = Decimal(str(blob.get("entry_filled_quote") or "0"))
+            if entry_base > 0:
+                self._accounted_fill_by_order["restored-entry"] = entry_base
+                self._accounted_quote_by_order["restored-entry"] = entry_quote
+                self._accounted_fill_base = sum(self._accounted_fill_by_order.values(), Decimal("0"))
+                self._accounted_fill_quote = sum(self._accounted_quote_by_order.values(), Decimal("0"))
+        price = self._exchange_stop_trigger_price()
+        total = self._position_base()
+        count = len(stop_ids)
+        share = total / Decimal(count) if count else total
+        running = Decimal("0")
+        self._exchange_stops = []
+        for index, item in enumerate(stop_ids):
+            amount = total - running if index == count - 1 else share
+            running += amount
+            self._exchange_stops.append({"id": item, "amount": amount, "price": price})
+        self._exchange_stop_order_id = stop_ids[0]
+        self._exchange_stop_amount = total
+        self._exchange_stop_price = price
+        self._drop_stop_ids_claimed_by_peers()
+
     def _restore_exit_state(self, custom_info: dict) -> None:
         """
         Reapply exit progress saved in get_custom_info()["exit"].
@@ -6539,9 +6580,11 @@ class RangeIcebergExecutor(ExecutorBase):
         and the supplied average, and it never places an entry. A stop loss that
         had already started stays the active exit. Exit order ids are reattached
         only when the connector still has them open and entries are still being
-        resumed. Missing ids are posted again from open_base. A saved exchange
-        stop id is kept and is not placed a second time. started_at is the trigger
-        time. It is not moved to the first exit fill.
+        resumed. Missing ids are posted again from open_base.         A saved exchange
+        stop id is kept and is not placed a second time. An ON_ANY_FILL stop can
+        already exist while the exit phase is still idle. That id and the entry
+        fill that sized it are kept, and the phase stays idle so entries continue.
+        started_at is the trigger time. It is not moved to the first exit fill.
         """
         if not isinstance(custom_info, dict):
             return
@@ -6574,6 +6617,7 @@ class RangeIcebergExecutor(ExecutorBase):
         if active not in ("take_profit", "stop_loss"):
             active = None
         if status == "idle" and active is None and not blob.get("filled_by_order"):
+            self._restore_idle_exchange_stop(custom_info, blob)
             return
         if status not in ("idle", "armed", "resting", "cancelling_entry", "executing", "done"):
             status = "idle"
