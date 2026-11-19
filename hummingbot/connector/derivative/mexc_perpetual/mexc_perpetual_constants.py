@@ -25,7 +25,9 @@ CONFIRMED_ABSENT = "confirmed_absent"
 ORDER_CANNOT_CANCEL_ERROR_CODE = 2041
 # 2026: leverage modification is not supported for cross.
 # 2027: only one cross or isolated position is allowed in the same direction.
+# 2019: leverage cannot be changed while orders are open on the pair.
 MARGIN_MODE_SWITCH_ERROR_CODES = {2026, 2027}
+LEVERAGE_OPEN_ORDER_ERROR_CODES = {2019}
 
 # Order side: 1 open long, 2 close short, 3 open short, 4 close long.
 SIDE_OPEN_LONG = 1
@@ -98,6 +100,7 @@ OPEN_ORDERS_MAX_PAGES = 20
 ASSETS_PATH = "/api/v1/private/account/assets"
 OPEN_POSITIONS_PATH = "/api/v1/private/position/open_positions"
 CHANGE_LEVERAGE_PATH = "/api/v1/private/position/change_leverage"
+POSITION_LEVERAGE_PATH = "/api/v1/private/position/leverage"
 POSITION_MODE_PATH = "/api/v1/private/position/position_mode"
 CHANGE_POSITION_MODE_PATH = "/api/v1/private/position/change_position_mode"
 FUNDING_RECORDS_PATH = "/api/v1/private/position/funding_records"
@@ -204,6 +207,7 @@ RATE_LIMITS = [
     RateLimit(limit_id=ASSETS_PATH, limit=20, time_interval=2),
     RateLimit(limit_id=OPEN_POSITIONS_PATH, limit=20, time_interval=2),
     RateLimit(limit_id=CHANGE_LEVERAGE_PATH, limit=10, time_interval=10),
+    RateLimit(limit_id=POSITION_LEVERAGE_PATH, limit=20, time_interval=2),
     RateLimit(limit_id=POSITION_MODE_PATH, limit=20, time_interval=2),
     RateLimit(limit_id=CHANGE_POSITION_MODE_PATH, limit=20, time_interval=2),
     RateLimit(limit_id=FUNDING_RECORDS_PATH, limit=20, time_interval=2),

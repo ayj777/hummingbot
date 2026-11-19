@@ -1823,6 +1823,8 @@ class MexcPerpetualDerivative(PerpetualDerivativePyBase):
         When margin_mode is omitted and this side's position is not loaded, the
         exchange is not called. When the loaded position already uses this leverage,
         and margin is not being changed, the exchange is not called either.
+        A rejection while orders are open is accepted only when a live read of
+        this side shows the same leverage and margin mode.
         """
         if not self._position_mode_confirmed:
             return False, (
@@ -1850,17 +1852,88 @@ class MexcPerpetualDerivative(PerpetualDerivativePyBase):
                 call, send_open_type = self._leverage_call_plan(trading_pair, item, leverage, requested)
                 if not call:
                     continue
-                await self._api_post(
-                    path_url=CONSTANTS.CHANGE_LEVERAGE_PATH,
-                    data=self._leverage_payload(
-                        trading_pair,
-                        symbol,
-                        item,
-                        leverage,
-                        requested if send_open_type else None,
-                    ),
-                    is_auth_required=True,
-                )
+                try:
+                    await self._api_post(
+                        path_url=CONSTANTS.CHANGE_LEVERAGE_PATH,
+                        data=self._leverage_payload(
+                            trading_pair,
+                            symbol,
+                            item,
+                            leverage,
+                            requested if send_open_type else None,
+                        ),
+                        is_auth_required=True,
+                    )
+                except Exception as exception:
+                    text = str(exception).lower()
+                    orders_open = (
+                        self._exception_contains_code(exception, CONSTANTS.LEVERAGE_OPEN_ORDER_ERROR_CODES)
+                        or "orders are open" in text
+                    )
+                    if not orders_open:
+                        raise
+                    matched = False
+                    live_leverage = None
+                    live_mode = None
+                    try:
+                        response = await self._api_get(
+                            path_url=CONSTANTS.POSITION_LEVERAGE_PATH,
+                            params={"symbol": symbol},
+                            is_auth_required=True,
+                        )
+                        rows = response.get("data") if isinstance(response, dict) else None
+                        if isinstance(rows, dict):
+                            rows = [rows]
+                        wanted = (
+                            CONSTANTS.POSITION_TYPE_LONG if item is PositionSide.LONG
+                            else CONSTANTS.POSITION_TYPE_SHORT
+                        )
+                        for row in rows or []:
+                            if not isinstance(row, dict):
+                                continue
+                            row_symbol = row.get("symbol")
+                            if row_symbol not in (None, "") and str(row_symbol) != symbol:
+                                continue
+                            try:
+                                if int(row.get("positionType")) != wanted:
+                                    continue
+                            except (TypeError, ValueError):
+                                continue
+                            open_type = row.get("openType")
+                            try:
+                                code = int(open_type)
+                            except (TypeError, ValueError):
+                                code = None
+                            if code == CONSTANTS.OPEN_TYPE_ISOLATED:
+                                live_mode = MarginMode.ISOLATED
+                            elif code == CONSTANTS.OPEN_TYPE_CROSS:
+                                live_mode = MarginMode.CROSS
+                            live_leverage = row.get("leverage")
+                            matched = (
+                                requested is not None
+                                and live_mode == requested
+                                and self._same_leverage(live_leverage, leverage)
+                            )
+                            if matched:
+                                self._remember_position_margin(trading_pair, item, open_type)
+                            break
+                    except Exception:
+                        matched = False
+                        live_leverage = None
+                        live_mode = None
+                    if matched:
+                        continue
+                    if live_leverage is None and live_mode is None:
+                        return False, (
+                            f"MEXC rejected the leverage change for {trading_pair} {item.name} "
+                            "while orders are open, and the live leverage read failed. Refusing to trade."
+                        )
+                    live_mode_text = live_mode if live_mode is not None else "unread"
+                    return False, (
+                        f"MEXC has {trading_pair} {item.name} at leverage {live_leverage} {live_mode_text}. "
+                        f"Requested leverage {leverage} {requested} differs and cannot be changed "
+                        "while orders are open. Refusing to trade."
+                    )
                 if send_open_type and requested is not None:
                     self._position_margin_modes[(trading_pair, item)] = requested
         except Exception as exception:
