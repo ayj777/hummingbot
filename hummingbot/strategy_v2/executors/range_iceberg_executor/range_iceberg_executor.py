@@ -288,6 +288,7 @@ class RangeIcebergExecutor(ExecutorBase):
         self._pending_restored_entries: Dict[str, tuple] = {}
         self._saved_exchange_order_ids: Dict[str, str] = {}
         self._legacy_entry_snapshot = False
+        self._legacy_saved_ids: Set[str] = set()
         self._entry_pause_started: Optional[float] = None
         self._last_place_timestamp = Decimal("-1")
         self._rng = random.Random(config.random_seed)
@@ -3661,21 +3662,29 @@ class RangeIcebergExecutor(ExecutorBase):
         quote = Decimal("0")
         saved_base = Decimal("0")
         saved_quote = Decimal("0")
+        prior_base = Decimal("0")
+        prior_quote = Decimal("0")
         for order_id in order_ids:
             if self._is_exit_order(order_id):
                 continue
             part_base, part_quote = self._best_fill(order_id)
-            # A snapshot with no per-order size keeps one aggregate. The fill is
-            # the larger of that aggregate and the live sizes, never the sum.
+            # The saved total covers only the orders in that snapshot. Fills on
+            # orders placed after the restore are added on top.
             if self._legacy_entry_snapshot and order_id == "restored-entry":
                 saved_base = part_base
                 saved_quote = part_quote
                 continue
+            if self._legacy_entry_snapshot and order_id in self._legacy_saved_ids:
+                prior_base += part_base
+                prior_quote += part_quote
+                continue
             base += part_base
             quote += part_quote
-        if self._legacy_entry_snapshot and saved_base >= base:
-            return saved_base, saved_quote
-        return base, quote
+        if not self._legacy_entry_snapshot:
+            return base, quote
+        if saved_base >= prior_base:
+            return saved_base + base, saved_quote + quote
+        return prior_base + base, prior_quote + quote
 
     @property
     def total_base(self) -> Decimal:
@@ -6875,12 +6884,12 @@ class RangeIcebergExecutor(ExecutorBase):
         Saved entry orders stay unresolved until their state and size are known.
 
         A snapshot that records executed size keeps max(snapshot, live) on that
-        order. An older snapshot has no per-order size. Its fill is the larger
-        of the saved total and the live executed sizes, never the sum, and never
-        below the saved total. The position and the managed size use that fill,
-        so the take profit and the stop cover it. A saved id the tracker does
-        not have is queried, then backed off and paused like any other unknown
-        order.
+        order.         An older snapshot has no per-order size. Its fill is the larger of the
+        saved total and the live size of those saved orders, never the sum, and
+        never below the saved total. Fills on orders placed after the restore
+        are added. The position and the managed size use that fill, so the take
+        profit and the stop cover it. A saved id the tracker does not have is
+        queried, then backed off and paused like any other unknown order.
         """
         if not self._resume_entries or self._schedule is None or not isinstance(info, dict):
             return
@@ -6891,17 +6900,21 @@ class RangeIcebergExecutor(ExecutorBase):
         if self.config.mode == ExecutionMode.RANGE and saved:
             self._slices = saved
         legacy = False
+        saved_ids = set()
         for level in levels:
             if not isinstance(level, dict):
                 continue
             order_id = level.get("order_id")
             if order_id in (None, "", "skipped"):
                 continue
+            saved_ids.add(str(order_id))
             if "executed_base" not in level:
                 legacy = True
                 continue
             self._remember_snapshotted_fill(str(order_id), level)
         self._legacy_entry_snapshot = legacy
+        if legacy:
+            self._legacy_saved_ids = saved_ids
         if not legacy:
             self._keep_snapshot_fills_on_their_orders()
         for index, level in enumerate(levels):
