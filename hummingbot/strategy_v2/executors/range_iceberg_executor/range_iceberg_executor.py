@@ -6036,6 +6036,14 @@ class RangeIcebergExecutor(ExecutorBase):
             return None
         if self._live_stop_matches(amount, trigger):
             return self._exchange_stop_order_id
+        peers = self._peer_stop_ids_blocking(trigger)
+        if peers:
+            self._reject_foreign_position_stop(peers, restore=restore)
+            return None
+        short = self._sibling_stop_room_short(amount)
+        if short is not None:
+            self._note_exchange_stop_failure(RuntimeError(short), restore=restore)
+            return None
         known = await self._foreign_open_stop_ids()
         if self._stop_list_error:
             self._note_exchange_stop_failure(
@@ -6073,7 +6081,8 @@ class RangeIcebergExecutor(ExecutorBase):
             )
             return None
         order_id = str(order_id)
-        if order_id not in set(self._exchange_stop_order_ids()) and order_id in known:
+        claimed = known | self._peer_stop_ids()
+        if order_id not in set(self._exchange_stop_order_ids()) and order_id in claimed:
             self._reject_foreign_position_stop({order_id}, restore=restore)
             return None
         return order_id
@@ -6127,11 +6136,74 @@ class RangeIcebergExecutor(ExecutorBase):
             foreign.add(row_id)
         return foreign
 
+    def _peer_stop_ids(self) -> Set[str]:
+        slot = self._side_slot()
+        found: Set[str] = set()
+        for peer in self._range_iceberg_peers():
+            if peer._side_slot() != slot:
+                continue
+            found.update(peer._exchange_stop_order_ids())
+        return found
+
+    def _peer_stop_ids_blocking(self, trigger: Decimal) -> Set[str]:
+        """
+        Stop ids a same-side iceberg already holds at this trigger.
+
+        A missing price blocks too. Prices on the same tick match, so a
+        quantized listing cannot miss the sibling stop.
+        """
+        slot = self._side_slot()
+        found: Set[str] = set()
+        for peer in self._range_iceberg_peers():
+            if peer._side_slot() != slot:
+                continue
+            for stop in peer._exchange_stops:
+                stop_id = stop.get("id")
+                if not stop_id:
+                    continue
+                price = stop.get("price")
+                if price is None or self._same_stop_tick(Decimal(str(price)), trigger):
+                    found.add(str(stop_id))
+        return found
+
+    def _peer_reserved_close_base(self) -> Decimal:
+        """
+        Size other icebergs already use for stops and resting close limits.
+
+        This executor does not cancel those orders. When the live position
+        cannot also hold this stop, the place is not sent.
+        """
+        slot = self._side_slot()
+        total = Decimal("0")
+        for peer in self._range_iceberg_peers():
+            if peer._side_slot() != slot:
+                continue
+            total += peer._exchange_stop_amount
+            total += peer._resting_reduce_only_close_base()
+        return total
+
+    def _sibling_stop_room_short(self, amount: Decimal) -> Optional[str]:
+        reserved = self._peer_reserved_close_base()
+        if reserved <= 0 or not self._position_sync_ok or self._live_position_base is None:
+            return None
+        room = self._live_position_base - reserved - self._resting_reduce_only_close_base()
+        if room < 0:
+            room = Decimal("0")
+        if amount <= room:
+            return None
+        return f"closable quantity is {room} and this stop needs {amount}"
+
+    def _same_stop_tick(self, left: Decimal, right: Decimal) -> bool:
+        step = self._price_step()
+        if step <= 0:
+            return left == right
+        return quantize_down(left, step) == quantize_down(right, step)
+
     def _stop_row_blocks_trigger(self, row, trigger: Decimal) -> bool:
         price = self._stop_row_price(row)
         if price is None:
             return True
-        return price == trigger
+        return self._same_stop_tick(price, trigger)
 
     def _stop_row_price(self, row) -> Optional[Decimal]:
         if not isinstance(row, dict):
@@ -6174,10 +6246,15 @@ class RangeIcebergExecutor(ExecutorBase):
             if text in ("2", "SHORT", "SELL"):
                 return not wanted_long
             try:
-                return (int(raw) == 1) if wanted_long else (int(raw) == 2)
+                number = int(raw)
             except (TypeError, ValueError):
-                return False
-        return False
+                return True
+            if number == 1:
+                return wanted_long
+            if number == 2:
+                return not wanted_long
+            return True
+        return True
 
     def _reject_foreign_position_stop(self, order_ids: Set[str], *, restore: bool) -> None:
         ids = ", ".join(sorted(str(order_id) for order_id in order_ids))

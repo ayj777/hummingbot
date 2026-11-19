@@ -4425,3 +4425,70 @@ class RangeIcebergExitTests(IsolatedAsyncioWrapperTestCase):
         labeled.restore_from_custom_info({"group_id": "aiot-long", "sibling_base": "40"})
         self.assertEqual("aiot-long", labeled.get_custom_info()["group_id"])
         self.assertEqual("40", labeled.get_custom_info()["sibling_base"])
+
+    def test_stop_row_without_a_side_is_not_overwritten(self):
+        state = self._install_mexc_stop_book()
+        state["stops"]["stop-foreign"] = {"amount": Decimal("80"), "price": Decimal("0.06965")}
+
+        async def list_open(trading_pair=None):
+            return [{"id": "stop-foreign", "symbol": "AIOT_USDT", "stopLossPrice": "0.06965"}]
+
+        self.connector.list_open_stop_orders = list_open
+        self._mid(Decimal("0.085"))
+        executor = self._executor(stop_loss={"price": "0.07", "execution": "SINGLE"})
+        self._open_entry(executor)
+        self._run(executor.control_task())
+        self.assertEqual([], state["placed"])
+        self.assertIsNone(executor.get_custom_info()["exchange_stop_order_id"])
+        self.assertIn("stop-foreign", executor.get_custom_info()["exchange_stop_error"])
+        self.assertEqual(Decimal("80"), state["stops"]["stop-foreign"]["amount"])
+
+    def test_peer_stop_at_the_same_trigger_is_not_replaced(self):
+        state = self._install_mexc_stop_book()
+        self._mid(Decimal("0.085"))
+        first = self._executor(stop_loss={"price": "0.07", "execution": "SINGLE"})
+        second = self._executor(stop_loss={"price": "0.07", "execution": "SINGLE"})
+        self._register_executors(first, second)
+        self._open_entry(first)
+        self._run(first.control_task())
+        self.assertEqual("stop-1", first.get_custom_info()["exchange_stop_order_id"])
+        placed = len(state["placed"])
+        self._open_entry(second)
+        self._run(second.control_task())
+        self.assertEqual(placed, len(state["placed"]))
+        self.assertIsNone(second.get_custom_info()["exchange_stop_order_id"])
+        self.assertIn("stop-1", second.get_custom_info()["exchange_stop_error"])
+        self.assertEqual(Decimal("100"), state["stops"]["stop-1"]["amount"])
+
+    def test_sibling_stop_is_not_sent_when_the_book_is_full(self):
+        state = self._install_mexc_stop_book()
+        self._mid(Decimal("0.085"))
+        first = self._executor(
+            total_amount=Decimal("100"),
+            exit_arming="ON_ANY_FILL",
+            take_profit={"price": "0.11", "execution": "SINGLE", "order_type": "LIMIT"},
+            stop_loss={"price": "0.07", "execution": "SINGLE"},
+        )
+        second = self._executor(
+            total_amount=Decimal("100"),
+            price_low=Decimal("0.07"),
+            price_high=Decimal("0.08"),
+            exit_arming="ON_ANY_FILL",
+            take_profit={"price": "0.11", "execution": "SINGLE", "order_type": "LIMIT"},
+            stop_loss={"price": "0.06", "execution": "SINGLE"},
+        )
+        self._register_executors(first, second)
+        self._open_entry(first)
+        self._run(first.control_task())
+        self.assertEqual(Decimal("100"), state["stops"]["stop-1"]["amount"])
+        self.assertEqual(1, len(self._open_limit_closes()))
+        placed = len(state["placed"])
+        self._install_position_source({"amount": Decimal("200")})
+        self._open_entry(second)
+        self.now += 4
+        self._run(second.control_task())
+        self.assertEqual(placed, len(state["placed"]))
+        self.assertIsNone(second.get_custom_info()["exchange_stop_order_id"])
+        self.assertIn("closable quantity", second.get_custom_info()["exchange_stop_error"])
+        self.assertEqual(Decimal("100"), state["stops"]["stop-1"]["amount"])
+        self.assertEqual(1, len(self._open_limit_closes()))
