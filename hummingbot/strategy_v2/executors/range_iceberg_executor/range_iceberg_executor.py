@@ -111,12 +111,10 @@ class RangeIcebergExecutor(ExecutorBase):
 
     The exit is reduce-only: closing a long is a sell with position action CLOSE
     (MEXC hedge side 4) and closing a short is a buy with position action CLOSE
-    (MEXC hedge side 2).     Exit size never exceeds this executor's own filled amount,
-    net of what the exit has already closed. A successful position read
-    caps that size at the live exchange position on this hedge side.
-    When that read is flat and the executor's own exit fills do not
-    explain it, the executor cancels its orders and stops, with close
-    type POSITION_CLOSED_EXTERNALLY. A failed read changes nothing.
+    (MEXC hedge side 2). Exit size never exceeds this executor's own filled amount,
+    net of what the exit has already closed. A live position read can cap that
+    size. Two flat reads, once a recent exit fill has had time to land, end
+    the executor when its own fills do not explain the flat book.
 
     A single limit take profit is not a trigger. It rests at the trigger for the
     filled amount, and further entry fills add to it or resize it. The order is
@@ -335,13 +333,8 @@ class RangeIcebergExecutor(ExecutorBase):
         self._position_sync_ok = False
         self._last_position_sync_at: Optional[float] = None
         self._external_close = False
-        self._external_reduce_base = Decimal("0")
         self._reconcile_error = ""
-        self._position_sync_token: Optional[float] = None
-        self._position_sync_outcome = "skipped"
-        self._stops_proven_fired: Set[str] = set()
-        self._unconfirmed_exit_orders = False
-        self._confirmed_order_fill = False
+        self._flat_position_reads = 0
         self._tp_grow_cancelling = False
         self._tp_previous_size = Decimal("0")
         self._replace_stop_before_failed = False
@@ -366,7 +359,6 @@ class RangeIcebergExecutor(ExecutorBase):
         self._exchange_stop_cancel_failures = 0
         self._exchange_stop_cancel_after: Optional[float] = None
         self._exchange_stop_cancel_started_at: Optional[float] = None
-        self._exchange_stop_placed_at: Optional[float] = None
         self._exchange_stop_close_capped = False
         self._tp_room_clear_at: Optional[float] = None
         self._side_guard_checked = False
@@ -717,8 +709,6 @@ class RangeIcebergExecutor(ExecutorBase):
         if self._shutdown_pending:
             await self._finish_shutdown()
             return
-        if await self._reconcile_exchange_state(force=False) == "closed":
-            return
         if not await self._ensure_account_settings():
             return
         if not self._contract_size_ready():
@@ -735,6 +725,8 @@ class RangeIcebergExecutor(ExecutorBase):
         await self._service_entry_rebuild()
         await self._send_keepalive_cancels()
         self._trim_excess_entries()
+        if await self._reconcile_exchange_state() == "closed":
+            return
         self._capture_schedule_anchor()
         if self._exit_phase == "done":
             await self._sync_exchange_stop()
@@ -769,8 +761,6 @@ class RangeIcebergExecutor(ExecutorBase):
                 await self._sync_exchange_stop()
                 return
         await self._sync_exchange_stop()
-        if self._shutdown_pending or self._external_close:
-            return
         if self._entries_frozen or not self._resume_entries:
             return
         if self._filled_reaches_total():
@@ -3356,9 +3346,7 @@ class RangeIcebergExecutor(ExecutorBase):
             "closed_base": str(self._exit_filled_base()),
             "open_base": str(self._position_base()),
             "exchange_position_base": None if self._live_position_base is None else str(self._live_position_base),
-            "last_position_sync_at": self._last_position_sync_at,
             "external_close": self._external_close,
-            "external_reduce_base": str(self._external_reduce_base),
             "reconcile_error": self._reconcile_error,
             "exit_error": self._exit_error,
             "exit_status": self._exit_phase,
@@ -4100,9 +4088,6 @@ class RangeIcebergExecutor(ExecutorBase):
         """
         Resize the backstop to the open position, then post one full take profit.
 
-        A fresh position read runs first. A failed read leaves the stop and
-        the take profit where they are.
-
         The resting take profit is cancelled first and the existing stops stay
         up, so the covered size does not drop while that cancel is open. It is
         not cancelled again until the stop backoff has passed, and it is put
@@ -4118,11 +4103,6 @@ class RangeIcebergExecutor(ExecutorBase):
         is posted once the hold expires. An identical size and price that is
         already live is not sent again.
         """
-        if self._external_close:
-            return
-        outcome = await self._reconcile_exchange_state(force=True)
-        if outcome in ("error", "closed"):
-            return
         if self._exchange_stop_restore and not self._exchange_stop_order_ids():
             if self._exit_working() and self._slow_clear_should_run():
                 if not self._begin_slow_room_clear():
@@ -4179,11 +4159,6 @@ class RangeIcebergExecutor(ExecutorBase):
         await self._post_resting_take_profit(self._managed_base())
 
     async def _post_resting_take_profit(self, amount: Decimal):
-        if self._external_close:
-            return
-        outcome = await self._reconcile_exchange_state(force=True)
-        if outcome in ("error", "closed"):
-            return
         amount = min(amount, self._managed_base())
         if self._reduce_only_limit_needs_a_live_stop():
             return
@@ -4378,11 +4353,6 @@ class RangeIcebergExecutor(ExecutorBase):
         self._begin_shutdown()
 
     async def _execute_exit_single(self):
-        if self._external_close:
-            return
-        outcome = await self._reconcile_exchange_state(force=True)
-        if outcome in ("error", "closed"):
-            return
         if self._exit_working() and not (
             self._exchange_stop_close_capped and self._exit_active == "stop_loss"
         ):
@@ -4489,8 +4459,6 @@ class RangeIcebergExecutor(ExecutorBase):
         return SliceSchedule(amounts=amounts, offsets=offsets, duration=duration, skip_unplaced=False)
 
     async def _place_next_exit_range_slice(self):
-        if await self._reconcile_exchange_state(force=True) in ("error", "closed"):
-            return
         if self._reduce_only_limit_needs_a_live_stop():
             return
         if self._exit_working_count() >= self._exit_visible_limit():
@@ -4529,8 +4497,6 @@ class RangeIcebergExecutor(ExecutorBase):
         self._mark_action()
 
     async def _place_next_exit_up_to_slice(self):
-        if await self._reconcile_exchange_state(force=True) in ("error", "closed"):
-            return
         if self._reduce_only_limit_needs_a_live_stop():
             return
         cfg = self._active_exit_config()
@@ -4578,8 +4544,6 @@ class RangeIcebergExecutor(ExecutorBase):
         self._track_exit(price, amount, order_id, pre_jitter_price=desired)
 
     async def _place_exit_remainder(self):
-        if await self._reconcile_exchange_state(force=True) in ("error", "closed"):
-            return
         if self._reduce_only_limit_needs_a_live_stop():
             return
         if self._exit_working_count() > 0 or not self._rate_limit_allows_place():
@@ -4813,58 +4777,34 @@ class RangeIcebergExecutor(ExecutorBase):
             return own
         return live
 
-    async def _reconcile_exchange_state(self, force: bool = False) -> str:
+    async def _reconcile_exchange_state(self) -> str:
         """
-        Read this connector, pair, and hedge side from the exchange.
+        Read this pair and hedge side from the exchange about every 4 seconds.
 
-        One successful read is reused for the rest of this timestamp.
-        A later tick waits about 4 seconds unless an order is about to
-        be placed or resized. "unsupported" means the connector has no
-        position refresh, and the fill ledger stays in charge. "error"
-        changes nothing. "closed" means the position was closed outside
-        this executor.
+        A connector without a position refresh is left on the fill ledger.
+        A failed or unreadable read changes nothing and is tried again on
+        the next cadence. Two flat reads are required, and a flat read
+        during the grace after our own exit fill does not count.
         """
         if self._external_close:
             return "closed"
         now = float(self._strategy.current_timestamp)
-        if self._position_sync_token == now:
-            return self._position_sync_outcome
-        if not force and self._last_position_sync_at is not None:
+        if self._last_position_sync_at is not None:
             if now + 1e-9 < float(self._last_position_sync_at) + float(self._POSITION_SYNC_SECONDS):
                 return "skipped"
         if self.filled_base <= 0 and not self._exchange_stop_order_ids():
             return "skipped"
         outcome, live = await self._read_live_position()
         if outcome == "error":
-            self._position_sync_token = now
-            self._position_sync_outcome = "error"
-            return "error"
-        stop_outcome = "unsupported"
-        open_stop_ids: Optional[Set[str]] = None
-        if outcome == "ok" and self._exchange_stop_order_ids():
-            stop_outcome, open_stop_ids = await self._read_open_stop_ids()
-            if stop_outcome == "error":
-                self._position_sync_token = now
-                self._position_sync_outcome = "error"
-                return "error"
-        self._unconfirmed_exit_orders = False
-        self._confirmed_order_fill = False
-        order_outcome = await self._confirm_working_orders()
-        if order_outcome == "error":
-            self._position_sync_token = now
-            self._position_sync_outcome = "error"
-            return "error"
-        if outcome == "ok":
-            self._live_position_base = live
-            self._position_sync_ok = True
             self._last_position_sync_at = now
-            self._reconcile_error = ""
-            applied = self._apply_live_position(live, stop_outcome, open_stop_ids)
-        else:
-            applied = "unsupported"
-        self._position_sync_token = now
-        self._position_sync_outcome = applied
-        return applied
+            self._flat_position_reads = 0
+            return "error"
+        if outcome != "ok":
+            return "unsupported"
+        self._last_position_sync_at = now
+        self._reconcile_error = ""
+        self._note_exit_fill_progress()
+        return self._apply_live_position(live)
 
     async def _read_live_position(self):
         connector = self.connectors[self.config.connector_name]
@@ -4884,217 +4824,66 @@ class RangeIcebergExecutor(ExecutorBase):
         if not isinstance(positions, dict):
             self._reconcile_error = "position read failed: unreadable"
             return "error", None
-        position = self._matching_exchange_position()
-        if position is None:
+        side = self._settings_position_side()
+        found = False
+        live = Decimal("0")
+        for position in positions.values():
+            if getattr(position, "trading_pair", None) != self.config.trading_pair:
+                continue
+            if getattr(position, "position_side", None) != side:
+                continue
+            amount = getattr(position, "amount", None)
+            if amount is None:
+                self._reconcile_error = "position read failed: unreadable"
+                return "error", None
+            try:
+                live += abs(Decimal(str(amount)))
+            except (TypeError, ValueError, ArithmeticError):
+                self._reconcile_error = "position read failed: unreadable"
+                return "error", None
+            found = True
+        if not found:
             return "ok", Decimal("0")
-        amount = getattr(position, "amount", None)
-        if amount is None:
-            self._reconcile_error = "position read failed: unreadable"
-            return "error", None
-        try:
-            live = abs(Decimal(str(amount)))
-        except (TypeError, ValueError, ArithmeticError):
-            self._reconcile_error = "position read failed: unreadable"
-            return "error", None
         return "ok", live
 
-    async def _read_open_stop_ids(self):
-        connector = self.connectors[self.config.connector_name]
-        self._stops_proven_fired = set()
-        listing = self._real_callable(connector, "list_open_stop_orders")
-        if listing is None:
-            reader = self._real_callable(connector, "get_position_stop_order")
-            if reader is None:
-                return "unsupported", None
-            open_ids: Set[str] = set()
-            for order_id in self._exchange_stop_order_ids():
-                try:
-                    record = reader(order_id)
-                    if hasattr(record, "__await__"):
-                        record = await record
-                except Exception as exc:
-                    self._reconcile_error = f"stop read failed: {exc}"
-                    return "error", None
-                if record is None:
-                    continue
-                if not isinstance(record, dict):
-                    self._reconcile_error = "stop read failed: unreadable"
-                    return "error", None
-                if self._stop_record_fired(record) is True:
-                    self._stops_proven_fired.add(str(order_id))
-                    continue
-                open_ids.add(str(order_id))
-            return "ok", open_ids
-        try:
-            rows = listing(self.config.trading_pair)
-            if hasattr(rows, "__await__"):
-                rows = await rows
-        except Exception as exc:
-            self._reconcile_error = f"stop read failed: {exc}"
-            return "error", None
-        if isinstance(rows, dict):
-            rows = rows.get("data") if rows.get("data") is not None else rows.get("orders")
-        if rows is None or not isinstance(rows, list):
-            self._reconcile_error = "stop read failed: unreadable"
-            return "error", None
-        open_ids = set()
-        for row in rows:
-            if not isinstance(row, dict):
-                continue
-            row_id = row.get("id", row.get("stopPlanOrderId", row.get("orderId", row.get("stopOrderId"))))
-            if row_id in (None, ""):
-                continue
-            if self._stop_record_fired(row) is True:
-                continue
-            open_ids.add(str(row_id))
-        return "ok", open_ids
-
-    def _apply_live_position(self, live: Decimal, stop_outcome: str, open_stop_ids: Optional[Set[str]]) -> str:
-        if stop_outcome == "ok" and open_stop_ids is not None:
-            if self._stops_proven_fired:
-                proven = set(self._stops_proven_fired)
-                self._stops_proven_fired = set()
-                self._credit_exchange_stops(proven)
-            self._forget_missing_stops(open_stop_ids)
-        if self._confirmed_order_fill:
-            self._refresh_tracked_orders()
+    def _apply_live_position(self, live: Decimal) -> str:
+        """
+        A positive size is applied at once. A flat size is applied only
+        on the second read, and not during the grace after our own exit fill.
+        Until then the previous managed size stays in place.
+        """
         own = self._position_base()
-        if live >= own:
-            self._external_reduce_base = Decimal("0")
-        else:
-            self._external_reduce_base = own - live
-        if self._shutdown_pending or self._external_close:
-            return "closed"
         if live <= 0 and own > 0:
-            if self._unconfirmed_exit_orders:
+            if self._exit_fill_grace_active():
+                self._flat_position_reads = 0
                 return "ok"
+            self._flat_position_reads += 1
+            if self._flat_position_reads < 2:
+                return "ok"
+            self._live_position_base = Decimal("0")
+            self._position_sync_ok = True
             self._begin_external_close()
             return "closed"
+        self._flat_position_reads = 0
+        self._live_position_base = live
+        self._position_sync_ok = True
         return "ok"
 
-    def _stop_was_just_placed(self) -> bool:
-        if self._exchange_stop_placed_at is None:
+    def _exit_fill_grace_active(self) -> bool:
+        if self._exit_last_fill_at is None:
             return False
         now = float(self._strategy.current_timestamp)
-        return now + 1e-9 < float(self._exchange_stop_placed_at) + float(self._POSITION_SYNC_SECONDS)
-
-    def _forget_missing_stops(self, open_stop_ids: Set[str]):
-        """
-        Drop owned stops the exchange no longer has open.
-
-        A stop placed in this cadence is kept, so a list that has not caught
-        up yet does not stack a second stop. A later sync places a new one
-        when the position is still open and the stop loss is still configured.
-        """
-        if self._stop_was_just_placed():
-            return
-        missing = [order_id for order_id in self._exchange_stop_order_ids() if order_id not in open_stop_ids]
-        if not missing:
-            return
-        self._forget_exchange_stops(missing)
-        if not self._exchange_stop_order_ids():
-            self._exchange_stop_cancel_started_at = None
-            self._exchange_stop_cancel_after = None
-            self._exchange_stop_cancel_failures = 0
+        return now <= float(self._exit_last_fill_at) + float(self._POSITION_SYNC_SECONDS)
 
     def _begin_external_close(self):
         if self._external_close or self.status == RunnableStatus.TERMINATED:
             return
         self._external_close = True
-        own = self._position_base()
-        live = self._live_position_base if self._live_position_base is not None else Decimal("0")
-        self._external_reduce_base = own - live if own > live else own
         self._exit_error = "position closed outside the bot"
         self._keep_exchange_stop = False
         self.close_type = CloseType.POSITION_CLOSED_EXTERNALLY
         self.close_timestamp = self._strategy.current_timestamp
         self._begin_shutdown()
-
-    def _working_exit_ids(self) -> Set[str]:
-        return {
-            str(slot.order_id)
-            for slot in self._exit_slices
-            if slot.order_id and slot.order_id != "skipped" and slot.is_working
-        }
-
-    def _working_tracked_order_ids(self) -> List[str]:
-        ids = []
-        for slot in list(self._slices) + list(self._exit_slices):
-            order_id = getattr(slot, "order_id", None)
-            if not order_id or order_id == "skipped" or not getattr(slot, "is_working", False):
-                continue
-            ids.append(str(order_id))
-        return ids
-
-    async def _confirm_working_orders(self) -> str:
-        """
-        Confirm a few working orders with the exchange.
-
-        An unknown answer leaves that order on the existing backoff.
-        An exception fails the tick closed. Exit orders are read first.
-        At most five lookups run on a tick.
-        """
-        connector = self.connectors[self.config.connector_name]
-        resolve = self._real_callable(connector, "resolve_unknown_order")
-        if resolve is None:
-            return "unsupported"
-        ids = self._working_tracked_order_ids()
-        if not ids:
-            return "ok"
-        exits = [order_id for order_id in ids if order_id in self._working_exit_ids()]
-        entries = [order_id for order_id in ids if order_id not in self._working_exit_ids()]
-        if len(exits) > 5:
-            self._unconfirmed_exit_orders = True
-        batch = (exits + entries)[:5]
-        confirmed = []
-        for order_id in batch:
-            try:
-                state = resolve(self.config.trading_pair, order_id, self._exchange_order_id_for(order_id))
-                if hasattr(state, "__await__"):
-                    state = await state
-            except Exception as exc:
-                self._reconcile_error = f"order read failed: {exc}"
-                return "error"
-            if not self._order_state_is_usable(order_id, state):
-                return "error"
-            if state is None and order_id in self._working_exit_ids():
-                self._unconfirmed_exit_orders = True
-            confirmed.append((order_id, state))
-        for order_id, state in confirmed:
-            if not self._apply_confirmed_order_state(order_id, state):
-                return "error"
-        return "ok"
-
-    def _order_state_is_usable(self, order_id: str, state) -> bool:
-        if state != OrderState.FILLED:
-            return True
-        order = self.get_in_flight_order(self.config.connector_name, order_id)
-        if order is None:
-            return True
-        try:
-            filled = Decimal(str(getattr(order, "executed_amount_base", 0) or 0))
-        except (TypeError, ValueError, ArithmeticError):
-            filled = Decimal("0")
-        if filled <= 0:
-            self._reconcile_error = f"order read failed: {order_id} fill is unreadable"
-            return False
-        return True
-
-    def _apply_confirmed_order_state(self, order_id: str, state) -> bool:
-        if state is None or state == "unknown" or self._is_confirmed_absent(state):
-            return True
-        order = self.get_in_flight_order(self.config.connector_name, order_id)
-        if order is None:
-            return True
-        if state == OrderState.CANCELED:
-            if order.current_state not in (OrderState.CANCELED, OrderState.FILLED, OrderState.FAILED):
-                order.current_state = OrderState.CANCELED
-            return True
-        if state == OrderState.FILLED:
-            order.current_state = OrderState.FILLED
-            self._confirmed_order_fill = True
-            return True
-        return True
 
     def _exit_room_base(self) -> Decimal:
         room = self._software_close_base() - self._exit_open_base()
@@ -5377,7 +5166,6 @@ class RangeIcebergExecutor(ExecutorBase):
                 self._exchange_stops.append({"id": order_id, "amount": amount, "price": price})
         self._exchange_stop_order_id = self._exchange_stops[0]["id"]
         self._exchange_stop_amount = sum((stop["amount"] for stop in self._exchange_stops), Decimal("0"))
-        self._exchange_stop_placed_at = float(self._strategy.current_timestamp)
         self._exchange_stop_price = price
         return True
 
@@ -6231,8 +6019,6 @@ class RangeIcebergExecutor(ExecutorBase):
         stop never cancels. The software stop, a finished exit, and every terminal
         path except keep_position cancel the order instead of refreshing it.
         """
-        if self._external_close:
-            return
         if self._keep_exchange_stop and self._shutdown_pending:
             return
         if self._stop_loss_close_in_progress() and not self._replace_stop_before_failed:
@@ -6286,12 +6072,6 @@ class RangeIcebergExecutor(ExecutorBase):
             and all(stop.get("price") == trigger for stop in self._exchange_stops)
         ):
             self._clear_exchange_stop_error_if_complete()
-            return
-        outcome = await self._reconcile_exchange_state(force=True)
-        if outcome in ("error", "closed"):
-            return
-        position = self._managed_base()
-        if position < self._min_order_size():
             return
         saved = [dict(stop) for stop in self._exchange_stops]
         if self._exchange_stop_order_ids():
