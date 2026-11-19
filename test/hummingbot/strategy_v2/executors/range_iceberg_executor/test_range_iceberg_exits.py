@@ -3563,7 +3563,7 @@ class RangeIcebergExitTests(IsolatedAsyncioWrapperTestCase):
         self.assertEqual(Decimal("40"), executor.config.total_amount)
         self.assertLessEqual(self._open_entry_amount() + executor.filled_base, Decimal("40"))
 
-    def test_z5_untracked_entry_is_gone_after_bounded_lookups(self):
+    def test_z5_untracked_entry_stays_frozen_until_the_lookup_window(self):
         executor = self._executor(total_amount=Decimal("100"))
         self._run(executor.control_task())
         order_id = self.buy_ids[0][0]
@@ -3579,21 +3579,110 @@ class RangeIcebergExitTests(IsolatedAsyncioWrapperTestCase):
         self.connector.resolve_unknown_order = resolve
         self._run(executor.control_task())
         self._run(executor.control_task())
+        self._run(executor.control_task())
         self.assertTrue(executor._entries_frozen)
         self.assertEqual(Decimal("100"), executor.config.total_amount)
+        self.assertEqual(1, len(self.buy_ids))
+
+    def test_z8_unknown_entry_is_kept_through_the_lookup_window(self):
+        executor = self._executor(
+            exit_arming="ON_ANY_FILL",
+            take_profit={"price": "0.10", "execution": "SINGLE", "order_type": "LIMIT"},
+        )
+        self._run(executor.control_task())
+        order_id = self.buy_ids[0][0]
+        price = self.orders[order_id].price
+        result = executor.update_config({"total_amount": "40"})
+        self.assertTrue(result["accepted"], result)
+        self._run(executor.control_task())
+        executor._slices[0].tracked.order = None
+        self.orders.pop(order_id)
+
+        async def resolve(trading_pair, client_order_id, exchange_order_id):
+            return None
+
+        self.connector.resolve_unknown_order = resolve
+        self._run(executor.control_task())
+        self.assertTrue(executor._entries_frozen)
+        self.now += 120
         self._run(executor.control_task())
         self.assertFalse(executor._entries_frozen)
         self.assertEqual(Decimal("40"), executor.config.total_amount)
-        later = executor.update_config({"total_amount": "30"})
-        self.assertTrue(later["accepted"], later)
+        self.assertIn(order_id, executor._accounted_fill_by_order)
+        self.assertIn(order_id, executor._edit_keepalive_cancels)
+        cancels = self.strategy.cancel.call_count
+        self.now += 10
         self._run(executor.control_task())
-        for row in list(self.buy_ids):
-            order = self.orders.get(row[0])
-            if order is not None and row[4] == PositionAction.OPEN and order.is_open:
-                order.current_state = OrderState.CANCELED
+        kept = [call.args[2] for call in self.strategy.cancel.call_args_list[cancels:]]
+        self.assertIn(order_id, kept)
+        self.orders[order_id] = InFlightOrder(
+            client_order_id=order_id,
+            trading_pair="AIOT-USDT",
+            order_type=OrderType.LIMIT,
+            trade_type=TradeType.BUY,
+            amount=Decimal("100"),
+            price=price,
+            initial_state=OrderState.FILLED,
+            creation_timestamp=self.now,
+        )
+        self.orders[order_id].executed_amount_base = Decimal("30")
+        self.orders[order_id].executed_amount_quote = Decimal("30") * price
         self._run(executor.control_task())
-        self.assertFalse(executor._entries_frozen)
-        self.assertEqual(Decimal("30"), executor.config.total_amount)
+        self.assertEqual(Decimal("30"), executor.filled_base)
+        closes = [call for call in self._close_calls() if call[1][3] == OrderType.LIMIT]
+        self.assertEqual([Decimal("30")], [call[1][2] for call in closes])
+
+    def test_z8c_three_unknowns_then_open_stays_frozen(self):
+        executor = self._executor(total_amount=Decimal("100"))
+        self._run(executor.control_task())
+        order_id = self.buy_ids[0][0]
+        result = executor.update_config({"total_amount": "40"})
+        self.assertTrue(result["accepted"], result)
+        self._run(executor.control_task())
+        executor._slices[0].tracked.order = None
+        self.orders.pop(order_id)
+        answers = [None, None, None, OrderState.OPEN]
+
+        async def resolve(trading_pair, client_order_id, exchange_order_id):
+            return answers.pop(0)
+
+        self.connector.resolve_unknown_order = resolve
+        self._run(executor.control_task())
+        self.now += 10
+        self._run(executor.control_task())
+        self.now += 20
+        self._run(executor.control_task())
+        self.assertTrue(executor._entries_frozen)
+        self.assertEqual(Decimal("100"), executor.config.total_amount)
+        self.assertEqual(1, len(self.buy_ids))
+        self.now += 40
+        self._run(executor.control_task())
+        self.assertTrue(executor._entries_frozen)
+        self.assertEqual(Decimal("100"), executor.config.total_amount)
+        self.assertEqual(1, len(self.buy_ids))
+        self.assertEqual([], answers)
+
+    def test_z9_every_rung_gets_a_first_cancel_before_retries(self):
+        executor = self._executor(levels=20, total_amount=Decimal("200"), iceberg=False)
+        for _ in range(20):
+            self._run(executor.control_task())
+        self.assertEqual(20, len(self.buy_ids))
+        order_ids = [row[0] for row in self.buy_ids]
+        prices = {row[0]: row[2] for row in self.buy_ids}
+        result = executor.update_config({"total_amount": "40"})
+        self.assertTrue(result["accepted"], result)
+        started = self.now
+        for _ in range(4):
+            self._run(executor.control_task())
+            self.now += 2
+        cancelled = [call.args[2] for call in self.strategy.cancel.call_args_list]
+        self.assertLessEqual(self.now - started, 8)
+        self.assertEqual(sorted(order_ids), sorted(cancelled))
+        first_five = cancelled[:5]
+        self.assertEqual(
+            sorted(prices, key=prices.get, reverse=True)[:5],
+            first_five,
+        )
 
     def test_z2_late_fill_on_a_cleared_order_counts_and_resizes_the_exit(self):
         executor = self._executor(

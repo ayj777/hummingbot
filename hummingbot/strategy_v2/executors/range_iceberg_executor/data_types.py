@@ -306,9 +306,13 @@ class RangeIcebergExecutorConfig(ExecutorConfigBase):
     price_high, take_profit, and stop_loss are the live values and are not
     applied again. custom_info reports size_unit beside total_amount. A new
     total or a new range cancels the working entries and builds a fresh plan
-    for whatever size is still unfilled. A lost cancel is retried, and an
-    entry the tracker cannot find is queried and then treated as gone.
-    config_edit_note carries a clamp or a still-pending cancel. config_edit_error
+    for whatever size is still unfilled. Never-sent cancels go out before any
+    retry. A lost cancel is retried. An entry the tracker cannot find is
+    queried on a 10/20/40 second backoff and is not dropped before 120 seconds
+    unless the connector reports it filled, cancelled, or not found after it
+    was confirmed placed. After that window, cancel-by-id continues and the
+    id stays in the fill ledger. config_edit_note carries a clamp or a
+    still-pending cancel. config_edit_error
     is set only when the edit was not applied and will not be applied.
     resume_entries false
     places no entry orders and sizes the restored open amount in base, even
