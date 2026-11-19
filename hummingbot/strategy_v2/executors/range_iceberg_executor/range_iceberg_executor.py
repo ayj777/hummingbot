@@ -289,7 +289,6 @@ class RangeIcebergExecutor(ExecutorBase):
         self._saved_exchange_order_ids: Dict[str, str] = {}
         self._legacy_entries_halted = False
         self._legacy_order_ids: Set[str] = set()
-        self._legacy_seen_ids: Set[str] = set()
         self._snapshot_rest_saved = False
         self._snapshot_rest_base = Decimal("0")
         self._snapshot_rest_quote = Decimal("0")
@@ -3682,6 +3681,8 @@ class RangeIcebergExecutor(ExecutorBase):
         return self._sum_best_fills()[1]
 
     def _sum_best_fills(self):
+        if self._legacy_entries_halted and self._legacy_order_ids and self._snapshot_rest_saved:
+            return self._legacy_fill_total()
         order_ids = set(self._counted_fill_base)
         order_ids.update(self._accounted_fill_by_order)
         for slot in self._slices:
@@ -3689,28 +3690,30 @@ class RangeIcebergExecutor(ExecutorBase):
                 order_ids.add(slot.order_id)
         base = Decimal("0")
         quote = Decimal("0")
-        rest_base = Decimal("0")
-        rest_quote = Decimal("0")
         for order_id in order_ids:
             if self._is_exit_order(order_id):
                 continue
             part_base, part_quote = self._best_fill(order_id)
-            if order_id == "restored-entry":
-                rest_base, rest_quote = part_base, part_quote
             base += part_base
             quote += part_quote
-        if self._legacy_tracker_has_every_saved_order():
-            # Saved and tracker are the same fills. Keep the max, do not add them.
-            base -= rest_base
-            quote -= rest_quote
-            if base < self._snapshot_rest_base:
-                return self._snapshot_rest_base, self._snapshot_rest_quote
         return base, quote
 
-    def _legacy_tracker_has_every_saved_order(self) -> bool:
-        if not self._legacy_entries_halted or not self._legacy_order_ids:
-            return False
-        return self._legacy_order_ids <= self._legacy_seen_ids
+    def _legacy_fill_total(self):
+        """
+        max(saved total, sum of the latest size of each saved order).
+
+        A tracker or lookup replaces that order's size. It is not added
+        to the saved total.
+        """
+        base = Decimal("0")
+        quote = Decimal("0")
+        for order_id in self._legacy_order_ids:
+            part_base, part_quote = self._best_fill(order_id)
+            base += part_base
+            quote += part_quote
+        if base < self._snapshot_rest_base:
+            return self._snapshot_rest_base, self._snapshot_rest_quote
+        return base, quote
 
     @property
     def total_base(self) -> Decimal:
@@ -6933,9 +6936,9 @@ class RangeIcebergExecutor(ExecutorBase):
         order. An older snapshot with a saved entry order cannot say which
         order a fill belongs to, so it places no new entries and says
         legacy_snapshot_entries_halted. That halt stays until a new executor
-        starts. Each saved order's executed size comes from the tracker or
-        from the same order lookup as any other restore. After that it is
-        the per-order size. A saved id the tracker does not have is queried,
+        starts. The ledger is the max of the saved total and the sum of
+        each saved order's latest size, from the tracker or the lookup.
+        A saved id the tracker does not have is queried,
         then backed off and paused like any other unknown order.
         """
         if isinstance(info, dict) and info.get("legacy_entries_halted"):
@@ -7011,7 +7014,6 @@ class RangeIcebergExecutor(ExecutorBase):
         order = self.get_in_flight_order(self.config.connector_name, order_id)
         if order is None:
             return
-        self._legacy_seen_ids.add(order_id)
         base = Decimal(str(order.executed_amount_base or 0))
         if base <= 0:
             return
