@@ -287,6 +287,7 @@ class RangeIcebergExecutor(ExecutorBase):
         self._unresolved_entry_ids: Set[str] = set()
         self._pending_restored_entries: Dict[str, tuple] = {}
         self._saved_exchange_order_ids: Dict[str, str] = {}
+        self._legacy_entry_snapshot = False
         self._entry_pause_started: Optional[float] = None
         self._last_place_timestamp = Decimal("-1")
         self._rng = random.Random(config.random_seed)
@@ -3056,26 +3057,11 @@ class RangeIcebergExecutor(ExecutorBase):
                 self._halt_for_unknown_order(order_id, "The order state is unknown.")
                 return True
             return False
-        self._open_lookup_count[order_id] = self._open_lookup_count.get(order_id, 0) + 1
-        self._open_lookup_started.setdefault(order_id, now)
-        count = self._open_lookup_count[order_id]
-        age = now - self._open_lookup_started[order_id]
-        if count >= self._open_lookup_cap or age >= self._open_lookup_max_seconds:
-            if halt:
-                self._halt_for_unknown_order(order_id, "The order is still open after repeated lookups.")
-                return True
-            delay = min(
-                self._open_lookup_backoff_seconds * (2 ** max(count - 1, 0)),
-                self._open_lookup_backoff_cap_seconds,
-            )
-            self._next_open_lookup_at[order_id] = now + delay
-            return False
-        delay = min(
-            self._open_lookup_backoff_seconds * (2 ** (count - 1)),
-            self._open_lookup_backoff_cap_seconds,
+        return self._backoff_or_halt_unknown(
+            order_id,
+            "The order is still open after repeated lookups.",
+            halt,
         )
-        self._next_open_lookup_at[order_id] = now + delay
-        return False
 
     async def _lookup_order_state(self, order_id: str):
         connector = self.connectors[self.config.connector_name]
@@ -6878,9 +6864,11 @@ class RangeIcebergExecutor(ExecutorBase):
         """
         Saved entry orders stay unresolved until their state and size are known.
 
-        Each order's fill is max(snapshot executed, live executed). That size is
-        not also kept in the aggregate. New entries wait until every saved id
-        is resolved from the tracker or an order query.
+        A snapshot that records executed size keeps max(snapshot, live) on that
+        order. An older snapshot has no per-order size, so only the live size
+        counts, and a saved order that is still open blocks new entries. A saved
+        id the tracker does not have is queried, then backed off and paused like
+        any other unknown order.
         """
         if not self._resume_entries or self._schedule is None or not isinstance(info, dict):
             return
@@ -6890,15 +6878,25 @@ class RangeIcebergExecutor(ExecutorBase):
         saved = self._slices_from_levels(levels)
         if self.config.mode == ExecutionMode.RANGE and saved:
             self._slices = saved
+        legacy = False
         for level in levels:
             if not isinstance(level, dict):
                 continue
             order_id = level.get("order_id")
             if order_id in (None, "", "skipped"):
                 continue
+            if "executed_base" not in level:
+                legacy = True
+                continue
             self._remember_snapshotted_fill(str(order_id), level)
-        self._attribute_legacy_entry_fills(levels)
-        self._keep_snapshot_fills_on_their_orders()
+        self._legacy_entry_snapshot = legacy
+        if legacy:
+            self._accounted_fill_by_order.pop("restored-entry", None)
+            self._accounted_quote_by_order.pop("restored-entry", None)
+            self._accounted_fill_base = sum(self._accounted_fill_by_order.values(), Decimal("0"))
+            self._accounted_fill_quote = sum(self._accounted_quote_by_order.values(), Decimal("0"))
+        else:
+            self._keep_snapshot_fills_on_their_orders()
         for index, level in enumerate(levels):
             if not isinstance(level, dict):
                 continue
@@ -6913,9 +6911,10 @@ class RangeIcebergExecutor(ExecutorBase):
             if index < len(self._slices) and self._slices[index].tracked is None:
                 slot = self._slices[index]
             order = self.get_in_flight_order(self.config.connector_name, text)
-            if order is None:
+            if order is None or (legacy and not order.is_done):
                 self._unresolved_entry_ids.add(text)
                 self._pending_restored_entries[text] = (level, slot)
+            if order is None:
                 continue
             self._attach_restored_entry(text, order, level, slot)
 
@@ -6942,45 +6941,6 @@ class RangeIcebergExecutor(ExecutorBase):
             return
         self._snapshotted_entry_base[order_id] = base
         self._snapshotted_entry_quote[order_id] = Decimal(str(level.get("executed_quote") or "0"))
-
-    def _attribute_legacy_entry_fills(self, levels: list) -> None:
-        """
-        A snapshot with no per-order executed size still recorded one filled amount.
-
-        That amount is attributed to the saved orders. Once a live executed size
-        is known, the order's fill is the max of the two, not the sum.
-        """
-        missing = []
-        for level in levels:
-            if not isinstance(level, dict):
-                continue
-            order_id = level.get("order_id")
-            if order_id in (None, "", "skipped") or "executed_base" in level:
-                continue
-            missing.append(level)
-        if not missing:
-            return
-        remaining = self._accounted_fill_by_order.get("restored-entry", Decimal("0"))
-        remaining -= sum(self._snapshotted_entry_base.values(), Decimal("0"))
-        if remaining <= 0:
-            return
-        quote_left = self._accounted_quote_by_order.get("restored-entry", Decimal("0"))
-        quote_left -= sum(self._snapshotted_entry_quote.values(), Decimal("0"))
-        if quote_left < 0:
-            quote_left = Decimal("0")
-        for level in missing:
-            if remaining <= 0:
-                break
-            amount = Decimal(str(level.get("amount") or "0"))
-            give = amount if amount < remaining else remaining
-            if give <= 0:
-                continue
-            order_id = str(level.get("order_id"))
-            share = quote_left * give / remaining
-            self._snapshotted_entry_base[order_id] = give
-            self._snapshotted_entry_quote[order_id] = share
-            quote_left -= share
-            remaining -= give
 
     def _keep_snapshot_fills_on_their_orders(self) -> None:
         """
@@ -7016,34 +6976,74 @@ class RangeIcebergExecutor(ExecutorBase):
             return
         self._saved_exchange_order_ids[order_id] = str(raw)
 
+    def _backoff_or_halt_unknown(self, order_id: str, because: str, halt: bool = True) -> bool:
+        """
+        Look the order up again after 10s, then 20s, then 40s. Then pause.
+        """
+        now = float(self._strategy.current_timestamp)
+        self._open_lookup_count[order_id] = self._open_lookup_count.get(order_id, 0) + 1
+        self._open_lookup_started.setdefault(order_id, now)
+        count = self._open_lookup_count[order_id]
+        age = now - self._open_lookup_started[order_id]
+        capped = count >= self._open_lookup_cap or age >= self._open_lookup_max_seconds
+        if capped and halt:
+            self._halt_for_unknown_order(order_id, because)
+            return True
+        power = count - 1
+        if capped:
+            power = max(power, 0)
+        delay = min(
+            self._open_lookup_backoff_seconds * (2 ** power),
+            self._open_lookup_backoff_cap_seconds,
+        )
+        self._next_open_lookup_at[order_id] = now + delay
+        return False
+
+    def _unknown_restore_reason(self, state) -> str:
+        if state == OrderState.FILLED:
+            return "The exchange says the order is filled but no size was recorded."
+        return "The order state is unknown."
+
     async def _resolve_restored_entries(self) -> None:
         """
         Look up each saved entry id before any new entry is placed.
 
         The tracker is enough when it still has the order. Otherwise the connector
-        is queried by client id and by exchange id. A terminal answer with a known
-        size closes the id. Anything still unknown keeps new entries blocked.
+        is queried by client id and by exchange id. An inconclusive answer backs
+        off and then pauses with unknown_order_halt. New entries stay blocked.
         """
         if not self._unresolved_entry_ids:
             return
+        now = float(self._strategy.current_timestamp)
         for order_id in list(self._unresolved_entry_ids):
+            if order_id in self._unknown_order_ids:
+                continue
             order = self.get_in_flight_order(self.config.connector_name, order_id)
             state = None
             if order is None:
+                if now < self._next_open_lookup_at.get(order_id, now):
+                    continue
                 state = await self._lookup_order_state(order_id)
                 self._refresh_tracked_orders()
                 order = self.get_in_flight_order(self.config.connector_name, order_id)
             if order is not None:
-                level, slot = self._pending_restored_entries.pop(order_id, ({}, None))
-                if slot is not None and slot.tracked is not None:
-                    slot = None
-                self._attach_restored_entry(order_id, order, level or {}, slot)
+                if self._slot_for(order_id) is None:
+                    level, slot = self._pending_restored_entries.get(order_id, ({}, None))
+                    if slot is not None and slot.tracked is not None:
+                        slot = None
+                    self._attach_restored_entry(order_id, order, level or {}, slot)
+                if self._legacy_entry_snapshot and not order.is_done:
+                    continue
+                self._pending_restored_entries.pop(order_id, None)
                 self._unresolved_entry_ids.discard(order_id)
+                self._clear_open_retry(order_id)
                 continue
-            if not self._restored_entry_size_is_known(order_id, state):
+            if self._restored_entry_size_is_known(order_id, state):
+                self._close_unresolved_entry(order_id)
+                self._unresolved_entry_ids.discard(order_id)
+                self._clear_open_retry(order_id)
                 continue
-            self._close_unresolved_entry(order_id)
-            self._unresolved_entry_ids.discard(order_id)
+            self._backoff_or_halt_unknown(order_id, self._unknown_restore_reason(state))
 
     def _restored_entry_size_is_known(self, order_id: str, state) -> bool:
         if self._is_confirmed_absent(state) or state == OrderState.CANCELED:

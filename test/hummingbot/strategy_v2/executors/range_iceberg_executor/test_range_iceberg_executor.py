@@ -2014,13 +2014,105 @@ class RangeIcebergExecutorTests(IsolatedAsyncioWrapperTestCase):
             schedule_start=ScheduleStart.SUBMIT,
         )
         resumed.restore_from_custom_info(payload["custom_info"])
-        self.assertEqual(Decimal("10"), resumed.filled_base)
-        self.assertEqual(Decimal("30"), resumed._open_unit())
+        self._run(resumed.control_task())
+        self.assertEqual(1, len(self.buy_ids))
         self.orders["buy-1"].executed_amount_base = Decimal("10")
         self.orders["buy-1"].executed_amount_quote = Decimal("0.85")
         self.assertEqual(Decimal("10"), resumed.filled_base)
         self.assertEqual(Decimal("30"), resumed._open_unit())
         self.assertEqual(Decimal("40"), resumed.filled_base + resumed._open_unit())
+
+    def test_an_inconclusive_restore_query_pauses_with_a_reason(self):
+        info = self._open_range_schedule()
+        self.orders.pop("buy-1")
+        lookups = []
+
+        async def resolve(trading_pair, client_order_id, exchange_order_id=None):
+            lookups.append(self.now)
+            return None
+
+        self.connector.resolve_unknown_order = resolve
+        resumed = self._resume_range_schedule(info)
+        self._run(resumed.control_task())
+        self.assertEqual([self.now], lookups)
+        self.assertEqual(1, len(self.buy_ids))
+        self.assertFalse(resumed.get_custom_info()["paused"])
+        self._run(resumed.control_task())
+        self.assertEqual(1, len(lookups))
+        self.now += 10
+        self._run(resumed.control_task())
+        self.assertEqual(2, len(lookups))
+        self.now += 20
+        self._run(resumed.control_task())
+        report = resumed.get_custom_info()
+        self.assertEqual(3, len(lookups))
+        self.assertTrue(report["paused"])
+        self.assertTrue(report["unknown_order_halt"])
+        self.assertIn("buy-1", report["status_reason"])
+        self.assertIn("unknown_order_halt", report["status_reason"])
+        self.assertEqual(1, len(self.buy_ids))
+        self.assertEqual(Decimal("0"), resumed.filled_base)
+
+    def test_a_filled_query_without_a_size_pauses_with_a_reason(self):
+        info = self._open_range_schedule()
+        self.orders.pop("buy-1")
+        lookups = []
+
+        async def resolve(trading_pair, client_order_id, exchange_order_id=None):
+            lookups.append(self.now)
+            return OrderState.FILLED
+
+        self.connector.resolve_unknown_order = resolve
+        resumed = self._resume_range_schedule(info)
+        self._run(resumed.control_task())
+        self.now += 10
+        self._run(resumed.control_task())
+        self.now += 20
+        self._run(resumed.control_task())
+        report = resumed.get_custom_info()
+        self.assertEqual(3, len(lookups))
+        self.assertTrue(report["paused"])
+        self.assertTrue(report["unknown_order_halt"])
+        self.assertIn("buy-1", report["status_reason"])
+        self.assertEqual(1, len(self.buy_ids))
+        self.assertEqual(Decimal("0"), resumed.filled_base)
+
+    def test_a_legacy_snapshot_does_not_assign_one_fill_to_two_orders(self):
+        self._fine_step()
+        executor = self._executor(
+            size_unit=SizeUnit.BASE,
+            total_amount=Decimal("100"),
+            levels=4,
+            iceberg=False,
+            visible_count=4,
+            schedule_interval=25,
+            schedule_slices=2,
+            duration=None,
+            schedule_start=ScheduleStart.SUBMIT,
+        )
+        self._run(executor.control_task())
+        self._run(executor.control_task())
+        self.assertEqual([Decimal("25"), Decimal("25")], [row[1] for row in self.buy_ids])
+        self._fill("buy-2", Decimal("25"))
+        payload = json.loads(executor.executor_info.model_dump_json())
+        for level in payload["custom_info"]["levels"]:
+            level.pop("executed_base", None)
+            level.pop("executed_quote", None)
+        resumed = self._executor(
+            size_unit=SizeUnit.BASE,
+            total_amount=Decimal("100"),
+            levels=4,
+            iceberg=False,
+            visible_count=4,
+            schedule_interval=25,
+            schedule_slices=2,
+            duration=None,
+            schedule_start=ScheduleStart.SUBMIT,
+        )
+        resumed.restore_from_custom_info(payload["custom_info"])
+        self._run(resumed.control_task())
+        self.assertEqual(Decimal("25"), resumed.filled_base)
+        self.assertEqual(2, len(self.buy_ids))
 
     def test_range_rungs_release_from_the_anchor(self):
         executor = self._executor(
