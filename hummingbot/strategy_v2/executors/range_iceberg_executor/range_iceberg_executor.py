@@ -1,7 +1,6 @@
 import inspect
 import logging
 import random
-import weakref
 from decimal import Decimal
 from typing import Dict, List, Optional, Set, Tuple
 
@@ -164,12 +163,14 @@ class RangeIcebergExecutor(ExecutorBase):
     unconfirmed take profit and the live stop. If the exchange stop already
     fired, the close is reconciled and the executor ends on the stop, not
     FAILED. A larger fill at the same backstop price places the full open
-    size and MEXC returns the existing stop id with that new vol. Two
-    executors on the same connector, pair, and position side do not share
-    that id: the second trigger moves one or more price ticks further from
-    the market, and an id another executor already owns is not remembered.
-    A moved
-    percent trigger is repriced with change_stop_plan_price, then resized at
+    size and MEXC returns the existing stop id with that new vol. Only one
+    range iceberg may be open per account, connector, pair, and position
+    side. A long and a short on the same pair are both allowed. A second
+    executor on a side that is already open refuses to start and places
+    nothing. Before a position stop is placed, an exchange stop on that
+    side that this executor does not own is left alone and the software
+    stop covers the position.
+    A moved percent trigger is repriced with change_stop_plan_price, then resized at
     that same price. Cancel-and-place is only the fallback when the reprice
     fails. protective_exchange_stop defaults to on only if
     the connector implements place_position_stop_order.
@@ -192,7 +193,7 @@ class RangeIcebergExecutor(ExecutorBase):
 
     custom_info for the API and Condor includes exit_state, exit_order_ids,
     exchange_stop_order_id, exchange_stop_order_ids, has_exchange_stop,
-    exchange_stop_error, exchange_stop_released, exchange_stop_nudge_ticks,
+    exchange_stop_error, exchange_stop_released,
     filled_base, closed_base, and open_base.
     take_profit_trigger_price, stop_loss_trigger_price, and
     exchange_stop_trigger_price are null until a fill exists, and null when
@@ -201,8 +202,6 @@ class RangeIcebergExecutor(ExecutorBase):
     """
 
     _logger: Optional[HummingbotLogger] = None
-    # Live stop id -> executor, per connector name, pair, and position side.
-    _exchange_stop_registry: Dict[Tuple[str, str, str], Dict[str, "weakref.ReferenceType"]] = {}
 
     @classmethod
     def logger(cls) -> HummingbotLogger:
@@ -324,9 +323,10 @@ class RangeIcebergExecutor(ExecutorBase):
         self._exchange_stop_cancel_after: Optional[float] = None
         self._exchange_stop_cancel_started_at: Optional[float] = None
         self._exchange_stop_close_capped = False
-        self._exchange_stop_nudge_ticks = 0
-        self._exchange_stop_extra_nudge = 0
         self._tp_room_clear_at: Optional[float] = None
+        self._side_guard_checked = False
+        self._side_guard_error = ""
+        self._account_identity = self._read_account_identity()
         self._keep_exchange_stop = False
         self._exit_failure_count = 0
         self._exit_retry_after: Optional[float] = None
@@ -617,6 +617,7 @@ class RangeIcebergExecutor(ExecutorBase):
             self._pause_started = None if pause_started is None else float(pause_started)
         self._resume_entries = self._resume_entries_requested(info)
         self._restore_exit_state(info)
+        self._side_guard_checked = False
 
     def _resume_entries_requested(self, info: dict) -> bool:
         """
@@ -636,6 +637,8 @@ class RangeIcebergExecutor(ExecutorBase):
 
     async def control_task(self):
         if self.status == RunnableStatus.TERMINATED:
+            return
+        if not self._side_guard_checked and self._reject_duplicate_side():
             return
         if self._shutdown_pending:
             await self._finish_shutdown()
@@ -727,19 +730,93 @@ class RangeIcebergExecutor(ExecutorBase):
         self.close_timestamp = self._strategy.current_timestamp
         self._begin_shutdown()
 
-    def stop(self):
+    def start(self):
         """
-        Leave the process-wide stop registry when this executor ends.
+        Refuse to start when this account, connector, pair, and side is already open.
+        """
+        if self._reject_duplicate_side():
+            return
+        super().start()
 
-        A keep_position shutdown leaves the exchange stop working, so the id
-        stays registered until a restore claims it. Every other end drops the
-        claim. Cancel and fire already drop it; this covers a stop that ends
-        with the id still listed.
+    def _read_account_identity(self) -> str:
+        connector = self.connectors.get(self.config.connector_name)
+        if connector is None:
+            return ""
+        for attr in ("account_name", "account_id", "trading_account_id"):
+            value = getattr(connector, attr, None)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        return ""
+
+    def _position_side_label(self) -> str:
+        return "LONG" if self.config.side == TradeType.BUY else "SHORT"
+
+    def _side_slot(self) -> Tuple[str, str, str, str]:
+        return (
+            self._account_identity,
+            self.config.connector_name,
+            self.config.trading_pair,
+            self._position_side_label(),
+        )
+
+    def _range_iceberg_peers(self) -> List["RangeIcebergExecutor"]:
+        orchestrator = getattr(self._strategy, "executor_orchestrator", None)
+        active = getattr(orchestrator, "active_executors", None)
+        if not isinstance(active, dict):
+            return []
+        peers = []
+        for executors in active.values():
+            if not isinstance(executors, (list, tuple)):
+                continue
+            for executor in executors:
+                if executor is self or not isinstance(executor, RangeIcebergExecutor):
+                    continue
+                peers.append(executor)
+        return peers
+
+    def _occupies_side_slot(self) -> bool:
         """
-        if not self._keep_exchange_stop:
-            for order_id in list(self._exchange_stop_order_ids()):
-                self._deregister_exchange_stop(order_id)
-        super().stop()
+        True while this executor still holds the side.
+
+        A running executor holds it. A terminated one holds it when it is
+        parked with the position (POSITION_HOLD) or still has a live exchange
+        stop. A refused start does not hold it.
+        """
+        if self._side_guard_error:
+            return False
+        if self.status != RunnableStatus.TERMINATED:
+            return True
+        if self._exchange_stop_order_ids():
+            return True
+        if self.close_type == CloseType.POSITION_HOLD or self._keep_exchange_stop:
+            return True
+        return False
+
+    def _duplicate_side_blocker(self):
+        slot = self._side_slot()
+        for peer in self._range_iceberg_peers():
+            if peer._side_slot() != slot or not peer._occupies_side_slot():
+                continue
+            return peer
+        return None
+
+    def _reject_duplicate_side(self) -> bool:
+        if self._side_guard_error:
+            return True
+        if self._duplicate_side_blocker() is None:
+            self._side_guard_checked = True
+            return False
+        message = (
+            f"another range iceberg is already open on "
+            f"{self.config.trading_pair} {self._position_side_label()}"
+        )
+        self._side_guard_error = message
+        self._side_guard_checked = True
+        self._exit_error = message
+        self.logger().error(message)
+        self.close_type = CloseType.FAILED
+        self.stop()
+        return True
 
     def evaluate_max_retries(self):
         """
@@ -1880,6 +1957,8 @@ class RangeIcebergExecutor(ExecutorBase):
         )
 
     def _status_reason(self) -> str:
+        if self._side_guard_error:
+            return self._side_guard_error
         if self._unknown_order_ids:
             return "unknown_order_halt: " + ", ".join(sorted(self._unknown_order_ids))
         if self._cancel_stop_error:
@@ -2249,8 +2328,7 @@ class RangeIcebergExecutor(ExecutorBase):
             "has_exchange_stop": bool(self._exchange_stop_order_ids()),
             "exchange_stop_error": self._exchange_stop_error,
             "exchange_stop_released": self._exchange_stop_released,
-            "exchange_stop_nudge_ticks": self._exchange_stop_nudge_ticks,
-            "exchange_stop_nudge": self._exchange_stop_nudge_text(),
+            "side_guard_error": self._side_guard_error,
             "closed_base": str(self._exit_filled_base()),
             "open_base": str(self._position_base()),
             "exit_error": self._exit_error,
@@ -3875,16 +3953,7 @@ class RangeIcebergExecutor(ExecutorBase):
         A long stop sits below the software trigger. A short stop sits above
         it. The gap is protective_stop_buffer_pct, so the software stop is
         reached first and can cancel this order before both of them fire.
-        If another live executor already has a stop at that price on this
-        side, the price moves further from the market by whole ticks.
         """
-        natural = self._natural_exchange_stop_trigger_price()
-        if natural is None:
-            self._exchange_stop_nudge_ticks = 0
-            return None
-        return self._unique_exchange_stop_price(natural)
-
-    def _natural_exchange_stop_trigger_price(self) -> Optional[Decimal]:
         trigger = self._trigger_price_for("stop_loss")
         if trigger is None or self.filled_base <= 0:
             return None
@@ -3906,139 +3975,6 @@ class RangeIcebergExecutor(ExecutorBase):
             return price
         return quantized
 
-    def _exchange_stop_nudge_text(self) -> str:
-        ticks = self._exchange_stop_nudge_ticks
-        if ticks <= 0:
-            return ""
-        direction = "below" if self.config.side == TradeType.BUY else "above"
-        return (
-            f"Trigger moved {ticks} tick(s) {direction} the buffer price "
-            "so it does not share another executor's stop."
-        )
-
-    def _stop_book_key(self) -> Tuple[str, str, str]:
-        side = "LONG" if self.config.side == TradeType.BUY else "SHORT"
-        return (self.config.connector_name, self.config.trading_pair, side)
-
-    def _registry_book(self) -> Dict[str, "weakref.ReferenceType"]:
-        return type(self)._exchange_stop_registry.setdefault(self._stop_book_key(), {})
-
-    def _same_connector(self, owner: "RangeIcebergExecutor") -> bool:
-        try:
-            name = self.config.connector_name
-            return owner.connectors.get(name) is self.connectors.get(name)
-        except Exception:
-            return False
-
-    def _stop_owner_is_live(self, owner: "RangeIcebergExecutor") -> bool:
-        if owner.status != RunnableStatus.RUNNING:
-            return False
-        if owner._shutdown_pending:
-            return False
-        return True
-
-    def _owner_of_stop(self, order_id: str):
-        book = self._registry_book()
-        ref = book.get(str(order_id))
-        if ref is None:
-            return None
-        owner = ref()
-        if owner is None or not self._same_connector(owner):
-            book.pop(str(order_id), None)
-            return None
-        if str(order_id) not in owner._exchange_stop_order_ids():
-            book.pop(str(order_id), None)
-            return None
-        return owner
-
-    def _release_exchange_stop_claim(self):
-        """
-        Drop this executor's registry entries without cancelling the orders.
-
-        A restart calls this on the previous object so the restored executor
-        can claim the same ids. A live sibling is left registered.
-        """
-        book = self._registry_book()
-        for order_id in self._exchange_stop_order_ids():
-            ref = book.get(order_id)
-            if ref is not None and ref() is self:
-                book.pop(order_id, None)
-
-    def _register_exchange_stop(self, order_id: str) -> bool:
-        order_id = str(order_id)
-        owner = self._owner_of_stop(order_id)
-        if owner is not None and owner is not self and self._stop_owner_is_live(owner):
-            return False
-        self._registry_book()[order_id] = weakref.ref(self)
-        return True
-
-    def _deregister_exchange_stop(self, order_id: str):
-        book = self._registry_book()
-        ref = book.get(str(order_id))
-        if ref is None:
-            return
-        owner = ref()
-        if owner is None or owner is self:
-            book.pop(str(order_id), None)
-
-    def _price_key(self, price: Decimal) -> Decimal:
-        step = self._price_step()
-        if step <= 0:
-            return price
-        return quantize_down(price, step)
-
-    def _step_stop_away(self, price: Decimal, ticks: int) -> Decimal:
-        step = self._price_step()
-        if step <= 0 or ticks <= 0:
-            return price
-        moved = price - step * Decimal(ticks) if self.config.side == TradeType.BUY else price + step * Decimal(ticks)
-        if self.config.side == TradeType.BUY:
-            moved = quantize_down(moved, step)
-        else:
-            moved = quantize_up(moved, step)
-        if moved <= 0:
-            return step
-        return moved
-
-    def _foreign_stop_price_keys(self) -> Set[Decimal]:
-        keys: Set[Decimal] = set()
-        book = self._registry_book()
-        for order_id, ref in list(book.items()):
-            owner = ref() if ref is not None else None
-            if owner is None or not self._same_connector(owner):
-                book.pop(order_id, None)
-                continue
-            if order_id not in owner._exchange_stop_order_ids():
-                book.pop(order_id, None)
-                continue
-            if owner is self or not self._stop_owner_is_live(owner):
-                continue
-            for stop in owner._exchange_stops:
-                if str(stop.get("id")) != order_id:
-                    continue
-                price = stop.get("price")
-                if price is not None:
-                    keys.add(self._price_key(Decimal(str(price))))
-        return keys
-
-    def _unique_exchange_stop_price(self, natural: Decimal) -> Decimal:
-        """
-        Move the trigger further from the market until no other live executor
-        on this side owns that price.
-        """
-        step = self._price_step()
-        extra = max(0, int(self._exchange_stop_extra_nudge))
-        price = self._step_stop_away(natural, extra) if extra else natural
-        occupied = self._foreign_stop_price_keys()
-        ticks = extra
-        guard = 0
-        while step > 0 and self._price_key(price) in occupied and guard < 50:
-            ticks += 1
-            price = self._step_stop_away(natural, ticks)
-            guard += 1
-        self._exchange_stop_nudge_ticks = ticks
-        return price
-
     def _exchange_stop_trigger_text(self):
         price = self._exchange_stop_trigger_price()
         if price is None:
@@ -4058,13 +3994,6 @@ class RangeIcebergExecutor(ExecutorBase):
 
     def _remember_exchange_stop(self, order_id: str, amount: Decimal, price: Optional[Decimal], *, replace: bool) -> bool:
         order_id = str(order_id)
-        if not self._register_exchange_stop(order_id):
-            self._exchange_stop_extra_nudge += 1
-            self._note_exchange_stop_failure(
-                RuntimeError(f"exchange stop {order_id} belongs to another executor"),
-            )
-            return False
-        previous = set(self._exchange_stop_order_ids())
         if replace:
             self._exchange_stops = [{"id": order_id, "amount": amount, "price": price}]
         else:
@@ -4081,8 +4010,6 @@ class RangeIcebergExecutor(ExecutorBase):
         self._exchange_stop_order_id = self._exchange_stops[0]["id"]
         self._exchange_stop_amount = sum((stop["amount"] for stop in self._exchange_stops), Decimal("0"))
         self._exchange_stop_price = price
-        for gone in previous - set(self._exchange_stop_order_ids()):
-            self._deregister_exchange_stop(gone)
         return True
 
     def _clear_exchange_stop_error_if_complete(self):
@@ -4171,8 +4098,6 @@ class RangeIcebergExecutor(ExecutorBase):
         return any(marker in text for marker in markers)
 
     def _clear_exchange_stop_id(self):
-        for order_id in self._exchange_stop_order_ids():
-            self._deregister_exchange_stop(order_id)
         if self._exchange_stop_amount > 0:
             self._exchange_stop_last_amount = self._exchange_stop_amount
         self._exchange_stops = []
@@ -4324,8 +4249,6 @@ class RangeIcebergExecutor(ExecutorBase):
         dropping = {str(order_id) for order_id in order_ids}
         if not dropping:
             return
-        for order_id in dropping:
-            self._deregister_exchange_stop(order_id)
         self._exchange_stops = [stop for stop in self._exchange_stops if stop.get("id") not in dropping]
         self._sync_exchange_stop_fields()
 
@@ -4418,10 +4341,6 @@ class RangeIcebergExecutor(ExecutorBase):
         means the position is flat and the exit is finished.
         """
         wanted = {str(order_id) for order_id in order_ids} - self._exchange_stop_credited
-        wanted = {
-            order_id for order_id in wanted
-            if (self._owner_of_stop(order_id) in (None, self))
-        }
         closed = Decimal("0")
         price = None
         kept = []
@@ -4430,7 +4349,6 @@ class RangeIcebergExecutor(ExecutorBase):
                 closed += Decimal(str(stop.get("amount") or 0))
                 price = stop.get("price") or price
                 self._exchange_stop_credited.add(str(stop.get("id")))
-                self._deregister_exchange_stop(str(stop.get("id")))
             else:
                 kept.append(stop)
         self._exchange_stops = kept
@@ -4727,13 +4645,7 @@ class RangeIcebergExecutor(ExecutorBase):
                 self._cancel_exit_orders()
                 self._tp_grow_cancelling = True
             return False
-        kept = []
-        for stop in restored:
-            if self._register_exchange_stop(str(stop["id"])):
-                kept.append(stop)
-        if not kept:
-            return False
-        self._exchange_stops = kept
+        self._exchange_stops = restored
         self._sync_exchange_stop_fields()
         self._exchange_stop_restore = []
         self._exchange_stop_restore_failures = 0
@@ -4798,6 +4710,10 @@ class RangeIcebergExecutor(ExecutorBase):
             return None
         if self._live_stop_matches(amount, trigger):
             return self._exchange_stop_order_id
+        foreign = await self._foreign_open_stop_ids()
+        if foreign:
+            self._reject_foreign_position_stop(foreign, restore=restore)
+            return None
         try:
             order_id = place(
                 trading_pair=self.config.trading_pair,
@@ -4818,15 +4734,92 @@ class RangeIcebergExecutor(ExecutorBase):
             )
             return None
         order_id = str(order_id)
-        owner = self._owner_of_stop(order_id)
-        if owner is not None and owner is not self:
-            self._exchange_stop_extra_nudge += 1
-            self._note_exchange_stop_failure(
-                RuntimeError(f"place returned {order_id}, which another executor already owns"),
-                restore=restore,
-            )
+        if order_id not in set(self._exchange_stop_order_ids()) and order_id in foreign:
+            self._reject_foreign_position_stop({order_id}, restore=restore)
             return None
         return order_id
+
+    async def _foreign_open_stop_ids(self) -> Set[str]:
+        """
+        Open position-stop ids on this side that this executor does not own.
+
+        An empty set means the list was empty or the connector cannot list.
+        A place is refused when this set is not empty, so a same-price place
+        cannot replace someone else's stop.
+        """
+        connector = self.connectors[self.config.connector_name]
+        listing = self._real_callable(connector, "list_open_stop_orders")
+        if listing is None:
+            return set()
+        try:
+            rows = listing(self.config.trading_pair)
+            if hasattr(rows, "__await__"):
+                rows = await rows
+        except Exception as exc:
+            self.logger().error(
+                "Could not list open position stops on %s %s before placing: %s",
+                self.config.trading_pair,
+                self._position_side_label(),
+                exc,
+            )
+            return set()
+        if isinstance(rows, dict):
+            rows = rows.get("data") or rows.get("orders") or rows.get("result") or []
+        if not isinstance(rows, list):
+            return set()
+        owned = set(self._exchange_stop_order_ids())
+        foreign: Set[str] = set()
+        for row in rows:
+            if not self._stop_row_matches_our_side(row):
+                continue
+            row_id = self._stop_row_id(row)
+            if row_id and row_id not in owned:
+                foreign.add(row_id)
+        return foreign
+
+    def _stop_row_id(self, row) -> Optional[str]:
+        if not isinstance(row, dict):
+            return None
+        for key in ("id", "stopPlanOrderId", "orderId", "stop_plan_order_id"):
+            value = row.get(key)
+            if value not in (None, ""):
+                return str(value)
+        return None
+
+    def _stop_row_matches_our_side(self, row) -> bool:
+        if not isinstance(row, dict):
+            return False
+        symbol = row.get("symbol") or row.get("trading_pair") or row.get("tradingPair")
+        if symbol not in (None, ""):
+            wanted_pair = self.config.trading_pair.replace("-", "").replace("_", "").upper()
+            seen_pair = str(symbol).replace("-", "").replace("_", "").upper()
+            if seen_pair != wanted_pair:
+                return False
+        wanted_long = self.config.side == TradeType.BUY
+        for key in ("positionType", "position_type", "positionSide", "side"):
+            if key not in row or row.get(key) in (None, ""):
+                continue
+            raw = row.get(key)
+            text = str(raw).strip().upper()
+            if text in ("1", "LONG", "BUY"):
+                return wanted_long
+            if text in ("2", "SHORT", "SELL"):
+                return not wanted_long
+            try:
+                return (int(raw) == 1) if wanted_long else (int(raw) == 2)
+            except (TypeError, ValueError):
+                return False
+        return False
+
+    def _reject_foreign_position_stop(self, order_ids: Set[str], *, restore: bool) -> None:
+        ids = ", ".join(sorted(str(order_id) for order_id in order_ids))
+        message = (
+            f"Refusing to place a position stop on {self.config.trading_pair} "
+            f"{self._position_side_label()}: the exchange already has stop {ids}, "
+            "which this executor does not own. The software stop loss will cover the position."
+        )
+        self.logger().error(message)
+        self._note_exchange_stop_failure(RuntimeError(message), restore=restore)
 
     async def _cancel_replaced_exchange_stop(self, old_id: str):
         connector = self.connectors[self.config.connector_name]
@@ -5162,43 +5155,18 @@ class RangeIcebergExecutor(ExecutorBase):
             self._exchange_stop_released = True
         if stop_ids and not self._exchange_stop_released:
             price = self._exchange_stop_trigger_price()
-            claimed = []
-            for item in stop_ids:
-                owner = self._owner_of_stop(item)
-                if owner is not None and owner is not self and self._stop_owner_is_live(owner):
-                    self._exchange_stop_extra_nudge = max(self._exchange_stop_extra_nudge, 1)
-                    self._exchange_stop_error = (
-                        f"Restored exchange stop {item} belongs to another executor. "
-                        "A new stop will be placed at a nudged price."
-                    )
-                    continue
-                claimed.append(item)
             total = self._position_base()
-            count = len(claimed)
+            count = len(stop_ids)
             share = total / Decimal(count) if count else total
             running = Decimal("0")
             self._exchange_stops = []
-            for index, item in enumerate(claimed):
+            for index, item in enumerate(stop_ids):
                 amount = total - running if index == count - 1 else share
                 running += amount
-                if not self._register_exchange_stop(item):
-                    self._exchange_stop_extra_nudge = max(self._exchange_stop_extra_nudge, 1)
-                    self._exchange_stop_error = (
-                        f"Restored exchange stop {item} belongs to another executor. "
-                        "A new stop will be placed at a nudged price."
-                    )
-                    continue
                 self._exchange_stops.append({"id": item, "amount": amount, "price": price})
-            if self._exchange_stops:
-                self._exchange_stop_order_id = self._exchange_stops[0]["id"]
-                self._exchange_stop_amount = sum(
-                    (stop["amount"] for stop in self._exchange_stops), Decimal("0"),
-                )
-                self._exchange_stop_price = price
-            else:
-                self._exchange_stop_order_id = None
-                self._exchange_stop_amount = Decimal("0")
-                self._exchange_stop_price = None
+            self._exchange_stop_order_id = stop_ids[0]
+            self._exchange_stop_amount = total
+            self._exchange_stop_price = price
         if self._resume_entries:
             filled_by_order = blob.get("filled_by_order") or {}
             if isinstance(filled_by_order, dict):
