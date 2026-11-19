@@ -112,7 +112,9 @@ class RangeIcebergExecutor(ExecutorBase):
     The exit is reduce-only: closing a long is a sell with position action CLOSE
     (MEXC hedge side 4) and closing a short is a buy with position action CLOSE
     (MEXC hedge side 2). Exit size never exceeds this executor's own filled amount,
-    net of what the exit has already closed.
+    net of what the exit has already closed. A live position read can cap that
+    size. Two flat reads, once a recent exit fill has had time to land, end
+    the executor when its own fills do not explain the flat book.
 
     A single limit take profit is not a trigger. It rests at the trigger for the
     filled amount, and further entry fills add to it or resize it. The order is
@@ -326,6 +328,13 @@ class RangeIcebergExecutor(ExecutorBase):
         self._entry_handed_to_exit = False
         self._resume_entries = True
         self._last_fill_timestamp: Optional[float] = None
+        self._POSITION_SYNC_SECONDS = 4.0
+        self._live_position_base: Optional[Decimal] = None
+        self._position_sync_ok = False
+        self._last_position_sync_at: Optional[float] = None
+        self._external_close = False
+        self._reconcile_error = ""
+        self._flat_position_reads = 0
         self._tp_grow_cancelling = False
         self._tp_previous_size = Decimal("0")
         self._replace_stop_before_failed = False
@@ -716,6 +725,8 @@ class RangeIcebergExecutor(ExecutorBase):
         await self._service_entry_rebuild()
         await self._send_keepalive_cancels()
         self._trim_excess_entries()
+        if await self._reconcile_exchange_state() == "closed":
+            return
         self._capture_schedule_anchor()
         if self._exit_phase == "done":
             await self._sync_exchange_stop()
@@ -1817,7 +1828,7 @@ class RangeIcebergExecutor(ExecutorBase):
             outcome = await self._request_exchange_stop_cancel()
             if outcome == "failed":
                 return
-            if outcome == "fired":
+            if outcome == "fired" and not self._external_close:
                 self._apply_exchange_stop_fill(fired=True)
         pending = self._unconfirmed_cancel_ids()
         if pending:
@@ -3334,6 +3345,9 @@ class RangeIcebergExecutor(ExecutorBase):
             "side_guard_error": self._side_guard_error,
             "closed_base": str(self._exit_filled_base()),
             "open_base": str(self._position_base()),
+            "exchange_position_base": None if self._live_position_base is None else str(self._live_position_base),
+            "external_close": self._external_close,
+            "reconcile_error": self._reconcile_error,
             "exit_error": self._exit_error,
             "exit_status": self._exit_phase,
             "exit_active": self._exit_active,
@@ -3789,7 +3803,7 @@ class RangeIcebergExecutor(ExecutorBase):
             return
         if not self._rate_limit_allows_place():
             return
-        amount = self._cap_exit_amount(self._position_base())
+        amount = self._cap_exit_amount(self._managed_base())
         if amount <= 0:
             return
         price = self._quantize_exit_price(self._exit_trigger_price or self._reference_price())
@@ -3887,8 +3901,14 @@ class RangeIcebergExecutor(ExecutorBase):
             return False
         if self._exchange_stop_trigger_price() is None:
             return False
-        shortfall = self._position_base() - self._exchange_stop_amount
+        shortfall = self._managed_base() - self._exchange_stop_amount
         return shortfall >= self._min_order_size()
+
+    def _exchange_stop_needs_shrink(self) -> bool:
+        if not self._exchange_stop_order_ids() or not self._protective_stop_enabled():
+            return False
+        excess = self._exchange_stop_amount - self._managed_base()
+        return excess >= self._min_order_size()
 
     def _exchange_stop_price_is_stale(self) -> bool:
         if not self._exchange_stops:
@@ -3905,7 +3925,11 @@ class RangeIcebergExecutor(ExecutorBase):
             return True
         if not self._exchange_stop_order_ids():
             return False
-        return self._exchange_stop_needs_more_size() or self._exchange_stop_price_is_stale()
+        return (
+            self._exchange_stop_needs_more_size()
+            or self._exchange_stop_needs_shrink()
+            or self._exchange_stop_price_is_stale()
+        )
 
     def _take_profit_must_move_before_the_stop(self) -> bool:
         """
@@ -3954,7 +3978,7 @@ class RangeIcebergExecutor(ExecutorBase):
             return False
         if self._exchange_stop_place_waiting() or self._failed_stop_placements() < 3:
             return False
-        position = self._position_base()
+        position = self._managed_base()
         if position < self._min_order_size():
             return False
         needs_full = (
@@ -4038,9 +4062,9 @@ class RangeIcebergExecutor(ExecutorBase):
 
     def _take_profit_size_behind_the_stop(self) -> Decimal:
         covered = self._exchange_stop_amount
+        position = self._managed_base()
         if covered <= 0:
-            covered = self._position_base()
-        position = self._position_base()
+            covered = position
         if covered > position:
             covered = position
         return covered
@@ -4093,7 +4117,7 @@ class RangeIcebergExecutor(ExecutorBase):
                 ):
                     return
                 self._tp_reposted_after_failure = False
-                await self._post_resting_take_profit(self._position_base())
+                await self._post_resting_take_profit(self._managed_base())
                 return
             await self._repost_take_profit_behind_the_stop()
             return
@@ -4132,9 +4156,10 @@ class RangeIcebergExecutor(ExecutorBase):
         if self._exchange_stop_needs_resize() or self._exit_phase == "done":
             return
         self._tp_reposted_after_failure = False
-        await self._post_resting_take_profit(self._position_base())
+        await self._post_resting_take_profit(self._managed_base())
 
     async def _post_resting_take_profit(self, amount: Decimal):
+        amount = min(amount, self._managed_base())
         if self._reduce_only_limit_needs_a_live_stop():
             return
         if self._unknown_order_ids or not self._rate_limit_allows_place():
@@ -4147,7 +4172,7 @@ class RangeIcebergExecutor(ExecutorBase):
         self._track_exit(price, amount, order_id)
 
     def _software_close_base(self) -> Decimal:
-        amount = self._position_base()
+        amount = self._managed_base()
         if (
             self._exchange_stop_close_capped
             and self._exchange_stop_order_id
@@ -4314,6 +4339,9 @@ class RangeIcebergExecutor(ExecutorBase):
         return self._position_base() < self._min_order_size()
 
     def _finish_exit(self):
+        if self._external_close:
+            self._exit_phase = "done"
+            return
         if self._exit_phase == "done":
             return
         self._exit_phase = "done"
@@ -4520,7 +4548,7 @@ class RangeIcebergExecutor(ExecutorBase):
             return
         if self._exit_working_count() > 0 or not self._rate_limit_allows_place():
             return
-        amount = self._cap_exit_amount(self._position_base())
+        amount = self._cap_exit_amount(self._managed_base())
         if amount <= 0:
             return
         price = self._exit_remainder_price()
@@ -4730,6 +4758,132 @@ class RangeIcebergExecutor(ExecutorBase):
         if net < 0:
             return Decimal("0")
         return net
+
+    def _managed_base(self) -> Decimal:
+        """
+        Size this executor may close or protect.
+
+        That is its own net fill, or the live exchange position when a
+        successful read is smaller. A larger exchange position is left alone.
+        Without a successful read, the own net fill is used.
+        """
+        own = self._position_base()
+        if not self._position_sync_ok or self._live_position_base is None:
+            return own
+        live = self._live_position_base
+        if live >= own:
+            return own
+        if live < 0:
+            return own
+        return live
+
+    async def _reconcile_exchange_state(self) -> str:
+        """
+        Read this pair and hedge side from the exchange about every 4 seconds.
+
+        A connector without a position refresh is left on the fill ledger.
+        A failed or unreadable read changes nothing and is tried again on
+        the next cadence. Two flat reads are required, and a flat read
+        during the grace after our own exit fill does not count.
+        """
+        if self._external_close:
+            return "closed"
+        now = float(self._strategy.current_timestamp)
+        if self._last_position_sync_at is not None:
+            if now + 1e-9 < float(self._last_position_sync_at) + float(self._POSITION_SYNC_SECONDS):
+                return "skipped"
+        if self.filled_base <= 0 and not self._exchange_stop_order_ids():
+            return "skipped"
+        outcome, live = await self._read_live_position()
+        if outcome == "error":
+            self._last_position_sync_at = now
+            self._flat_position_reads = 0
+            return "error"
+        if outcome != "ok":
+            return "unsupported"
+        self._last_position_sync_at = now
+        self._reconcile_error = ""
+        self._note_exit_fill_progress()
+        return self._apply_live_position(live)
+
+    async def _read_live_position(self):
+        connector = self.connectors[self.config.connector_name]
+        updater = self._real_callable(connector, "_update_positions")
+        if updater is None:
+            updater = self._real_callable(connector, "update_positions")
+        if updater is None:
+            return "unsupported", None
+        try:
+            result = updater()
+            if hasattr(result, "__await__"):
+                await result
+        except Exception as exc:
+            self._reconcile_error = f"position read failed: {exc}"
+            return "error", None
+        positions = getattr(connector, "account_positions", None)
+        if not isinstance(positions, dict):
+            self._reconcile_error = "position read failed: unreadable"
+            return "error", None
+        side = self._settings_position_side()
+        found = False
+        live = Decimal("0")
+        for position in positions.values():
+            if getattr(position, "trading_pair", None) != self.config.trading_pair:
+                continue
+            if getattr(position, "position_side", None) != side:
+                continue
+            amount = getattr(position, "amount", None)
+            if amount is None:
+                self._reconcile_error = "position read failed: unreadable"
+                return "error", None
+            try:
+                live += abs(Decimal(str(amount)))
+            except (TypeError, ValueError, ArithmeticError):
+                self._reconcile_error = "position read failed: unreadable"
+                return "error", None
+            found = True
+        if not found:
+            return "ok", Decimal("0")
+        return "ok", live
+
+    def _apply_live_position(self, live: Decimal) -> str:
+        """
+        A positive size is applied at once. A flat size is applied only
+        on the second read, and not during the grace after our own exit fill.
+        Until then the previous managed size stays in place.
+        """
+        own = self._position_base()
+        if live <= 0 and own > 0:
+            if self._exit_fill_grace_active():
+                self._flat_position_reads = 0
+                return "ok"
+            self._flat_position_reads += 1
+            if self._flat_position_reads < 2:
+                return "ok"
+            self._live_position_base = Decimal("0")
+            self._position_sync_ok = True
+            self._begin_external_close()
+            return "closed"
+        self._flat_position_reads = 0
+        self._live_position_base = live
+        self._position_sync_ok = True
+        return "ok"
+
+    def _exit_fill_grace_active(self) -> bool:
+        if self._exit_last_fill_at is None:
+            return False
+        now = float(self._strategy.current_timestamp)
+        return now <= float(self._exit_last_fill_at) + float(self._POSITION_SYNC_SECONDS)
+
+    def _begin_external_close(self):
+        if self._external_close or self.status == RunnableStatus.TERMINATED:
+            return
+        self._external_close = True
+        self._exit_error = "position closed outside the bot"
+        self._keep_exchange_stop = False
+        self.close_type = CloseType.POSITION_CLOSED_EXTERNALLY
+        self.close_timestamp = self._strategy.current_timestamp
+        self._begin_shutdown()
 
     def _exit_room_base(self) -> Decimal:
         room = self._software_close_base() - self._exit_open_base()
@@ -5495,10 +5649,10 @@ class RangeIcebergExecutor(ExecutorBase):
         Live stops are not subtracted here: a same-price place replaces one,
         and a new price is sent only after the old stops are cancelled.
         """
-        room = self._position_base() - self._resting_reduce_only_close_base()
+        room = self._managed_base() - self._resting_reduce_only_close_base()
         if room < 0:
             room = Decimal("0")
-        position = self._position_base()
+        position = self._managed_base()
         if room > position:
             room = position
         step = self._amount_step()
@@ -5548,7 +5702,7 @@ class RangeIcebergExecutor(ExecutorBase):
         stop is not sent again.
         """
         trigger = self._exchange_stop_trigger_price()
-        position = self._position_base()
+        position = self._managed_base()
         if trigger is None or position < self._min_order_size():
             return False
         if self._exchange_stop_price_is_stale():
@@ -5593,7 +5747,7 @@ class RangeIcebergExecutor(ExecutorBase):
         if self._exchange_stop_restore and not self._exchange_stop_order_ids():
             return await self._restore_exchange_stops(self._exchange_stop_restore)
         trigger = self._exchange_stop_trigger_price()
-        position = self._position_base()
+        position = self._managed_base()
         if trigger is None or position < self._min_order_size():
             return False
         saved = [dict(stop) for stop in self._exchange_stops]
@@ -5901,15 +6055,20 @@ class RangeIcebergExecutor(ExecutorBase):
             await self._restore_exchange_stops(self._exchange_stop_restore)
             return
         trigger = self._exchange_stop_trigger_price()
-        position = self._position_base()
+        position = self._managed_base()
         if trigger is None or position < self._min_order_size():
             return
         if self._exchange_stop_order_ids() and not await self._align_exchange_stop_prices():
-            if not self._exchange_stop_needs_more_size() and not self._exchange_stop_price_is_stale():
+            if (
+                not self._exchange_stop_needs_more_size()
+                and not self._exchange_stop_needs_shrink()
+                and not self._exchange_stop_price_is_stale()
+            ):
                 return
         if (
             self._exchange_stop_order_ids()
             and not self._exchange_stop_needs_more_size()
+            and not self._exchange_stop_needs_shrink()
             and all(stop.get("price") == trigger for stop in self._exchange_stops)
         ):
             self._clear_exchange_stop_error_if_complete()

@@ -3794,3 +3794,181 @@ class RangeIcebergExitTests(IsolatedAsyncioWrapperTestCase):
         self.assertEqual("", rejected.get_custom_info()["config_edit_error"])
         self.assertEqual("", rejected.get_custom_info()["config_edit_note"])
         self.assertEqual(Decimal("100"), rejected.config.total_amount)
+
+    def _protected_config(self):
+        return dict(
+            take_profit={"percent": "0.10", "execution": "SINGLE", "order_type": "LIMIT"},
+            stop_loss={"percent": "0.05", "execution": "SINGLE"},
+        )
+
+    def _arm_protected(self):
+        self.connector._update_positions = MagicMock()
+        state = self._install_mexc_stop_book()
+        self._mid(Decimal("0.085"))
+        executor = self._executor(**self._protected_config())
+        self._open_entry(executor)
+        self._run(executor.control_task())
+        self.assertEqual("stop-1", executor.get_custom_info()["exchange_stop_order_id"])
+        self.assertGreater(len(self._open_limit_closes()), 0)
+        return executor, state
+
+    def _install_position_source(self, holder, *, decoy_short=False):
+        calls = {"n": 0}
+
+        async def update():
+            calls["n"] += 1
+            if holder.get("error"):
+                raise RuntimeError(holder["error"])
+            amount = holder.get("amount")
+            if amount is None:
+                self.connector.account_positions = {}
+                return
+            positions = {}
+            if decoy_short:
+                positions["short"] = SimpleNamespace(
+                    trading_pair="AIOT-USDT",
+                    position_side=PositionSide.SHORT,
+                    amount=Decimal("999"),
+                    update_timestamp=self.now + 1,
+                )
+            positions["long"] = SimpleNamespace(
+                trading_pair="AIOT-USDT",
+                position_side=PositionSide.LONG,
+                amount=Decimal(str(amount)),
+                update_timestamp=self.now + 1,
+            )
+            self.connector.account_positions = positions
+
+        self.connector._update_positions = update
+        return calls
+
+    def _read_again(self, executor):
+        self.now += 4
+        self._run(executor.control_task())
+
+    def test_external_flat_close_cancels_the_stop_and_frees_the_slot(self):
+        executor, state = self._arm_protected()
+        self.assertTrue(executor._occupies_side_slot())
+        placed = len(state["placed"])
+        calls = self._install_position_source({"amount": None})
+        self._read_again(executor)
+        self.assertEqual(1, calls["n"])
+        self.assertFalse(executor.get_custom_info()["external_close"])
+        self.assertEqual(RunnableStatus.RUNNING, executor.status)
+        self.assertEqual("stop-1", executor.get_custom_info()["exchange_stop_order_id"])
+        self._read_again(executor)
+        self.assertEqual(2, calls["n"])
+        self.assertEqual(CloseType.POSITION_CLOSED_EXTERNALLY, executor.close_type)
+        self.assertEqual("position closed outside the bot", executor.get_custom_info()["status_reason"])
+        self.assertTrue(executor.get_custom_info()["external_close"])
+        self.assertEqual(Decimal("0"), Decimal(executor.get_custom_info()["exchange_position_base"]))
+        self.assertEqual("", executor.get_custom_info()["reconcile_error"])
+        self.now += 1
+        self._run(executor.control_task())
+        self.assertEqual(RunnableStatus.TERMINATED, executor.status)
+        self.assertFalse(executor._occupies_side_slot())
+        self.assertIn("stop-1", state["cancelled"])
+        self.assertEqual(placed, len(state["placed"]))
+        fresh = self._executor(**self._protected_config())
+        self.strategy.executor_orchestrator = SimpleNamespace(
+            active_executors={"controller": [executor, fresh]}
+        )
+        self.assertFalse(fresh._reject_duplicate_side())
+
+    def test_external_partial_close_shrinks_the_stop_and_take_profit(self):
+        executor, state = self._arm_protected()
+        calls = self._install_position_source({"amount": Decimal("40")}, decoy_short=True)
+        self._read_again(executor)
+        self.assertEqual(1, calls["n"])
+        for _ in range(3):
+            self.now += 1
+            self._run(executor.control_task())
+        self.assertEqual(1, calls["n"])
+        self.assertEqual(Decimal("40"), state["stops"]["stop-1"]["amount"])
+        self.assertEqual([Decimal("40")], [order.amount for order in self._open_limit_closes()])
+        info = executor.get_custom_info()
+        self.assertFalse(info["external_close"])
+        self.assertEqual(Decimal("100"), Decimal(info["open_base"]))
+        self.assertEqual(Decimal("40"), Decimal(info["exchange_position_base"]))
+        self.assertEqual("", info["reconcile_error"])
+        self.assertEqual(RunnableStatus.RUNNING, executor.status)
+        self.assertNotEqual(CloseType.POSITION_CLOSED_EXTERNALLY, executor.close_type)
+
+    def test_external_add_on_the_same_side_is_not_managed(self):
+        executor, state = self._arm_protected()
+        placed = list(state["placed"])
+        self._install_position_source({"amount": Decimal("150")}, decoy_short=True)
+        self._read_again(executor)
+        for _ in range(2):
+            self.now += 1
+            self._run(executor.control_task())
+        self.assertEqual(Decimal("100"), state["stops"]["stop-1"]["amount"])
+        self.assertEqual(placed, state["placed"])
+        self.assertEqual([Decimal("100")], [order.amount for order in self._open_limit_closes()])
+        info = executor.get_custom_info()
+        self.assertFalse(info["external_close"])
+        self.assertEqual(Decimal("150"), Decimal(info["exchange_position_base"]))
+        self.assertEqual(Decimal("100"), Decimal(info["open_base"]))
+        self.assertEqual(RunnableStatus.RUNNING, executor.status)
+
+    def test_flat_read_right_after_our_exit_fill_does_not_close(self):
+        executor, state = self._arm_protected()
+        stop_id = executor.get_custom_info()["exchange_stop_order_id"]
+        tp_id = self._open_limit_closes()[0].client_order_id
+        self._fill(tp_id, Decimal("40"))
+        self._install_position_source({"amount": None})
+        self._read_again(executor)
+        info = executor.get_custom_info()
+        self.assertFalse(info["external_close"])
+        self.assertNotEqual(CloseType.POSITION_CLOSED_EXTERNALLY, executor.close_type)
+        self.assertEqual(RunnableStatus.RUNNING, executor.status)
+        self.assertEqual(stop_id, info["exchange_stop_order_id"])
+        self.assertNotIn(stop_id, state["cancelled"])
+        self.assertGreater(executor._position_base(), 0)
+        self.assertGreater(len(self._open_limit_closes()), 0)
+        self._read_again(executor)
+        self.assertFalse(executor.get_custom_info()["external_close"])
+        self.assertEqual(RunnableStatus.RUNNING, executor.status)
+        self.assertEqual(stop_id, executor.get_custom_info()["exchange_stop_order_id"])
+
+    def test_position_lookup_error_changes_nothing(self):
+        executor, state = self._arm_protected()
+        stop_id = executor.get_custom_info()["exchange_stop_order_id"]
+        self.connector.account_positions = {}
+        calls = self._install_position_source({"error": "timeout", "amount": None})
+        self._read_again(executor)
+        self.assertEqual(1, calls["n"])
+        info = executor.get_custom_info()
+        self.assertIn("position read failed", info["reconcile_error"])
+        self.assertFalse(info["external_close"])
+        self.assertIsNone(info["exchange_position_base"])
+        self.assertEqual(stop_id, info["exchange_stop_order_id"])
+        self.assertEqual([], state["cancelled"])
+        self.assertEqual(Decimal("100"), state["stops"][stop_id]["amount"])
+        self.assertEqual(RunnableStatus.RUNNING, executor.status)
+        self.now += 1
+        self._run(executor.control_task())
+        self.assertEqual(1, calls["n"])
+
+    def test_resume_with_the_position_already_flat_ends_cleanly(self):
+        executor, state = self._arm_protected()
+        snapshot = executor.get_custom_info()
+        placed = len(state["placed"])
+        restored = self._executor(**self._protected_config())
+        restored.restore_from_custom_info(snapshot)
+        self.assertEqual(Decimal("100"), restored._position_base())
+        self.assertEqual("stop-1", restored.get_custom_info()["exchange_stop_order_id"])
+        self._install_position_source({"amount": None})
+        self._read_again(restored)
+        self.assertEqual(RunnableStatus.RUNNING, restored.status)
+        self.assertFalse(restored.get_custom_info()["external_close"])
+        self._read_again(restored)
+        self.assertEqual(CloseType.POSITION_CLOSED_EXTERNALLY, restored.close_type)
+        self.assertEqual("position closed outside the bot", restored.get_custom_info()["status_reason"])
+        self.now += 1
+        self._run(restored.control_task())
+        self.assertEqual(RunnableStatus.TERMINATED, restored.status)
+        self.assertIsNone(restored.get_custom_info()["exchange_stop_order_id"])
+        self.assertIn("stop-1", state["cancelled"])
+        self.assertEqual(placed, len(state["placed"]))
+        self.assertFalse(restored._occupies_side_slot())
