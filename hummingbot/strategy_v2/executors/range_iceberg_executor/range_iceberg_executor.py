@@ -79,9 +79,10 @@ class RangeIcebergExecutor(ExecutorBase):
 
     The duration clock starts at the first fill. A partial fill starts it. SUBMIT
     starts it when the executor is created. The first entry slice is placed at the
-    start, and a range rung larger than that slice may still go out. Each later
-    slice waits until the previous slice is fully filled and one jittered interval
-    has passed since that fill. A partial fill does not release the next slice.
+    start. A range rung larger than the released slice is sent in parts, one slice
+    at a time. Each later slice waits until the previous slice is fully filled and
+    one jittered interval has passed since that fill. A partial fill does not
+    release the next slice.
     CARRY and SKIP do not change this. Paused time, including an entry pause, does
     not count toward that wait. The duration clock still counts entry-pause time.
     expiry_seconds is always measured from the executor start, so an order that never
@@ -740,6 +741,7 @@ class RangeIcebergExecutor(ExecutorBase):
         self._restore_entry_pause(info)
         self._restore_shared_side_hint(info)
         self._restore_exit_state(info)
+        self._restore_open_entry_orders(info)
         self._side_guard_checked = False
 
     def _resume_entries_requested(self, info: dict) -> bool:
@@ -2097,12 +2099,21 @@ class RangeIcebergExecutor(ExecutorBase):
         planned = slot.target_price
         price = self._jitter_price(planned, rules.min_price_increment)
         step = rules.min_base_amount_increment
-        amount = self._bounded_amount(slot.target_amount, price, step, rules.min_order_size)
+        original = slot.target_amount
+        amount = self._bounded_amount(original, price, step, rules.min_order_size)
         if amount < rules.min_order_size:
             slot.tracked = TrackedOrder(order_id="skipped")
             return
         amount = await self._cap_child_amount(amount, price, step, rules.min_order_size)
         if amount is None:
+            return
+        if self._schedule is not None:
+            room = quantize_down(self._unit_to_base(self._placeable(), price), step)
+            if room < rules.min_order_size:
+                return
+            if amount > room:
+                amount = room
+        if amount < rules.min_order_size:
             return
         order_id = self._submit(price, amount)
         slot.tracked = TrackedOrder(order_id=order_id)
@@ -2110,6 +2121,10 @@ class RangeIcebergExecutor(ExecutorBase):
         slot.target_price = price
         slot.pre_jitter_price = planned
         self._submitted_order_ids.append(order_id)
+        leftover = original - amount
+        if leftover >= rules.min_order_size:
+            rest = _Slice(LadderLevel(price=planned, base_amount=leftover))
+            self._slices.insert(self._slices.index(slot) + 1, rest)
         self._mark_action()
 
     async def _place_up_to_slice(self, price: Decimal, placeable_unit: Decimal):
@@ -2353,7 +2368,12 @@ class RangeIcebergExecutor(ExecutorBase):
     def _range_slot_released(self, slot: _Slice) -> bool:
         if self._schedule is None:
             return True
-        return self._base_to_unit(slot.target_amount, slot.target_price) <= self._placeable()
+        placeable = self._placeable()
+        if placeable <= 0:
+            return False
+        # A rung larger than the released slice is placed up to that slice.
+        room = self._unit_to_base(placeable, slot.target_price)
+        return room >= self._min_order_size()
 
     def _reprice_one(self, desired: Decimal) -> bool:
         rules = self.get_trading_rules(self.config.connector_name, self.config.trading_pair)
@@ -2527,28 +2547,15 @@ class RangeIcebergExecutor(ExecutorBase):
     def _entry_release_limit(self) -> int:
         if self._schedule is None:
             return 0
-        if self.config.mode == ExecutionMode.RANGE and self._slices:
-            return len(self._slices)
         return len(self._schedule.amounts)
 
     def _entry_release_piece(self, index: int) -> Decimal:
         """
-        Size of one released entry slice.
-
-        The first range rung may be larger than the first schedule amount.
-        Later pieces are the rung or the schedule amount.
+        Size of one schedule slice. Range rungs do not change this size.
         """
-        if self._schedule is None:
+        if self._schedule is None or index < 0 or index >= len(self._schedule.amounts):
             return Decimal("0")
-        if self.config.mode == ExecutionMode.RANGE and index < len(self._slices):
-            slot = self._slices[index]
-            piece = self._base_to_unit(slot.target_amount, slot.target_price)
-            if index == 0 and self._schedule.amounts and piece < self._schedule.amounts[0]:
-                piece = self._schedule.amounts[0]
-            return piece
-        if index < len(self._schedule.amounts):
-            return self._schedule.amounts[index]
-        return Decimal("0")
+        return self._schedule.amounts[index]
 
     def _tranches_covered_by_fill(self) -> int:
         """
@@ -2697,11 +2704,11 @@ class RangeIcebergExecutor(ExecutorBase):
         """
         Size the entry schedule has released.
 
-        The first slice is released immediately. A range rung larger than that
-        slice is released too. Each later slice is released only after the
-        previous one is fully filled and one jittered interval has passed
-        since that fill. The total is the cap. CARRY and SKIP do not add size
-        and do not drop size.
+        The first slice is released immediately. Each later slice is released
+        only after the previous one is fully filled and one jittered interval
+        has passed since that fill. The slice size is the schedule amount, not
+        a range rung. The total is the cap. CARRY and SKIP do not add size and
+        do not drop size.
         """
         if self._schedule is None:
             return self.config.total_amount
@@ -6840,6 +6847,78 @@ class RangeIcebergExecutor(ExecutorBase):
         self._exit_accounted_base.clear()
         self._exit_accounted_quote.clear()
         self._last_fill_timestamp = float(self._strategy.current_timestamp)
+
+    def _restore_open_entry_orders(self, info: dict) -> None:
+        """
+        Put resting entry orders back on the rebuilt slices.
+
+        The filled size is restored separately. Without the open remainder, the
+        next tick buys that remainder again while the original order still rests.
+        """
+        if not self._resume_entries or self._schedule is None or not isinstance(info, dict):
+            return
+        levels = info.get("levels")
+        if not isinstance(levels, list):
+            return
+        for level in levels:
+            if not isinstance(level, dict):
+                continue
+            order_id = level.get("order_id")
+            if order_id in (None, "", "skipped"):
+                continue
+            text = str(order_id)
+            if self._is_exit_order(text) or any(slot.order_id == text for slot in self._slices):
+                continue
+            order = self.get_in_flight_order(self.config.connector_name, text)
+            if order is None or order.is_done:
+                continue
+            self._attach_restored_entry(text, order, level)
+
+    def _attach_restored_entry(self, order_id: str, order, level: dict) -> None:
+        if order.price in (None, 0):
+            price = Decimal(str(level.get("price") or "0"))
+        else:
+            price = order.price
+        amount = Decimal(str(order.amount or level.get("amount") or "0"))
+        if amount <= 0 or price <= 0:
+            return
+        slot = None
+        if self.config.mode == ExecutionMode.RANGE:
+            slot = next(
+                (
+                    item for item in self._slices
+                    if item.tracked is None and not item.retired and item.target_price == price
+                ),
+                None,
+            )
+            if slot is None:
+                slot = next(
+                    (item for item in self._slices if item.tracked is None and not item.retired),
+                    None,
+                )
+        if slot is None:
+            slot = _Slice(LadderLevel(price=price, base_amount=amount))
+            self._slices.append(slot)
+        slot.target_price = price
+        slot.target_amount = amount
+        slot.pre_jitter_price = price
+        slot.tracked = TrackedOrder(order_id=order_id)
+        slot.tracked.order = order
+        if order_id not in self._submitted_order_ids:
+            self._submitted_order_ids.append(order_id)
+        executed = Decimal(str(order.executed_amount_base or 0))
+        executed_quote = Decimal(str(order.executed_amount_quote or 0))
+        rest = self._accounted_fill_by_order.get("restored-entry", Decimal("0"))
+        rest_quote = self._accounted_quote_by_order.get("restored-entry", Decimal("0"))
+        if executed > 0 and rest > 0:
+            self._accounted_fill_by_order["restored-entry"] = rest - min(rest, executed)
+            kept_quote = rest_quote - min(rest_quote, executed_quote)
+            self._accounted_quote_by_order["restored-entry"] = kept_quote
+            if self._accounted_fill_by_order["restored-entry"] <= 0:
+                self._accounted_fill_by_order.pop("restored-entry", None)
+                self._accounted_quote_by_order.pop("restored-entry", None)
+            self._accounted_fill_base = sum(self._accounted_fill_by_order.values(), Decimal("0"))
+            self._accounted_fill_quote = sum(self._accounted_quote_by_order.values(), Decimal("0"))
 
     def _restore_scheduled_entry_fill(self, blob: dict) -> None:
         """

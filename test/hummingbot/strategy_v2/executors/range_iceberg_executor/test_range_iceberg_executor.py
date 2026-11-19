@@ -1727,6 +1727,103 @@ class RangeIcebergExecutorTests(IsolatedAsyncioWrapperTestCase):
         self.assertEqual(Decimal("2500"), self.buy_ids[1][1])
         self.assertLessEqual(self.buy_ids[1][2], Decimal("0.09"))
 
+    def _fine_step(self):
+        self.connector.trading_rules["AIOT-USDT"] = TradingRule(
+            trading_pair="AIOT-USDT",
+            min_order_size=Decimal("1"),
+            min_price_increment=Decimal("0.00001"),
+            min_base_amount_increment=Decimal("1"),
+        )
+
+    def test_range_schedule_places_the_leftover_when_the_next_rung_does_not_fit(self):
+        self._fine_step()
+        executor = self._executor(
+            size_unit=SizeUnit.QUOTE,
+            total_amount=Decimal("1000"),
+            levels=10,
+            iceberg=True,
+            visible_count=1,
+            schedule_interval=30,
+            schedule_slices=4,
+            duration=None,
+            schedule_start=ScheduleStart.SUBMIT,
+        )
+        placed_quote = Decimal("0")
+        for _ in range(8):
+            self._run(executor.control_task())
+            if not self.buy_ids:
+                break
+            order_id, amount, price, _order_type, _action = self.buy_ids[-1]
+            if self.orders[order_id].current_state != OrderState.FILLED:
+                self._fill(order_id, amount, amount * price)
+                placed_quote += amount * price
+            if placed_quote + Decimal("1") >= Decimal("250"):
+                break
+        self.assertGreaterEqual(placed_quote, Decimal("249"))
+        self.assertIsNone(executor.close_type)
+        self._run(executor.control_task())
+        held = len(self.buy_ids)
+        self.now += 29
+        self._run(executor.control_task())
+        self.assertEqual(held, len(self.buy_ids))
+        self.now += 1
+        self._run(executor.control_task())
+        self.assertGreater(len(self.buy_ids), held)
+        self.assertNotEqual(CloseType.TIME_LIMIT, executor.close_type)
+
+    def test_range_schedule_paces_slices_instead_of_whole_rungs(self):
+        self._fine_step()
+        executor = self._executor(
+            size_unit=SizeUnit.BASE,
+            total_amount=Decimal("100"),
+            levels=2,
+            iceberg=False,
+            visible_count=2,
+            duration=100,
+            schedule_slices=4,
+            min_order_interval=0,
+            schedule_start=ScheduleStart.SUBMIT,
+        )
+        self._run(executor.control_task())
+        self.assertEqual(Decimal("25"), self.buy_ids[0][1])
+        self._fill("buy-1", Decimal("25"))
+        self._run(executor.control_task())
+        self.now = 1_024
+        self._run(executor.control_task())
+        self.assertEqual(1, len(self.buy_ids))
+        self.now = 1_025
+        self._run(executor.control_task())
+        self.assertEqual(2, len(self.buy_ids))
+        self.assertEqual(Decimal("25"), self.buy_ids[1][1])
+
+    def test_restart_keeps_the_resting_remainder_of_a_partial_slice(self):
+        self._book(Decimal("0.084"), Decimal("0.085"))
+        executor = self._up_to(
+            total_amount=Decimal("80"),
+            slice_amount=Decimal("40"),
+            duration=100,
+            schedule_slices=2,
+            schedule_start=ScheduleStart.SUBMIT,
+        )
+        self._run(executor.control_task())
+        self.assertEqual(Decimal("40"), self.buy_ids[0][1])
+        self._fill("buy-1", Decimal("10"), Decimal("0.85"), OrderState.PARTIALLY_FILLED)
+        self._run(executor.control_task())
+        self.assertEqual(1, len(self.buy_ids))
+        payload = json.loads(executor.executor_info.model_dump_json())
+        resumed = self._up_to(
+            total_amount=Decimal("80"),
+            slice_amount=Decimal("40"),
+            duration=100,
+            schedule_slices=2,
+            schedule_start=ScheduleStart.SUBMIT,
+        )
+        resumed.restore_from_custom_info(payload["custom_info"])
+        self._run(resumed.control_task())
+        self.assertEqual(1, len(self.buy_ids))
+        self.assertEqual(Decimal("10"), resumed.filled_base)
+        self.assertEqual(Decimal("30"), resumed._open_unit())
+
     def test_range_rungs_release_from_the_anchor(self):
         executor = self._executor(
             size_unit=SizeUnit.BASE,
@@ -2297,8 +2394,8 @@ class RangeIcebergExecutorTests(IsolatedAsyncioWrapperTestCase):
         )
         self._run(wide.control_task())
         self.assertEqual(1, len(self.buy_ids))
-        self.assertEqual(Decimal("50"), self.buy_ids[0][1])
-        self.assertGreater(self.buy_ids[0][1], Decimal("100") / Decimal("4"))
+        self.assertEqual(Decimal("20"), self.buy_ids[0][1])
+        self.assertLess(self.buy_ids[0][1], Decimal("50"))
         self.now = 20_000
         self._run(wide.control_task())
         self.assertEqual(1, len(self.buy_ids))
@@ -2319,7 +2416,7 @@ class RangeIcebergExecutorTests(IsolatedAsyncioWrapperTestCase):
         )
         self._run(weighted.control_task())
         self.assertEqual(placed + 1, len(self.buy_ids))
-        self.assertGreater(self.buy_ids[-1][1], Decimal("25"))
+        self.assertEqual(Decimal("20"), self.buy_ids[-1][1])
         self.assertIsNone(weighted.get_custom_info()["schedule_started_at"])
 
         submit_at = len(self.buy_ids)
@@ -2336,7 +2433,7 @@ class RangeIcebergExecutorTests(IsolatedAsyncioWrapperTestCase):
         )
         self._run(submit.control_task())
         self.assertEqual(submit_at + 1, len(self.buy_ids))
-        self.assertEqual(Decimal("50"), self.buy_ids[-1][1])
+        self.assertEqual(Decimal("20"), self.buy_ids[-1][1])
         self.now += 25
         self._run(submit.control_task())
         self.assertEqual(submit_at + 1, len(self.buy_ids))
