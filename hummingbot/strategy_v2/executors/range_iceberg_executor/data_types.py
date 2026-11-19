@@ -297,7 +297,9 @@ class RangeIcebergExecutorConfig(ExecutorConfigBase):
     resumed stop-loss close does not place a new stop. Every id is listed in
     exchange_stop_order_ids. Resuming from custom_info restores an exit_state
     of ARMED, RESTING, or CLOSING, re-posts a missing exit from open_base,
-    and keeps the saved exchange stop ids. resume_entries false
+    and keeps the saved exchange stop ids unless another live executor on
+    the same side already owns that id. A shared trigger price is moved
+    further from the market by whole ticks. resume_entries false
     places no entry orders and sizes the restored open amount in base, even
     when the saved config used quote.
 
