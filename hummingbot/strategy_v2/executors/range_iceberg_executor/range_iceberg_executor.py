@@ -284,6 +284,9 @@ class RangeIcebergExecutor(ExecutorBase):
         self._fill_gate_pauses: List[tuple] = []
         self._snapshotted_entry_base: Dict[str, Decimal] = {}
         self._snapshotted_entry_quote: Dict[str, Decimal] = {}
+        self._unresolved_entry_ids: Set[str] = set()
+        self._pending_restored_entries: Dict[str, tuple] = {}
+        self._saved_exchange_order_ids: Dict[str, str] = {}
         self._entry_pause_started: Optional[float] = None
         self._last_place_timestamp = Decimal("-1")
         self._rng = random.Random(config.random_seed)
@@ -789,6 +792,7 @@ class RangeIcebergExecutor(ExecutorBase):
         self._halt_on_unresolved_exchange_orders()
         await self._release_confirmed_failures()
         self._refresh_tracked_orders()
+        await self._resolve_restored_entries()
         self._release_cancelled_rungs()
         self._release_cancelled_exit_rungs()
         await self._service_entry_rebuild()
@@ -2858,7 +2862,12 @@ class RangeIcebergExecutor(ExecutorBase):
         return bool(slot.is_filled and slot.order_id and not self._known_fill_size(slot.order_id))
 
     def _replacement_blocked(self) -> bool:
-        return bool(self._unconfirmed_cancels) or bool(self._unknown_order_ids) or bool(self._open_lookup_count)
+        return bool(
+            self._unconfirmed_cancels
+            or self._unknown_order_ids
+            or self._open_lookup_count
+            or self._unresolved_entry_ids
+        )
 
     def _real_callable(self, owner, name):
         value = getattr(owner, name, None)
@@ -2931,7 +2940,7 @@ class RangeIcebergExecutor(ExecutorBase):
 
     def _release_cancelled_rungs(self) -> None:
         """
-        A range rung that ends cancelled still owns its unfilled remainder.
+        A range rung that is done and not filled still owns its unfilled remainder.
         Keep the fill, then clear the rung so the remainder is posted again.
         """
         if self.config.mode != ExecutionMode.RANGE or self._shutdown_pending:
@@ -2944,7 +2953,7 @@ class RangeIcebergExecutor(ExecutorBase):
             if slot.order_id in self._unknown_order_ids:
                 continue
             order = slot.tracked.order
-            if order is None or not order.is_cancelled or order.is_filled:
+            if order is None or not order.is_done or order.is_filled:
                 continue
             filled_base, _quote = self._best_fill(slot.order_id)
             remainder = slot.target_amount - filled_base
@@ -3285,6 +3294,7 @@ class RangeIcebergExecutor(ExecutorBase):
         order_ids.update(self._unknown_order_ids)
         order_ids.update(self._unconfirmed_cancels)
         order_ids.update(self._accounted_fill_by_order)
+        order_ids.update(self._unresolved_entry_ids)
         for slot in self._slices:
             if slot.order_id and slot.order_id != "skipped":
                 order_ids.add(slot.order_id)
@@ -3366,9 +3376,9 @@ class RangeIcebergExecutor(ExecutorBase):
 
     def _exchange_order_id_for(self, order_id: str) -> Optional[str]:
         order = self._order_for(order_id)
-        if order is None or not order.exchange_order_id:
-            return None
-        return str(order.exchange_order_id)
+        if order is not None and order.exchange_order_id:
+            return str(order.exchange_order_id)
+        return self._saved_exchange_order_ids.get(order_id) or None
 
     def _halt_for_unknown_order(self, order_id: str, because: str):
         self._unknown_order_ids.add(order_id)
@@ -3667,27 +3677,9 @@ class RangeIcebergExecutor(ExecutorBase):
             if self._is_exit_order(order_id):
                 continue
             part_base, part_quote = self._best_fill(order_id)
-            part_base, part_quote = self._fill_beyond_snapshot(order_id, part_base, part_quote)
             base += part_base
             quote += part_quote
         return base, quote
-
-    def _fill_beyond_snapshot(self, order_id: str, base: Decimal, quote: Decimal):
-        """
-        A restored order's snapshotted fill already sits in restored-entry.
-
-        Only the size reported after that snapshot counts again.
-        """
-        if order_id not in self._snapshotted_entry_base:
-            return base, quote
-        seen = self._snapshotted_entry_base[order_id]
-        seen_quote = self._snapshotted_entry_quote.get(order_id, Decimal("0"))
-        if base <= seen:
-            return Decimal("0"), Decimal("0")
-        extra_quote = quote - seen_quote
-        if extra_quote < 0:
-            extra_quote = Decimal("0")
-        return base - seen, extra_quote
 
     @property
     def total_base(self) -> Decimal:
@@ -3744,7 +3736,7 @@ class RangeIcebergExecutor(ExecutorBase):
         executed_quote = Decimal("0")
         if slot.order_id and slot.order_id != "skipped":
             executed_base, executed_quote = self._best_fill(slot.order_id)
-        return {
+        view = {
             "price": str(slot.target_price),
             "amount": str(slot.target_amount),
             "order_id": slot.order_id,
@@ -3752,6 +3744,10 @@ class RangeIcebergExecutor(ExecutorBase):
             "executed_base": str(executed_base),
             "executed_quote": str(executed_quote),
         }
+        exchange_id = self._exchange_order_id_for(slot.order_id or "")
+        if exchange_id:
+            view["exchange_order_id"] = exchange_id
+        return view
 
     def get_custom_info(self) -> dict:
         return {
@@ -6880,10 +6876,11 @@ class RangeIcebergExecutor(ExecutorBase):
 
     def _restore_open_entry_orders(self, info: dict) -> None:
         """
-        Put resting entry orders back on the rebuilt slices.
+        Saved entry orders stay unresolved until their state and size are known.
 
-        The filled size is restored separately. Without the open remainder, the
-        next tick buys that remainder again while the original order still rests.
+        Each order's fill is max(snapshot executed, live executed). That size is
+        not also kept in the aggregate. New entries wait until every saved id
+        is resolved from the tracker or an order query.
         """
         if not self._resume_entries or self._schedule is None or not isinstance(info, dict):
             return
@@ -6893,6 +6890,15 @@ class RangeIcebergExecutor(ExecutorBase):
         saved = self._slices_from_levels(levels)
         if self.config.mode == ExecutionMode.RANGE and saved:
             self._slices = saved
+        for level in levels:
+            if not isinstance(level, dict):
+                continue
+            order_id = level.get("order_id")
+            if order_id in (None, "", "skipped"):
+                continue
+            self._remember_snapshotted_fill(str(order_id), level)
+        self._attribute_legacy_entry_fills(levels)
+        self._keep_snapshot_fills_on_their_orders()
         for index, level in enumerate(levels):
             if not isinstance(level, dict):
                 continue
@@ -6900,15 +6906,17 @@ class RangeIcebergExecutor(ExecutorBase):
             if order_id in (None, "", "skipped"):
                 continue
             text = str(order_id)
-            self._remember_snapshotted_fill(text, level)
+            self._remember_exchange_order_id(text, level)
             if self._is_exit_order(text) or any(slot.order_id == text for slot in self._slices):
-                continue
-            order = self.get_in_flight_order(self.config.connector_name, text)
-            if order is None or order.is_done:
                 continue
             slot = None
             if index < len(self._slices) and self._slices[index].tracked is None:
                 slot = self._slices[index]
+            order = self.get_in_flight_order(self.config.connector_name, text)
+            if order is None:
+                self._unresolved_entry_ids.add(text)
+                self._pending_restored_entries[text] = (level, slot)
+                continue
             self._attach_restored_entry(text, order, level, slot)
 
     def _slices_from_levels(self, levels: list) -> List[_Slice]:
@@ -6934,6 +6942,133 @@ class RangeIcebergExecutor(ExecutorBase):
             return
         self._snapshotted_entry_base[order_id] = base
         self._snapshotted_entry_quote[order_id] = Decimal(str(level.get("executed_quote") or "0"))
+
+    def _attribute_legacy_entry_fills(self, levels: list) -> None:
+        """
+        A snapshot with no per-order executed size still recorded one filled amount.
+
+        That amount is attributed to the saved orders. Once a live executed size
+        is known, the order's fill is the max of the two, not the sum.
+        """
+        missing = []
+        for level in levels:
+            if not isinstance(level, dict):
+                continue
+            order_id = level.get("order_id")
+            if order_id in (None, "", "skipped") or "executed_base" in level:
+                continue
+            missing.append(level)
+        if not missing:
+            return
+        remaining = self._accounted_fill_by_order.get("restored-entry", Decimal("0"))
+        remaining -= sum(self._snapshotted_entry_base.values(), Decimal("0"))
+        if remaining <= 0:
+            return
+        quote_left = self._accounted_quote_by_order.get("restored-entry", Decimal("0"))
+        quote_left -= sum(self._snapshotted_entry_quote.values(), Decimal("0"))
+        if quote_left < 0:
+            quote_left = Decimal("0")
+        for level in missing:
+            if remaining <= 0:
+                break
+            amount = Decimal(str(level.get("amount") or "0"))
+            give = amount if amount < remaining else remaining
+            if give <= 0:
+                continue
+            order_id = str(level.get("order_id"))
+            share = quote_left * give / remaining
+            self._snapshotted_entry_base[order_id] = give
+            self._snapshotted_entry_quote[order_id] = share
+            quote_left -= share
+            remaining -= give
+
+    def _keep_snapshot_fills_on_their_orders(self) -> None:
+        """
+        Keep each snapshot fill on its order and take that size out of the aggregate.
+        """
+        if not self._snapshotted_entry_base:
+            return
+        for order_id, base in self._snapshotted_entry_base.items():
+            if base <= self._accounted_fill_by_order.get(order_id, Decimal("0")):
+                continue
+            self._accounted_fill_by_order[order_id] = base
+            quote = self._snapshotted_entry_quote.get(order_id, Decimal("0"))
+            self._accounted_quote_by_order[order_id] = quote
+        rest = self._accounted_fill_by_order.get("restored-entry", Decimal("0"))
+        if rest > 0:
+            covered = sum(self._snapshotted_entry_base.values(), Decimal("0"))
+            covered_quote = sum(self._snapshotted_entry_quote.values(), Decimal("0"))
+            rest_quote = self._accounted_quote_by_order.get("restored-entry", Decimal("0"))
+            kept = rest - min(rest, covered)
+            kept_quote = rest_quote - min(rest_quote, covered_quote)
+            if kept <= 0:
+                self._accounted_fill_by_order.pop("restored-entry", None)
+                self._accounted_quote_by_order.pop("restored-entry", None)
+            else:
+                self._accounted_fill_by_order["restored-entry"] = kept
+                self._accounted_quote_by_order["restored-entry"] = kept_quote
+        self._accounted_fill_base = sum(self._accounted_fill_by_order.values(), Decimal("0"))
+        self._accounted_fill_quote = sum(self._accounted_quote_by_order.values(), Decimal("0"))
+
+    def _remember_exchange_order_id(self, order_id: str, level: dict) -> None:
+        raw = level.get("exchange_order_id")
+        if raw in (None, ""):
+            return
+        self._saved_exchange_order_ids[order_id] = str(raw)
+
+    async def _resolve_restored_entries(self) -> None:
+        """
+        Look up each saved entry id before any new entry is placed.
+
+        The tracker is enough when it still has the order. Otherwise the connector
+        is queried by client id and by exchange id. A terminal answer with a known
+        size closes the id. Anything still unknown keeps new entries blocked.
+        """
+        if not self._unresolved_entry_ids:
+            return
+        for order_id in list(self._unresolved_entry_ids):
+            order = self.get_in_flight_order(self.config.connector_name, order_id)
+            state = None
+            if order is None:
+                state = await self._lookup_order_state(order_id)
+                self._refresh_tracked_orders()
+                order = self.get_in_flight_order(self.config.connector_name, order_id)
+            if order is not None:
+                level, slot = self._pending_restored_entries.pop(order_id, ({}, None))
+                if slot is not None and slot.tracked is not None:
+                    slot = None
+                self._attach_restored_entry(order_id, order, level or {}, slot)
+                self._unresolved_entry_ids.discard(order_id)
+                continue
+            if not self._restored_entry_size_is_known(order_id, state):
+                continue
+            self._close_unresolved_entry(order_id)
+            self._unresolved_entry_ids.discard(order_id)
+
+    def _restored_entry_size_is_known(self, order_id: str, state) -> bool:
+        if self._is_confirmed_absent(state) or state == OrderState.CANCELED:
+            return True
+        if state != OrderState.FILLED:
+            return False
+        base, _quote = self._best_fill(order_id)
+        return base > 0
+
+    def _close_unresolved_entry(self, order_id: str) -> None:
+        """
+        The order is gone. Keep its known fill and leave only the unfilled remainder.
+        """
+        _level, slot = self._pending_restored_entries.pop(order_id, ({}, None))
+        filled, _quote = self._best_fill(order_id)
+        if slot is None or slot.tracked is not None:
+            return
+        remainder = slot.target_amount - filled
+        if remainder < 0:
+            remainder = Decimal("0")
+        if remainder < self._min_order_size():
+            slot.tracked = TrackedOrder(order_id="skipped")
+            slot.retired = True
+            return
+        slot.target_amount = remainder
 
     def _attach_restored_entry(
         self,
@@ -6974,30 +7109,6 @@ class RangeIcebergExecutor(ExecutorBase):
         slot.tracked.order = order
         if order_id not in self._submitted_order_ids:
             self._submitted_order_ids.append(order_id)
-        if "executed_base" not in level:
-            self._subtract_live_fill_from_restored_entry(order)
-
-    def _subtract_live_fill_from_restored_entry(self, order) -> None:
-        """
-        Old snapshots have no per-order executed size.
-
-        If the live order already shows the fill, drop that size from the
-        aggregate so it is not counted twice.
-        """
-        executed = Decimal(str(order.executed_amount_base or 0))
-        rest = self._accounted_fill_by_order.get("restored-entry", Decimal("0"))
-        if executed <= 0 or rest <= 0:
-            return
-        executed_quote = Decimal(str(order.executed_amount_quote or 0))
-        rest_quote = self._accounted_quote_by_order.get("restored-entry", Decimal("0"))
-        self._accounted_fill_by_order["restored-entry"] = rest - min(rest, executed)
-        kept_quote = rest_quote - min(rest_quote, executed_quote)
-        self._accounted_quote_by_order["restored-entry"] = kept_quote
-        if self._accounted_fill_by_order["restored-entry"] <= 0:
-            self._accounted_fill_by_order.pop("restored-entry", None)
-            self._accounted_quote_by_order.pop("restored-entry", None)
-        self._accounted_fill_base = sum(self._accounted_fill_by_order.values(), Decimal("0"))
-        self._accounted_fill_quote = sum(self._accounted_quote_by_order.values(), Decimal("0"))
 
     def _restore_scheduled_entry_fill(self, blob: dict) -> None:
         """

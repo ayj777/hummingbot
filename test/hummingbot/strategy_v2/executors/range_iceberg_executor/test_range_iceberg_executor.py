@@ -1900,6 +1900,128 @@ class RangeIcebergExecutorTests(IsolatedAsyncioWrapperTestCase):
         self.assertEqual(Decimal("30"), resumed._open_unit())
         self.assertEqual(Decimal("40"), resumed.filled_base + resumed._open_unit())
 
+    def _open_range_schedule(self):
+        self._fine_step()
+        executor = self._executor(
+            size_unit=SizeUnit.BASE,
+            total_amount=Decimal("100"),
+            levels=2,
+            iceberg=False,
+            visible_count=2,
+            schedule_interval=25,
+            schedule_slices=4,
+            duration=None,
+            schedule_start=ScheduleStart.SUBMIT,
+        )
+        self._run(executor.control_task())
+        self.assertEqual(Decimal("25"), self.buy_ids[0][1])
+        payload = json.loads(executor.executor_info.model_dump_json())
+        return payload["custom_info"]
+
+    def _resume_range_schedule(self, info):
+        resumed = self._executor(
+            size_unit=SizeUnit.BASE,
+            total_amount=Decimal("100"),
+            levels=2,
+            iceberg=False,
+            visible_count=2,
+            schedule_interval=25,
+            schedule_slices=4,
+            duration=None,
+            schedule_start=ScheduleStart.SUBMIT,
+        )
+        resumed.restore_from_custom_info(info)
+        return resumed
+
+    def test_a_fill_while_down_is_not_bought_again(self):
+        info = self._open_range_schedule()
+        self._fill("buy-1", Decimal("25"))
+        resumed = self._resume_range_schedule(info)
+        self._run(resumed.control_task())
+        self.assertEqual(Decimal("25"), resumed.filled_base)
+        self.assertEqual(1, len(self.buy_ids))
+
+    def test_a_cancel_while_down_keeps_its_fill(self):
+        info = self._open_range_schedule()
+        self._fill("buy-1", Decimal("10"), state=OrderState.CANCELED)
+        resumed = self._resume_range_schedule(info)
+        self._run(resumed.control_task())
+        self.assertEqual(Decimal("10"), resumed.filled_base)
+        added = [row[1] for row in self.buy_ids if row[0] != "buy-1"]
+        self.assertTrue(all(amount <= Decimal("15") for amount in added))
+
+    def test_an_order_tracked_under_another_id_is_not_bought_again(self):
+        info = self._open_range_schedule()
+        order = self.orders.pop("buy-1")
+        order.client_order_id = "buy-renamed"
+        self.orders["buy-renamed"] = order
+        resumed = self._resume_range_schedule(info)
+        self._run(resumed.control_task())
+        self.assertEqual(1, len(self.buy_ids))
+
+    def test_a_missing_order_is_resolved_before_a_new_entry(self):
+        info = self._open_range_schedule()
+        order = self.orders.pop("buy-1")
+        looked = []
+
+        async def resolve(trading_pair, client_order_id, exchange_order_id=None):
+            looked.append(client_order_id)
+            order.current_state = OrderState.FILLED
+            order.executed_amount_base = Decimal("25")
+            order.executed_amount_quote = Decimal("2")
+            self.orders[client_order_id] = order
+            return OrderState.FILLED
+
+        self.connector.resolve_unknown_order = resolve
+        resumed = self._resume_range_schedule(info)
+        self._run(resumed.control_task())
+        self.assertEqual(["buy-1"], looked)
+        self.assertEqual(Decimal("25"), resumed.filled_base)
+        self.assertEqual(1, len(self.buy_ids))
+
+    def test_a_cancel_with_no_fill_is_replaced_once(self):
+        info = self._open_range_schedule()
+        self._fill("buy-1", Decimal("0"), state=OrderState.CANCELED)
+        resumed = self._resume_range_schedule(info)
+        self._run(resumed.control_task())
+        self.assertEqual(Decimal("0"), resumed.filled_base)
+        self.assertEqual(2, len(self.buy_ids))
+        self.assertEqual(Decimal("25"), self.buy_ids[1][1])
+
+    def test_a_legacy_snapshot_does_not_add_a_late_fill_twice(self):
+        self._book(Decimal("0.084"), Decimal("0.085"))
+        executor = self._up_to(
+            total_amount=Decimal("80"),
+            slice_amount=Decimal("40"),
+            duration=100,
+            schedule_slices=2,
+            schedule_start=ScheduleStart.SUBMIT,
+        )
+        self._run(executor.control_task())
+        self._fill("buy-1", Decimal("10"), Decimal("0.85"), OrderState.PARTIALLY_FILLED)
+        self._run(executor.control_task())
+        payload = json.loads(executor.executor_info.model_dump_json())
+        for level in payload["custom_info"]["levels"]:
+            level.pop("executed_base", None)
+            level.pop("executed_quote", None)
+        self.orders["buy-1"].executed_amount_base = Decimal("0")
+        self.orders["buy-1"].executed_amount_quote = Decimal("0")
+        resumed = self._up_to(
+            total_amount=Decimal("80"),
+            slice_amount=Decimal("40"),
+            duration=100,
+            schedule_slices=2,
+            schedule_start=ScheduleStart.SUBMIT,
+        )
+        resumed.restore_from_custom_info(payload["custom_info"])
+        self.assertEqual(Decimal("10"), resumed.filled_base)
+        self.assertEqual(Decimal("30"), resumed._open_unit())
+        self.orders["buy-1"].executed_amount_base = Decimal("10")
+        self.orders["buy-1"].executed_amount_quote = Decimal("0.85")
+        self.assertEqual(Decimal("10"), resumed.filled_base)
+        self.assertEqual(Decimal("30"), resumed._open_unit())
+        self.assertEqual(Decimal("40"), resumed.filled_base + resumed._open_unit())
+
     def test_range_rungs_release_from_the_anchor(self):
         executor = self._executor(
             size_unit=SizeUnit.BASE,
