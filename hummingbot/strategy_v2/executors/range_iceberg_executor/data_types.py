@@ -300,7 +300,11 @@ class RangeIcebergExecutorConfig(ExecutorConfigBase):
     and keeps the saved exchange stop ids. Only one range iceberg may be
     open on the same account, connector, pair, and position side. An open
     executor is edited in place with update_config (total amount, price range,
-    take profit, and stop loss) instead of opening a second one. resume_entries false
+    take profit, and stop loss) instead of opening a second one. Those edits
+    are stored on custom_info config_edits, in the executor's own size unit,
+    and resume applies that object only. The reported total_amount, price_low,
+    price_high, take_profit, and stop_loss are the live values and are not
+    applied again. resume_entries false
     places no entry orders and sizes the restored open amount in base, even
     when the saved config used quote.
 

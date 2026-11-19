@@ -180,7 +180,7 @@ class RangeIcebergExitTests(IsolatedAsyncioWrapperTestCase):
         self.assertEqual(price * Decimal("1.10"), Decimal(info["exit_average_price"]))
         self.assertEqual(price * Decimal("1.10"), Decimal(info["take_profit_trigger_price"]))
         self.assertEqual((args[4] - price) * base, Decimal(info["realized_pnl_quote"]))
-        self.assertEqual("0.10", info["take_profit"]["percent"])
+        self.assertEqual("0.1", info["take_profit"]["percent"])
         self.assertEqual("SINGLE", info["take_profit"]["execution"])
 
     def test_take_profit_single_market_waits_for_the_trigger(self):
@@ -3076,7 +3076,7 @@ class RangeIcebergExitTests(IsolatedAsyncioWrapperTestCase):
         self.assertEqual("150", info["total_amount"])
         self.assertEqual("0.07", info["price_low"])
         self.assertEqual("0.11", info["price_high"])
-        self.assertEqual("0.20", info["take_profit"]["percent"])
+        self.assertEqual("0.2", info["take_profit"]["percent"])
         self.assertEqual("0.05", info["stop_loss"]["price"])
         resumed = self._executor()
         resumed.restore_from_custom_info(info)
@@ -3109,3 +3109,195 @@ class RangeIcebergExitTests(IsolatedAsyncioWrapperTestCase):
         result = executor.update_config({"total_amount": "120"})
         self.assertFalse(result["accepted"])
         self.assertEqual("a parked position hold cannot be edited", result["reason"])
+
+    def test_update_config_rejects_a_ladder_that_cannot_be_built(self):
+        executor = self._executor(total_amount=Decimal("100"))
+        self._run(executor.control_task())
+        result = executor.update_config({"total_amount": "5"})
+        self.assertFalse(result["accepted"])
+        self.assertIn("minimum order size", result["reason"])
+        self.assertEqual(Decimal("100"), executor.config.total_amount)
+        self.assertFalse(executor.get_custom_info()["pending_config_edit"])
+        self.assertEqual(0, self.strategy.cancel.call_count)
+
+    def test_update_config_keeps_the_old_plan_when_apply_cannot_build(self):
+        executor = self._executor(total_amount=Decimal("100"))
+        self._run(executor.control_task())
+        result = executor.update_config({"total_amount": "40"})
+        self.assertTrue(result["accepted"], result)
+        self.assertTrue(executor.get_custom_info()["pending_config_edit"])
+        self.connector.get_contract_size.side_effect = RuntimeError("missing")
+        cancels = self.strategy.cancel.call_count
+        self._run(executor.control_task())
+        self.assertEqual(Decimal("100"), executor.config.total_amount)
+        self.assertEqual(cancels, self.strategy.cancel.call_count)
+        info = executor.get_custom_info()
+        self.assertFalse(info["pending_config_edit"])
+        self.assertIn("contractSize", info["config_edit_error"])
+        self.assertEqual({}, info["config_edits"])
+
+    def test_update_config_clamps_a_shrink_when_fills_land_before_apply(self):
+        executor = self._executor(total_amount=Decimal("100"))
+        self._run(executor.control_task())
+        order = self.orders[self.buy_ids[-1][0]]
+        order.executed_amount_base = Decimal("30")
+        order.executed_amount_quote = Decimal("30") * order.price
+        order.current_state = OrderState.PARTIALLY_FILLED
+        result = executor.update_config({"total_amount": "40"})
+        self.assertTrue(result["accepted"], result)
+        order.executed_amount_base = Decimal("70")
+        order.executed_amount_quote = Decimal("70") * order.price
+        self._run(executor.control_task())
+        info = executor.get_custom_info()
+        self.assertEqual(Decimal("70"), executor.config.total_amount)
+        self.assertIn("clamped to the filled amount 70", info["config_edit_error"])
+        self.assertEqual("70", info["config_edits"]["total_amount"])
+        self.assertFalse(info["pending_config_edit"])
+        self.assertIsNotNone(info["last_config_edit_applied_at"])
+        self.assertGreaterEqual(self.strategy.cancel.call_count, 1)
+
+    def test_update_config_records_a_dropped_edit_when_the_executor_stops(self):
+        executor = self._executor()
+        result = executor.update_config({"total_amount": "120"})
+        self.assertTrue(result["accepted"], result)
+        self.assertTrue(executor.get_custom_info()["pending_config_edit"])
+        executor.early_stop(keep_position=True)
+        info = executor.get_custom_info()
+        self.assertFalse(info["pending_config_edit"])
+        self.assertEqual("dropped: executor stopped before apply", info["config_edit_error"])
+        self.assertEqual(Decimal("100"), executor.config.total_amount)
+        self.assertEqual({}, info["config_edits"])
+
+    def test_clearing_stop_loss_cancels_the_protective_exchange_stop(self):
+        state = self._install_mexc_stop_book()
+        executor = self._executor(stop_loss={"price": "0.07", "execution": "SINGLE"})
+        self._open_entry(executor)
+        self._run(executor.control_task())
+        self.assertEqual("stop-1", executor.get_custom_info()["exchange_stop_order_id"])
+        result = executor.update_config({"stop_loss": None})
+        self.assertEqual(
+            {"accepted": True, "reason": "clearing stop_loss cancels the protective exchange stop"},
+            result,
+        )
+        self._run(executor.control_task())
+        self.assertIsNone(executor.config.stop_loss)
+        self.assertIsNone(executor.get_custom_info()["exchange_stop_order_id"])
+        self.assertEqual(["stop-1"], state["cancelled"])
+        self.assertNotIn("stop-1", state["stops"])
+        self.assertIsNone(executor.get_custom_info()["config_edits"]["stop_loss"])
+
+    def test_exit_decimals_round_trip(self):
+        executor = self._executor(
+            take_profit={
+                "percent": "0.10",
+                "execution": "ICEBERG",
+                "slices": 2,
+                "visible_count": 1,
+                "interval": 30.0,
+                "limit_price": "0.120",
+            },
+        )
+        view = executor.get_custom_info()["take_profit"]
+        self.assertEqual("0.1", view["percent"])
+        self.assertEqual("30", view["interval"])
+        self.assertEqual("0.12", view["limit_price"])
+        again = self._executor(take_profit=view)
+        self.assertEqual(view, again.get_custom_info()["take_profit"])
+
+    def test_quote_base_and_contracts_resume_ignores_reported_totals_unless_edited(self):
+        state = self._install_mexc_stop_book()
+        quote = self._executor(
+            size_unit=SizeUnit.QUOTE,
+            total_amount=Decimal("8.5"),
+            exit_arming="ON_ANY_FILL",
+            take_profit={"percent": "0.10", "execution": "SINGLE", "order_type": "LIMIT"},
+            stop_loss={"price": "0.07", "execution": "SINGLE"},
+        )
+        self._run(quote.control_task())
+        order = self.orders[self.buy_ids[-1][0]]
+        order.executed_amount_base = Decimal("50")
+        order.executed_amount_quote = Decimal("50") * order.price
+        order.current_state = OrderState.PARTIALLY_FILLED
+        self._run(quote.control_task())
+        snapshot = quote.get_custom_info()
+        self.assertEqual("8.5", snapshot["total_amount"])
+        self.assertEqual({}, snapshot["config_edits"])
+        self.assertEqual("stop-1", snapshot["exchange_stop_order_id"])
+        resumed = self._executor(
+            size_unit=SizeUnit.BASE,
+            total_amount=Decimal("50"),
+            exit_arming="ON_ANY_FILL",
+            take_profit={"percent": "0.10", "execution": "SINGLE", "order_type": "LIMIT"},
+            stop_loss={"price": "0.07", "execution": "SINGLE"},
+        )
+        payload = dict(snapshot)
+        payload["resume_entries"] = False
+        payload["size_unit"] = "BASE"
+        payload.pop("open_base")
+        resumed.restore_from_custom_info(payload)
+        self.assertEqual(SizeUnit.BASE, resumed.config.size_unit)
+        self.assertEqual(Decimal("50"), resumed.config.total_amount)
+        self.assertNotEqual(CloseType.FAILED, resumed.close_type)
+        self.assertEqual(Decimal("50"), resumed.filled_base)
+        self._run(resumed.control_task())
+        self.assertNotEqual(CloseType.FAILED, resumed.close_type)
+        self.assertNotEqual(RunnableStatus.TERMINATED, resumed.status)
+        self.assertEqual("stop-1", resumed.get_custom_info()["exchange_stop_order_id"])
+        self.assertNotIn("stop-1", state["cancelled"])
+
+        quoted_edit = self._executor(size_unit=SizeUnit.QUOTE, total_amount=Decimal("8.5"))
+        self.assertTrue(quoted_edit.update_config({"total_amount": "12"})["accepted"])
+        self._run(quoted_edit.control_task())
+        quote_info = quoted_edit.get_custom_info()
+        self.assertEqual("12", quote_info["config_edits"]["total_amount"])
+        self.assertEqual("QUOTE", quote_info["config_edits"]["size_unit"])
+        same_quote = self._executor(size_unit=SizeUnit.QUOTE, total_amount=Decimal("8.5"))
+        same_quote.restore_from_custom_info(quote_info)
+        self.assertEqual(Decimal("12"), same_quote.config.total_amount)
+        self.assertEqual(SizeUnit.QUOTE, same_quote.config.size_unit)
+        self.assertNotEqual(CloseType.FAILED, same_quote.close_type)
+        quote_as_base = self._executor(size_unit=SizeUnit.BASE, total_amount=Decimal("50"))
+        quote_as_base.restore_from_custom_info(quote_info)
+        self.assertEqual(Decimal("150"), quote_as_base.config.total_amount)
+        self.assertEqual(SizeUnit.BASE, quote_as_base.config.size_unit)
+        self.assertNotEqual(CloseType.FAILED, quote_as_base.close_type)
+
+        base = self._executor(total_amount=Decimal("100"))
+        bare = base.get_custom_info()
+        bare["total_amount"] = "8.5"
+        bare["size_unit"] = "BASE"
+        untouched = self._executor(total_amount=Decimal("100"))
+        untouched.restore_from_custom_info(bare)
+        self.assertEqual(Decimal("100"), untouched.config.total_amount)
+        self.assertEqual({}, untouched.get_custom_info()["config_edits"])
+        self.assertTrue(base.update_config({"total_amount": "150"})["accepted"])
+        self._run(base.control_task())
+        base_info = base.get_custom_info()
+        self.assertEqual("BASE", base_info["config_edits"]["size_unit"])
+        base_resume = self._executor(total_amount=Decimal("100"))
+        base_resume.restore_from_custom_info(base_info)
+        self.assertEqual(Decimal("150"), base_resume.config.total_amount)
+        self.assertNotEqual(CloseType.FAILED, base_resume.close_type)
+
+        contracts = self._executor(size_unit=SizeUnit.CONTRACTS, total_amount=Decimal("10"))
+        contract_bare = contracts.get_custom_info()
+        self.assertEqual("10", contract_bare["total_amount"])
+        contract_resume = self._executor(size_unit=SizeUnit.BASE, total_amount=Decimal("50"))
+        contract_resume.restore_from_custom_info(contract_bare)
+        self.assertEqual(Decimal("50"), contract_resume.config.total_amount)
+        self.assertNotEqual(CloseType.FAILED, contract_resume.close_type)
+        self.assertTrue(contracts.update_config({"total_amount": "8"})["accepted"])
+        self._run(contracts.control_task())
+        contract_info = contracts.get_custom_info()
+        self.assertEqual("8", contract_info["config_edits"]["total_amount"])
+        self.assertEqual("CONTRACTS", contract_info["config_edits"]["size_unit"])
+        contract_as_base = self._executor(size_unit=SizeUnit.BASE, total_amount=Decimal("50"))
+        contract_as_base.restore_from_custom_info(contract_info)
+        self.assertEqual(Decimal("80"), contract_as_base.config.total_amount)
+        self.assertEqual(SizeUnit.BASE, contract_as_base.config.size_unit)
+        self.assertNotEqual(CloseType.FAILED, contract_as_base.close_type)
+        same_contracts = self._executor(size_unit=SizeUnit.CONTRACTS, total_amount=Decimal("10"))
+        same_contracts.restore_from_custom_info(contract_info)
+        self.assertEqual(Decimal("8"), same_contracts.config.total_amount)
+        self.assertEqual(SizeUnit.CONTRACTS, same_contracts.config.size_unit)
+        self.assertNotEqual(CloseType.FAILED, same_contracts.close_type)

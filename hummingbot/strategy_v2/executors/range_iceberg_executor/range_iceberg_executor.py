@@ -175,7 +175,10 @@ class RangeIcebergExecutor(ExecutorBase):
     update_config edits this executor in place while it is RUNNING: total
     amount, the range, and take profit or stop loss. The control loop applies
     the edit before it places or syncs, so the change cannot race a fill.
-    A second iceberg on the same side is not required.
+    Accepted edits are stored in custom_info config_edits, in this executor's
+    size unit. Resume reads that object only. The reported total_amount,
+    price_low, price_high, take_profit, and stop_loss are the live values
+    and are not applied again. A second iceberg on the same side is not required.
     A moved percent trigger is repriced with change_stop_plan_price, then resized at
     that same price. Cancel-and-place is only the fallback when the reprice
     fails. protective_exchange_stop defaults to on only if
@@ -335,6 +338,11 @@ class RangeIcebergExecutor(ExecutorBase):
         self._account_identity = self._read_account_identity()
         self._queued_config: Optional[RangeIcebergExecutorConfig] = None
         self._queued_edit_keys: Set[str] = set()
+        self._queued_clears_stop = False
+        self._clear_exchange_stop = False
+        self._config_edits: dict = {}
+        self._config_edit_error = ""
+        self._last_config_edit_applied_at: Optional[float] = None
         self._keep_exchange_stop = False
         self._exit_failure_count = 0
         self._exit_retry_after: Optional[float] = None
@@ -646,10 +654,16 @@ class RangeIcebergExecutor(ExecutorBase):
 
     async def control_task(self):
         if self.status == RunnableStatus.TERMINATED:
+            self._drop_queued_config_edit()
             return
         if not self._side_guard_checked and self._reject_duplicate_side():
             return
         self._apply_queued_config_edit()
+        if self._clear_exchange_stop:
+            self.logger().info("Clearing stop_loss. Cancelling the protective exchange stop.")
+            outcome = await self._request_exchange_stop_cancel()
+            if outcome == "confirmed" or not self._exchange_stop_order_ids():
+                self._clear_exchange_stop = False
         self._service_config_edit_cancels()
         if self._shutdown_pending:
             await self._finish_shutdown()
@@ -781,9 +795,20 @@ class RangeIcebergExecutor(ExecutorBase):
                 )
         if candidate.mode != ExecutionMode.RANGE and ("price_low" in changes or "price_high" in changes):
             return self._edit_result(False, "price_low and price_high apply to RANGE mode")
+        try:
+            if candidate.mode == ExecutionMode.RANGE and ({"total_amount", "price_low", "price_high"} & set(changes)):
+                self._ladder_for_config(candidate)
+            elif "total_amount" in changes:
+                self._require_orderable_total(candidate)
+        except ValueError as exc:
+            return self._edit_result(False, str(exc))
+        reason = ""
+        if "stop_loss" in changes and candidate.stop_loss is None:
+            reason = "clearing stop_loss cancels the protective exchange stop"
         self._queued_config = candidate
         self._queued_edit_keys.update(changes.keys())
-        return self._edit_result(True, "")
+        self._queued_clears_stop = "stop_loss" in self._queued_edit_keys and candidate.stop_loss is None
+        return self._edit_result(True, reason)
 
     def _edit_result(self, accepted: bool, reason: str) -> dict:
         if not accepted and reason:
@@ -851,22 +876,64 @@ class RangeIcebergExecutor(ExecutorBase):
         if candidate is None:
             return
         if self._config_edit_block_reason():
-            self._queued_config = None
-            self._queued_edit_keys = set()
+            self._drop_queued_config_edit()
             return
         keys = set(self._queued_edit_keys)
+        clamped = ""
+        if "total_amount" in keys:
+            filled = self._filled_amount_in_unit(candidate)
+            if candidate.total_amount < filled:
+                try:
+                    candidate = self._config_with_changes(candidate, {"total_amount": str(filled)})
+                except (ValidationError, ValueError) as exc:
+                    self._queued_config = None
+                    self._queued_edit_keys = set()
+                    self._queued_clears_stop = False
+                    self._config_edit_error = self._validation_reason(exc)
+                    self.logger().error("Rejected range iceberg edit at apply: %s", exc)
+                    return
+                clamped = f"total_amount clamped to the filled amount {filled}"
+        new_slices = None
+        if candidate.mode == ExecutionMode.RANGE and keys & {"total_amount", "price_low", "price_high"}:
+            try:
+                levels = self._ladder_for_config(candidate)
+                new_slices = self._retarget_slices(candidate, levels)
+            except ValueError as exc:
+                self._queued_config = None
+                self._queued_edit_keys = set()
+                self._queued_clears_stop = False
+                self._config_edit_error = str(exc)
+                self.logger().error("Rejected range iceberg edit at apply: %s", exc)
+                return
+        clears_stop = self._queued_clears_stop
         self.config = candidate
         self._queued_config = None
         self._queued_edit_keys = set()
+        self._queued_clears_stop = False
+        if new_slices is not None:
+            self._slices = new_slices
         if keys & {"total_amount", "price_low", "price_high"}:
             self._resize_schedule_amounts()
-            self._retarget_entry_plan()
         if keys & {"take_profit", "stop_loss"}:
             self._tp_reprice_after = None
             self._exit_plan_ready = False
             self._exchange_stop_last_request = None
             if self._exit_active == "take_profit" and self._exit_phase == "resting":
                 self._cancel_exit_orders()
+        if clears_stop:
+            self._clear_exchange_stop = True
+        self._remember_applied_edits(keys, candidate)
+        self._last_config_edit_applied_at = float(self._strategy.current_timestamp)
+        self._config_edit_error = clamped
+
+    def _drop_queued_config_edit(self, reason: str = "dropped: executor stopped before apply") -> None:
+        if self._queued_config is None and not self._queued_edit_keys:
+            return
+        self._queued_config = None
+        self._queued_edit_keys = set()
+        self._queued_clears_stop = False
+        self._config_edit_error = reason
+        self.logger().warning("Dropped range iceberg edit: %s", reason)
 
     def _resize_schedule_amounts(self) -> None:
         schedule = self._schedule
@@ -882,32 +949,86 @@ class RangeIcebergExecutor(ExecutorBase):
             remaining -= piece
         schedule.amounts = amounts
 
-    def _retarget_entry_plan(self) -> None:
-        if self.config.mode != ExecutionMode.RANGE:
-            return
-        rules = self.get_trading_rules(self.config.connector_name, self.config.trading_pair)
+    def _ladder_for_config(
+        self,
+        config: RangeIcebergExecutorConfig,
+        total_amount: Optional[Decimal] = None,
+        size_unit: Optional[SizeUnit] = None,
+    ):
+        if config.mode != ExecutionMode.RANGE:
+            raise ValueError("price_low and price_high apply to RANGE mode")
+        if config.price_low is None or config.price_high is None:
+            raise ValueError("price_low and price_high are required")
+        rules = self.get_trading_rules(config.connector_name, config.trading_pair)
         contract_size = self._contract_size()
         if contract_size is None:
-            self.logger().error("Refusing to edit the range until contractSize is loaded.")
-            return
-        try:
-            levels = build_range_ladder(
-                total_amount=self.config.total_amount,
-                size_unit=self.config.size_unit,
-                price_low=self.config.price_low,
-                price_high=self.config.price_high,
-                levels=self.config.levels,
-                distribution=self.config.distribution,
-                weight=self.config.weight,
-                side=self.config.side,
-                price_step=Decimal(str(rules.min_price_increment)),
-                amount_step=Decimal(str(rules.min_base_amount_increment)),
-                min_amount=Decimal(str(rules.min_order_size)),
-                contract_size=contract_size,
-            )
-        except ValueError as exc:
-            self.logger().error(str(exc))
-            return
+            raise ValueError("Refusing to edit the range until contractSize is loaded.")
+        return build_range_ladder(
+            total_amount=config.total_amount if total_amount is None else total_amount,
+            size_unit=config.size_unit if size_unit is None else size_unit,
+            price_low=config.price_low,
+            price_high=config.price_high,
+            levels=config.levels,
+            distribution=config.distribution,
+            weight=config.weight,
+            side=config.side,
+            price_step=Decimal(str(rules.min_price_increment)),
+            amount_step=Decimal(str(rules.min_base_amount_increment)),
+            min_amount=Decimal(str(rules.min_order_size)),
+            contract_size=contract_size,
+        )
+
+    def _require_orderable_total(self, config: RangeIcebergExecutorConfig) -> None:
+        rules = self.get_trading_rules(config.connector_name, config.trading_pair)
+        base = self._amount_in_base(config.total_amount, config.size_unit, config)
+        if base < Decimal(str(rules.min_order_size)):
+            raise ValueError("The total is below the minimum order size.")
+
+    def _amount_in_base(self, amount: Decimal, unit: SizeUnit, config: RangeIcebergExecutorConfig) -> Decimal:
+        if unit == SizeUnit.BASE:
+            return amount
+        if unit == SizeUnit.CONTRACTS:
+            size = self._contract_size()
+            if size is None:
+                raise ValueError("Refusing to edit the range until contractSize is loaded.")
+            return amount * size
+        price = config.limit_price or config.price_low or Decimal("1")
+        if price <= 0:
+            raise ValueError("A quote total needs a positive price.")
+        return amount / price
+
+    def _convert_total(
+        self,
+        amount: Decimal,
+        source: SizeUnit,
+        target: SizeUnit,
+        config: RangeIcebergExecutorConfig,
+    ) -> Decimal:
+        if source == target:
+            return amount
+        if source == SizeUnit.QUOTE and config.mode == ExecutionMode.RANGE:
+            levels = self._ladder_for_config(config, total_amount=amount, size_unit=SizeUnit.QUOTE)
+            base = sum((level.base_amount for level in levels), Decimal("0"))
+        elif source == SizeUnit.CONTRACTS:
+            base = self._amount_in_base(amount, SizeUnit.CONTRACTS, config)
+        elif source == SizeUnit.BASE:
+            base = amount
+        else:
+            base = self._amount_in_base(amount, source, config)
+        if target == SizeUnit.BASE:
+            return base
+        if target == SizeUnit.CONTRACTS:
+            size = self._contract_size()
+            if size is None:
+                raise ValueError("Refusing to edit the range until contractSize is loaded.")
+            if size <= 0:
+                return base
+            return base / size
+        price = config.limit_price or config.price_low or Decimal("1")
+        return base * price
+
+    def _retarget_slices(self, config: RangeIcebergExecutorConfig, levels) -> List[_Slice]:
+        rules = self.get_trading_rules(config.connector_name, config.trading_pair)
         min_amount = Decimal(str(rules.min_order_size))
         rebuilt: List[_Slice] = []
         level_index = 0
@@ -923,8 +1044,14 @@ class RangeIcebergExecutor(ExecutorBase):
             if level_index < len(levels):
                 level_index += 1
             price = self._slot_price(slot)
-            inside = self._price_inside_config_range(price)
+            inside = self._price_inside_config_range(price, config)
             live = self._working_slice_base(slot)
+            filled_on_slot = Decimal("0")
+            if slot.order_id and slot.order_id != "skipped":
+                filled_on_slot, _quote = self._best_fill(slot.order_id)
+            room = desired.base_amount - filled_on_slot
+            if room < 0:
+                room = Decimal("0")
             if not inside:
                 slot.target_price = desired.price
                 slot.target_amount = desired.base_amount
@@ -932,8 +1059,8 @@ class RangeIcebergExecutor(ExecutorBase):
                 slot.edit_cancel = True
                 rebuilt.append(slot)
                 continue
-            if live > desired.base_amount:
-                slot.target_amount = desired.base_amount
+            if live > room:
+                slot.target_amount = filled_on_slot + room
                 slot.edit_cancel = True
                 rebuilt.append(slot)
                 continue
@@ -945,11 +1072,12 @@ class RangeIcebergExecutor(ExecutorBase):
         while level_index < len(levels):
             rebuilt.append(_Slice(levels[level_index]))
             level_index += 1
-        self._slices = rebuilt
+        return rebuilt
 
-    def _price_inside_config_range(self, price: Decimal) -> bool:
-        low = self.config.price_low
-        high = self.config.price_high
+    def _price_inside_config_range(self, price: Decimal, config: Optional[RangeIcebergExecutorConfig] = None) -> bool:
+        config = config or self.config
+        low = config.price_low
+        high = config.price_high
         if low is None or high is None:
             return True
         return low <= price <= high
@@ -982,29 +1110,132 @@ class RangeIcebergExecutor(ExecutorBase):
         self._request_cancel(slot)
 
     def _restore_edited_config(self, info: dict) -> None:
-        if not isinstance(info, dict):
+        """
+        Apply config_edits only.
+
+        Reported total_amount, price_low, price_high, take_profit, and stop_loss
+        are the live values. They are not edits. A total_amount in config_edits
+        is in the size unit stored beside it. When this resume config uses a
+        different unit, that total is converted. It does not replace the open
+        base the resume payload already sized.
+        """
+        if not isinstance(info, dict) or "config_edits" not in info:
             return
-        changes = {}
-        for key in self._EDITABLE_CONFIG_FIELDS:
-            if key in info:
-                changes[key] = info[key]
-        if not changes:
+        edits = info.get("config_edits")
+        if not isinstance(edits, dict):
             return
+        if not any(key in edits for key in self._EDITABLE_CONFIG_FIELDS):
+            return
+        stored = self._stored_config_edits(edits)
         try:
+            changes = self._changes_from_config_edits(edits)
             candidate = self._config_with_changes(self.config, changes)
+            if candidate.mode == ExecutionMode.RANGE and (
+                {"total_amount", "price_low", "price_high"} & set(changes)
+            ):
+                self._ladder_for_config(candidate)
         except (ValidationError, ValueError) as exc:
+            self._config_edit_error = self._validation_reason(exc)
             self.logger().error("Could not restore the edited range iceberg config: %s", exc)
             return
         if self._config_edit_signature(candidate) == self._config_edit_signature(self.config):
+            self._config_edits = stored
             return
+        previous_config = self.config
+        previous_schedule = self._schedule
+        previous_slices = list(self._slices)
+        previous_close = self.close_type
         self.config = candidate
         replaced = self._make_schedule()
-        if replaced is not None and self._schedule is not None:
-            replaced.skipped = self._schedule.skipped
-            replaced._closed = self._schedule._closed
-            replaced._assigned = self._schedule._assigned
+        if replaced is not None and previous_schedule is not None:
+            replaced.skipped = previous_schedule.skipped
+            replaced._closed = previous_schedule._closed
+            replaced._assigned = previous_schedule._assigned
         self._schedule = replaced
         self._build_plan()
+        if self.close_type == CloseType.FAILED and previous_close != CloseType.FAILED:
+            self.config = previous_config
+            self._schedule = previous_schedule
+            self._slices = previous_slices
+            self.close_type = previous_close
+            self._config_edit_error = "Could not restore the edited range iceberg config."
+            self.logger().error(self._config_edit_error)
+            return
+        self._config_edits = stored
+        self._config_edit_error = ""
+
+    def _stored_config_edits(self, edits: dict) -> dict:
+        stored = {}
+        for key in self._EDITABLE_CONFIG_FIELDS:
+            if key in edits:
+                stored[key] = edits[key]
+        if "total_amount" in stored and edits.get("size_unit") not in (None, ""):
+            stored["size_unit"] = str(edits["size_unit"])
+        elif "total_amount" in stored:
+            stored["size_unit"] = self.config.size_unit.value
+        return stored
+
+    def _changes_from_config_edits(self, edits: dict) -> dict:
+        changes = {}
+        for key in self._EDITABLE_CONFIG_FIELDS:
+            if key in edits:
+                changes[key] = edits[key]
+        if "total_amount" not in changes:
+            return changes
+        source_name = str(edits.get("size_unit") or self.config.size_unit.value).upper()
+        try:
+            source = SizeUnit(source_name)
+        except ValueError as exc:
+            raise ValueError(f"config_edits size_unit ({source_name}) is not BASE, QUOTE, or CONTRACTS") from exc
+        if source != self.config.size_unit:
+            price_changes = {key: value for key, value in changes.items() if key != "total_amount"}
+            priced = self._config_with_changes(self.config, price_changes) if price_changes else self.config
+            converted = self._convert_total(
+                Decimal(str(changes["total_amount"])),
+                source,
+                self.config.size_unit,
+                priced,
+            )
+            changes["total_amount"] = str(converted)
+        return changes
+
+    def _remember_applied_edits(self, keys: Set[str], config: RangeIcebergExecutorConfig) -> None:
+        for key in keys:
+            if key in self._EDITABLE_CONFIG_FIELDS:
+                self._config_edits[key] = self._edit_field_view(config, key)
+        if "total_amount" in self._config_edits:
+            self._config_edits["size_unit"] = config.size_unit.value
+
+    def _edit_field_view(self, config: RangeIcebergExecutorConfig, key: str):
+        if key == "total_amount":
+            return self._stable_decimal_text(config.total_amount)
+        if key in ("price_low", "price_high"):
+            value = getattr(config, key)
+            return None if value is None else self._stable_decimal_text(value)
+        return self._exit_config_view(getattr(config, key))
+
+    def _config_edits_view(self) -> dict:
+        edits = dict(self._config_edits)
+        config = self._queued_config
+        if config is None:
+            return edits
+        for key in self._queued_edit_keys:
+            if key in self._EDITABLE_CONFIG_FIELDS:
+                edits[key] = self._edit_field_view(config, key)
+        if "total_amount" in self._queued_edit_keys:
+            edits["size_unit"] = config.size_unit.value
+        return edits
+
+    def _stable_decimal_text(self, value) -> str:
+        if isinstance(value, str) and any(character.isalpha() for character in value):
+            return value.strip()
+        number = Decimal(str(value))
+        text = format(number, "f")
+        if "." in text:
+            text = text.rstrip("0").rstrip(".")
+        if text in ("", "-0"):
+            return "0"
+        return text
 
     def _config_edit_signature(self, config: RangeIcebergExecutorConfig):
         return (
@@ -1133,6 +1364,7 @@ class RangeIcebergExecutor(ExecutorBase):
         Ask the exchange to cancel working orders, then stay up until those cancels
         are confirmed. A stop that returns while the orders are still open hides the failure.
         """
+        self._drop_queued_config_edit()
         self._shutdown_pending = True
         self._cancel_working_orders()
         pending = self._unconfirmed_cancel_ids()
@@ -2593,10 +2825,14 @@ class RangeIcebergExecutor(ExecutorBase):
             "filled_base": str(self.filled_base),
             "filled_quote": str(self.filled_amount_quote),
             "total_base": str(self.total_base),
-            "target_amount": str(self._reporting_config().total_amount),
-            "total_amount": str(self._reporting_config().total_amount),
-            "price_low": None if self._reporting_config().price_low is None else str(self._reporting_config().price_low),
-            "price_high": None if self._reporting_config().price_high is None else str(self._reporting_config().price_high),
+            "target_amount": self._stable_decimal_text(self._reporting_config().total_amount),
+            "total_amount": self._stable_decimal_text(self._reporting_config().total_amount),
+            "price_low": None if self._reporting_config().price_low is None else self._stable_decimal_text(self._reporting_config().price_low),
+            "price_high": None if self._reporting_config().price_high is None else self._stable_decimal_text(self._reporting_config().price_high),
+            "config_edits": self._config_edits_view(),
+            "pending_config_edit": self._queued_config is not None,
+            "last_config_edit_applied_at": self._last_config_edit_applied_at,
+            "config_edit_error": self._config_edit_error,
             "filled_amount": str(self._filled_unit()),
             "unfilled_amount": str(self._unfilled_amount()),
             "skipped_amount": str(self._skipped_amount()),
@@ -5257,16 +5493,16 @@ class RangeIcebergExecutor(ExecutorBase):
         if cfg is None:
             return None
         return {
-            "percent": None if cfg.percent is None else str(cfg.percent),
-            "price": None if cfg.price is None else str(cfg.price),
+            "percent": None if cfg.percent is None else self._stable_decimal_text(cfg.percent),
+            "price": None if cfg.price is None else self._stable_decimal_text(cfg.price),
             "execution": cfg.execution.value,
             "order_type": None if cfg.order_type is None else cfg.order_type.value,
             "slices": cfg.slices,
             "visible_count": cfg.visible_count,
-            "interval": None if cfg.interval is None else str(cfg.interval),
-            "limit_price": None if cfg.limit_price is None else str(cfg.limit_price),
-            "price_low": None if cfg.price_low is None else str(cfg.price_low),
-            "price_high": None if cfg.price_high is None else str(cfg.price_high),
+            "interval": None if cfg.interval is None else self._stable_decimal_text(cfg.interval),
+            "limit_price": None if cfg.limit_price is None else self._stable_decimal_text(cfg.limit_price),
+            "price_low": None if cfg.price_low is None else self._stable_decimal_text(cfg.price_low),
+            "price_high": None if cfg.price_high is None else self._stable_decimal_text(cfg.price_high),
         }
 
     def _exit_snapshot(self) -> dict:
@@ -5314,7 +5550,7 @@ class RangeIcebergExecutor(ExecutorBase):
         raw = custom_info.get("open_base")
         if raw in (None, ""):
             raw = blob.get("open_base")
-        if raw in (None, ""):
+        if raw in (None, "") and "config_edits" not in custom_info:
             size_unit = str(custom_info.get("size_unit") or blob.get("size_unit") or "").upper()
             total = custom_info.get("total_amount", blob.get("total_amount"))
             if size_unit == "BASE" and total not in (None, ""):
