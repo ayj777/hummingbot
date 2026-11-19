@@ -4386,19 +4386,22 @@ class RangeIcebergExitTests(IsolatedAsyncioWrapperTestCase):
     def test_flat_read_during_a_sibling_exit_does_not_end_the_others(self):
         executors, _state = self._arm_tiers()
         self._register_executors(*executors)
+        executors[0].stop()
         executors[0]._exit_last_fill_at = self.now
+        self.assertEqual(RunnableStatus.TERMINATED, executors[0].status)
         self._install_position_source({"amount": None})
+        others = executors[1:]
         self.now += 4
-        for executor in executors:
+        for executor in others:
             self._run(executor.control_task())
             self.assertFalse(executor.get_custom_info()["external_close"])
         self.now += 4
-        for executor in executors:
+        for executor in others:
             self._run(executor.control_task())
             self.assertFalse(executor.get_custom_info()["external_close"])
             self.assertEqual(RunnableStatus.RUNNING, executor.status)
         self.now += 4
-        for executor in executors:
+        for executor in others:
             self._run(executor.control_task())
             self.assertEqual(CloseType.POSITION_CLOSED_EXTERNALLY, executor.close_type)
 
@@ -4492,3 +4495,19 @@ class RangeIcebergExitTests(IsolatedAsyncioWrapperTestCase):
         self.assertIn("closable quantity", second.get_custom_info()["exchange_stop_error"])
         self.assertEqual(Decimal("100"), state["stops"]["stop-1"]["amount"])
         self.assertEqual(1, len(self._open_limit_closes()))
+
+    def test_two_snapshots_restored_before_register_keep_one_stop(self):
+        executors, state = self._arm_tiers()
+        snapshot = executors[0].get_custom_info()
+        self.strategy.executor_orchestrator = SimpleNamespace(active_executors={"main": []})
+        copies = [self._executor(**self._tier_specs()[0]) for _ in range(2)]
+        for copy in copies:
+            copy.restore_from_custom_info(snapshot)
+            self.assertEqual("stop-1", copy.get_custom_info()["exchange_stop_order_id"])
+        self._register_executors(*copies)
+        placed = len(state["placed"])
+        self._run(copies[0].control_task())
+        self._run(copies[1].control_task())
+        owners = [copy.get_custom_info()["exchange_stop_order_id"] for copy in copies]
+        self.assertEqual(["stop-1"], [owner for owner in owners if owner])
+        self.assertEqual(placed, len(state["placed"]))

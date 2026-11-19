@@ -726,6 +726,7 @@ class RangeIcebergExecutor(ExecutorBase):
             return
         if not self._side_guard_checked and self._reject_duplicate_side():
             return
+        self._drop_stop_ids_claimed_by_peers(keep_lower_id=True)
         self._apply_queued_config_edit()
         if self._clear_exchange_stop:
             self.logger().info("Clearing stop_loss. Cancelling the protective exchange stop.")
@@ -1875,18 +1876,26 @@ class RangeIcebergExecutor(ExecutorBase):
         """
         slot = self._side_slot()
         for peer in self._range_iceberg_peers():
-            if peer._side_slot() != slot or peer.status == RunnableStatus.TERMINATED:
+            if peer._side_slot() != slot:
                 continue
             if peer._exit_fill_grace_active():
                 return True
         return False
 
-    def _drop_stop_ids_claimed_by_peers(self) -> None:
-        """A restored snapshot must not adopt a stop id another tier already holds."""
+    def _drop_stop_ids_claimed_by_peers(self, keep_lower_id: bool = False) -> None:
+        """
+        A restored snapshot must not adopt a stop id another tier already holds.
+
+        keep_lower_id is for a later tick, when two tiers were restored before
+        either one was registered. The lower id keeps the stop. The other drops
+        it and will not place over that trigger.
+        """
         claimed = set()
         slot = self._side_slot()
         for peer in self._range_iceberg_peers():
             if peer._side_slot() != slot:
+                continue
+            if keep_lower_id and id(peer) > id(self):
                 continue
             claimed.update(peer._exchange_stop_order_ids())
         if not claimed:
