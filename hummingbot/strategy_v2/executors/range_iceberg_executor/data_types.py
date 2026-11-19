@@ -297,10 +297,14 @@ class RangeIcebergExecutorConfig(ExecutorConfigBase):
     resumed stop-loss close does not place a new stop. Every id is listed in
     exchange_stop_order_ids. Resuming from custom_info restores an exit_state
     of ARMED, RESTING, or CLOSING, re-posts a missing exit from open_base,
-    and keeps the saved exchange stop ids. Only one range iceberg may be
-    open on the same account, connector, pair, and position side. An open
-    executor is edited in place with update_config (total amount, price range,
-    take profit, and stop loss) instead of opening a second one. Those edits
+    and keeps the saved exchange stop ids. Several range icebergs may share
+    one account, connector, pair, and position side. The API enforces how
+    many. group_id is an optional label. sibling_base is the live size this
+    iceberg must leave for the others, and the API refreshes it with
+    set_sibling_base. The API pauses entry orders on the shallower tiers
+    with set_entry_paused. That pause does not stop the schedule clock, the
+    take profit, or the stop. An open executor is edited in place with update_config
+    (total amount, price range, take profit, and stop loss). Those edits
     are stored on custom_info config_edits, in the executor's own size unit,
     and resume applies that object only. The reported total_amount, price_low,
     price_high, take_profit, and stop_loss are the live values and are not
@@ -368,6 +372,28 @@ class RangeIcebergExecutorConfig(ExecutorConfigBase):
     protective_stop_buffer_pct: Decimal = Decimal("0.005")
     stop_loss_fallback_seconds: float = 30
     exchange_stop_hold_seconds: float = 5
+    group_id: Optional[str] = None
+    sibling_base: Optional[Decimal] = None
+
+    @field_validator("group_id", mode="before")
+    @classmethod
+    def parse_group_id(cls, value):
+        if value is None:
+            return None
+        if not isinstance(value, str):
+            raise ValueError("group_id must be a string")
+        text = value.strip()
+        return text or None
+
+    @field_validator("sibling_base", mode="before")
+    @classmethod
+    def parse_sibling_base(cls, value):
+        if value is None or value == "":
+            return None
+        amount = Decimal(str(value))
+        if amount < 0:
+            raise ValueError("sibling_base must be greater than or equal to 0")
+        return amount
 
     @field_validator("side", mode="before")
     @classmethod
