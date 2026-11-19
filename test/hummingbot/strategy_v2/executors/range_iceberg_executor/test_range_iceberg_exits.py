@@ -2931,3 +2931,181 @@ class RangeIcebergExitTests(IsolatedAsyncioWrapperTestCase):
         self.assertEqual("stop-1", executor.get_custom_info()["exchange_stop_order_id"])
         self.assertEqual(1, len(state["placed"]))
         self.assertNotIn("stop-short", state["cancelled"])
+
+    def test_update_config_grows_the_total_and_schedules_another_slice(self):
+        executor = self._executor(levels=2, total_amount=Decimal("100"))
+        self._run(executor.control_task())
+        self.assertEqual(Decimal("50"), self.buy_ids[-1][1])
+        result = executor.update_config({"total_amount": "200"})
+        self.assertEqual({"accepted": True, "reason": ""}, result)
+        self.assertEqual("200", executor.get_custom_info()["total_amount"])
+        self._run(executor.control_task())
+        self.assertEqual(Decimal("200"), executor.config.total_amount)
+        placed = [
+            amount for _order_id, amount, _price, _order_type, action in self.buy_ids
+            if action == PositionAction.OPEN
+        ]
+        self.assertGreater(sum(placed), Decimal("50"))
+        self.assertEqual(Decimal("200"), sum(slot.target_amount for slot in executor._slices))
+
+    def test_update_config_shrinks_an_unfilled_slice(self):
+        executor = self._executor(total_amount=Decimal("100"))
+        self._run(executor.control_task())
+        self.assertEqual(Decimal("100"), self.buy_ids[-1][1])
+        result = executor.update_config({"total_amount": "40"})
+        self.assertTrue(result["accepted"])
+        self._run(executor.control_task())
+        order_id = self.buy_ids[0][0]
+        self.orders[order_id].current_state = OrderState.CANCELED
+        self._run(executor.control_task())
+        self.assertEqual(Decimal("40"), executor.config.total_amount)
+        self.assertEqual(Decimal("40"), self.buy_ids[-1][1])
+        self.assertGreaterEqual(self.strategy.cancel.call_count, 1)
+
+    def test_update_config_rejects_a_shrink_below_the_fill(self):
+        executor = self._executor()
+        self._open_entry(executor)
+        result = executor.update_config({"total_amount": "50"})
+        self.assertFalse(result["accepted"])
+        self.assertIn("below the filled amount", result["reason"])
+        self.assertEqual(Decimal("100"), executor.config.total_amount)
+        self.assertEqual(0, self.strategy.cancel.call_count)
+
+    def test_update_config_reprices_a_slice_outside_the_new_range(self):
+        executor = self._executor()
+        self._run(executor.control_task())
+        self.assertEqual(Decimal("0.08"), self.buy_ids[-1][2])
+        result = executor.update_config({"price_low": "0.091", "price_high": "0.10"})
+        self.assertTrue(result["accepted"], result)
+        self._run(executor.control_task())
+        self.orders[self.buy_ids[0][0]].current_state = OrderState.CANCELED
+        self._run(executor.control_task())
+        self.assertEqual(Decimal("0.091"), executor.config.price_low)
+        self.assertEqual(Decimal("0.10"), executor.config.price_high)
+        self.assertEqual(Decimal("0.091"), self.buy_ids[-1][2])
+        self.assertGreaterEqual(self.strategy.cancel.call_count, 1)
+
+    def test_update_config_reprices_one_slice_per_rate_limit_window(self):
+        executor = self._executor(levels=2, min_order_interval=2)
+        self._run(executor.control_task())
+        self.now += 2
+        self._run(executor.control_task())
+        self.assertEqual(2, len(self.buy_ids))
+        self.now += 2
+        result = executor.update_config({"price_low": "0.11", "price_high": "0.12"})
+        self.assertTrue(result["accepted"], result)
+        self._run(executor.control_task())
+        self.assertEqual(1, self.strategy.cancel.call_count)
+        self._run(executor.control_task())
+        self.assertEqual(1, self.strategy.cancel.call_count)
+        self.now += 2
+        self._run(executor.control_task())
+        self.assertEqual(2, self.strategy.cancel.call_count)
+
+    def test_update_config_reprices_the_take_profit_and_the_exchange_stop(self):
+        state = self._install_mexc_stop_book()
+        changes = []
+
+        async def change_price(order_id, stop_loss_price=None, **kwargs):
+            price = Decimal(str(stop_loss_price))
+            changes.append((str(order_id), price))
+            if order_id in state["stops"]:
+                state["stops"][order_id]["price"] = price
+            return {"success": True}
+
+        self.connector.change_stop_plan_price = change_price
+        executor = self._executor(
+            take_profit={"percent": "0.10", "execution": "SINGLE", "order_type": "LIMIT"},
+            stop_loss={"price": "0.07", "execution": "SINGLE"},
+        )
+        _order_id, _base, price = self._open_entry(executor)
+        self._run(executor.control_task())
+        self.assertEqual("stop-1", executor.get_custom_info()["exchange_stop_order_id"])
+        result = executor.update_config({
+            "take_profit": {"percent": "0.20", "execution": "SINGLE", "order_type": "LIMIT"},
+            "stop_loss": {"price": "0.06", "execution": "SINGLE"},
+        })
+        self.assertTrue(result["accepted"], result)
+        self._run(executor.control_task())
+        self.assertEqual([("stop-1", Decimal("0.0597"))], changes)
+        self.assertEqual(Decimal("0.0597"), Decimal(executor.get_custom_info()["exchange_stop_trigger_price"]))
+        self.assertEqual([], state["cancelled"])
+        self.assertEqual("stop-1", executor.get_custom_info()["exchange_stop_order_id"])
+        closes = [call for call in self._close_calls() if call[1][3] == OrderType.LIMIT]
+        self.assertEqual(price * Decimal("1.20"), closes[-1][1][4])
+
+    def test_update_config_rejects_an_edit_while_the_stop_loss_is_closing(self):
+        self._mid(Decimal("0.085"))
+        executor = self._executor(stop_loss={"price": "0.07", "execution": "SINGLE"})
+        self._open_entry(executor)
+        self._mid(Decimal("0.06"))
+        self._run(executor.control_task())
+        self.assertIn(executor.get_custom_info()["exit_state"], ("TRIGGERED", "CLOSING"))
+        result = executor.update_config({"total_amount": "150"})
+        self.assertFalse(result["accepted"])
+        self.assertEqual("a stop loss close is in progress", result["reason"])
+        self.assertEqual(Decimal("100"), executor.config.total_amount)
+
+    def test_update_config_rejects_a_stop_on_the_wrong_side_of_the_range(self):
+        executor = self._executor()
+        result = executor.update_config({
+            "stop_loss": {"price": "0.085", "execution": "SINGLE"},
+            "take_profit": {"price": "0.07", "execution": "SINGLE"},
+        })
+        self.assertFalse(result["accepted"])
+        self.assertTrue(result["reason"])
+        self.assertIsNone(executor.config.stop_loss)
+        self.assertIsNone(executor.config.take_profit)
+
+    def test_update_config_is_restored_from_custom_info(self):
+        executor = self._executor(
+            take_profit={"percent": "0.10", "execution": "SINGLE", "order_type": "LIMIT"},
+            stop_loss={"price": "0.07", "execution": "SINGLE"},
+        )
+        self._open_entry(executor)
+        result = executor.update_config({
+            "total_amount": "150",
+            "price_low": "0.07",
+            "price_high": "0.11",
+            "take_profit": {"percent": "0.20", "execution": "SINGLE", "order_type": "LIMIT"},
+            "stop_loss": {"price": "0.05", "execution": "SINGLE"},
+        })
+        self.assertTrue(result["accepted"], result)
+        self._run(executor.control_task())
+        info = executor.get_custom_info()
+        self.assertEqual("150", info["total_amount"])
+        self.assertEqual("0.07", info["price_low"])
+        self.assertEqual("0.11", info["price_high"])
+        self.assertEqual("0.20", info["take_profit"]["percent"])
+        self.assertEqual("0.05", info["stop_loss"]["price"])
+        resumed = self._executor()
+        resumed.restore_from_custom_info(info)
+        self.assertEqual(Decimal("150"), resumed.config.total_amount)
+        self.assertEqual(Decimal("0.07"), resumed.config.price_low)
+        self.assertEqual(Decimal("0.11"), resumed.config.price_high)
+        self.assertEqual(Decimal("0.20"), resumed.config.take_profit.percent)
+        self.assertEqual(Decimal("0.05"), resumed.config.stop_loss.price)
+        self.assertEqual("150", resumed.get_custom_info()["total_amount"])
+
+    def test_update_config_does_not_open_a_second_executor_on_the_side(self):
+        first = self._executor()
+        second = self._executor()
+        self._register_executors(first, second)
+        result = first.update_config({"total_amount": "120"})
+        self.assertTrue(result["accepted"])
+        before = len(self.buy_ids)
+        second.start()
+        self.assertEqual(RunnableStatus.TERMINATED, second.status)
+        self.assertEqual(CloseType.FAILED, second.close_type)
+        self.assertEqual(
+            "another range iceberg is already open on AIOT-USDT LONG",
+            second.get_custom_info()["side_guard_error"],
+        )
+        self.assertEqual(before, len(self.buy_ids))
+
+    def test_update_config_rejects_a_parked_position_hold(self):
+        executor = self._executor()
+        executor.early_stop(keep_position=True)
+        result = executor.update_config({"total_amount": "120"})
+        self.assertFalse(result["accepted"])
+        self.assertEqual("a parked position hold cannot be edited", result["reason"])

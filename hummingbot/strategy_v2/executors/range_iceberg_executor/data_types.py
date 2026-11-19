@@ -298,7 +298,9 @@ class RangeIcebergExecutorConfig(ExecutorConfigBase):
     exchange_stop_order_ids. Resuming from custom_info restores an exit_state
     of ARMED, RESTING, or CLOSING, re-posts a missing exit from open_base,
     and keeps the saved exchange stop ids. Only one range iceberg may be
-    open on the same account, connector, pair, and position side. resume_entries false
+    open on the same account, connector, pair, and position side. An open
+    executor is edited in place with update_config (total amount, price range,
+    take profit, and stop loss) instead of opening a second one. resume_entries false
     places no entry orders and sizes the restored open amount in base, even
     when the saved config used quote.
 
