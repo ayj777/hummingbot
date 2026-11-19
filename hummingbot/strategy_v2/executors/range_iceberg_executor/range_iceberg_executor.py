@@ -818,9 +818,15 @@ class RangeIcebergExecutor(ExecutorBase):
             if self._exit_phase in ("cancelling_entry", "executing", "done", "armed"):
                 await self._sync_exchange_stop()
                 return
-            if self._entry_clock_handled or self._execution_complete():
+            if self._exit_may_arm():
                 await self._sync_exchange_stop()
                 return
+        if self._legacy_entries_halted and self._needs_exit_after_entry():
+            if self._exit_phase == "idle":
+                self._exit_phase = "armed"
+            await self._control_exit()
+            await self._sync_exchange_stop()
+            return
         if self._execution_complete():
             if self._needs_exit_after_entry():
                 self._exit_phase = "armed"
@@ -835,7 +841,7 @@ class RangeIcebergExecutor(ExecutorBase):
                 await self._sync_exchange_stop()
                 return
         await self._sync_exchange_stop()
-        if self._entry_paused:
+        if self._legacy_entries_halted or self._entry_paused:
             self._cancel_entry_orders_for_exit()
             return
         if self._entries_frozen or not self._resume_entries:
@@ -1875,8 +1881,10 @@ class RangeIcebergExecutor(ExecutorBase):
         Resume keeps the unspent size and places one normal iceberg slot per
         tick, never more working children than visible_count. entry_paused
         and pause_reason are restored from custom_info. A snapshot that omits
-        them stays unpaused.
+        them stays unpaused. A legacy snapshot halt is not cleared here.
         """
+        if not paused and self._legacy_entries_halted:
+            return
         now = float(self._strategy.current_timestamp)
         if paused and not self._entry_paused:
             self._entry_pause_started = now
@@ -2534,6 +2542,19 @@ class RangeIcebergExecutor(ExecutorBase):
         if leftover <= 0:
             return self._filled_unit() > 0 or self._skipped_amount() >= self.config.total_amount
         return self._unit_to_base(leftover, self.config.limit_price) < Decimal(str(rules.min_order_size))
+
+    def _exit_may_arm(self) -> bool:
+        """
+        True when the filled size may be protected.
+
+        The entry is finished, its clock has ended, or entries are halted
+        and will not be placed again.
+        """
+        return (
+            self._execution_complete()
+            or self._entry_clock_handled
+            or self._legacy_entries_halted
+        )
 
     def _all_slices_filled(self) -> bool:
         if not self._slices:
@@ -3395,8 +3416,8 @@ class RangeIcebergExecutor(ExecutorBase):
             return self._cap_block_reason
         if self._exit_error:
             return self._exit_error
-        if self._entry_pause_reason == "legacy_snapshot_entries_halted":
-            return self._entry_pause_reason
+        if self._legacy_entries_halted:
+            return "legacy_snapshot_entries_halted"
         return ""
 
     def to_format_status(self):
@@ -3799,6 +3820,7 @@ class RangeIcebergExecutor(ExecutorBase):
             "sibling_base": None if self._sibling_base is None else str(self._sibling_base),
             "entry_paused": self._entry_paused,
             "pause_reason": self._entry_pause_reason,
+            "legacy_entries_halted": self._legacy_entries_halted,
             "exit_error": self._exit_error,
             "exit_status": self._exit_phase,
             "exit_active": self._exit_active,
@@ -3957,7 +3979,7 @@ class RangeIcebergExecutor(ExecutorBase):
         if self._take_profit_price_is_adverse():
             return False
         if self.config.exit_arming == ExitArming.ON_FULL_FILL:
-            return self._execution_complete() or self._entry_clock_handled or self._exit_phase in (
+            return self._exit_may_arm() or self._exit_phase in (
                 "armed",
                 "resting",
                 "executing",
@@ -4197,7 +4219,7 @@ class RangeIcebergExecutor(ExecutorBase):
             await self._execute_exit()
             return
         if kind is None:
-            if (self._execution_complete() or self._entry_clock_handled) and self._exit_phase == "idle":
+            if self._exit_may_arm() and self._exit_phase == "idle":
                 self._exit_phase = "armed"
             return
 
@@ -5211,8 +5233,8 @@ class RangeIcebergExecutor(ExecutorBase):
         icebergs still claim. That cap sticks until the next hint, so a
         later drop is not taken from this iceberg. Without a successful
         read, the own net fill is used. A legacy snapshot with saved orders
-        uses the live read, capped to this executor, and never below the
-        saved total.
+        closes no more than its recorded size, and no more than the live
+        position or a sibling hint when that is smaller.
         """
         if self._legacy_entries_halted:
             return self._legacy_exit_base()
@@ -5237,24 +5259,25 @@ class RangeIcebergExecutor(ExecutorBase):
         """
         Exit size for a legacy snapshot whose orders cannot be attributed.
 
-        The live position is capped to this executor. It is never below the
-        saved total. Until a read succeeds, the saved total is the size.
+        The close is the recorded size. A live position or a sibling hint
+        can only make it smaller. Until a read succeeds, the recorded size
+        is the close.
         """
         saved = self._accounted_fill_by_order.get("restored-entry", Decimal("0"))
         saved -= self._exit_filled_base()
         if saved < 0:
             saved = Decimal("0")
-        if not self._position_sync_ok or self._live_position_base is None:
-            return saved
-        live = self._live_position_base
-        if live < 0:
-            live = Decimal("0")
-        cap = self._target_base()
-        if self._hinted_close_base is not None:
-            cap = self._hinted_close_base if cap <= 0 else min(cap, self._hinted_close_base)
-        size = Decimal("0") if cap <= 0 else min(live, cap)
-        if size < saved:
-            return saved
+        size = saved
+        if self._position_sync_ok and self._live_position_base is not None:
+            live = self._live_position_base
+            if live < 0:
+                live = Decimal("0")
+            if live < size:
+                size = live
+        if self._hinted_close_base is not None and self._hinted_close_base < size:
+            size = self._hinted_close_base
+            if size < 0:
+                size = Decimal("0")
         return size
 
     async def _reconcile_exchange_state(self) -> str:
@@ -5551,7 +5574,7 @@ class RangeIcebergExecutor(ExecutorBase):
             return ExitState.ARMED
         if not self._exits_configured() or self.filled_base <= 0:
             return ExitState.NONE
-        if self.config.exit_arming == ExitArming.ON_ANY_FILL or self._execution_complete() or self._entry_clock_handled:
+        if self.config.exit_arming == ExitArming.ON_ANY_FILL or self._exit_may_arm():
             return ExitState.ARMED
         return ExitState.NONE
 
@@ -5582,10 +5605,11 @@ class RangeIcebergExecutor(ExecutorBase):
             return False
         if self.config.exit_arming == ExitArming.ON_ANY_FILL:
             return True
-        return (
-            self._execution_complete()
-            or self._entry_clock_handled
-            or self._exit_phase in ("armed", "resting", "cancelling_entry", "executing")
+        return self._exit_may_arm() or self._exit_phase in (
+            "armed",
+            "resting",
+            "cancelling_entry",
+            "executing",
         )
 
     def _exchange_position_id(self):
@@ -6903,10 +6927,13 @@ class RangeIcebergExecutor(ExecutorBase):
         A snapshot that records executed size keeps max(snapshot, live) on that
         order. An older snapshot with a saved entry order cannot say which
         order a fill belongs to, so it places no new entries and says
-        legacy_snapshot_entries_halted. Exits keep running off the live
-        position. A saved id the tracker does not have is queried, then backed
-        off and paused like any other unknown order.
+        legacy_snapshot_entries_halted. That halt stays until a new executor
+        starts. The close is the recorded size, and no larger than the live
+        position or a sibling hint. A saved id the tracker does not have is
+        queried, then backed off and paused like any other unknown order.
         """
+        if isinstance(info, dict) and info.get("legacy_entries_halted"):
+            self._legacy_entries_halted = True
         if not self._resume_entries or self._schedule is None or not isinstance(info, dict):
             return
         levels = info.get("levels")
@@ -6928,8 +6955,9 @@ class RangeIcebergExecutor(ExecutorBase):
                 legacy = True
                 continue
             self._remember_snapshotted_fill(str(order_id), level)
-        self._legacy_entries_halted = legacy and has_saved_order
-        if not legacy:
+        if legacy and has_saved_order:
+            self._legacy_entries_halted = True
+        if not legacy and not self._legacy_entries_halted:
             self._keep_snapshot_fills_on_their_orders()
         for index, level in enumerate(levels):
             if not isinstance(level, dict):

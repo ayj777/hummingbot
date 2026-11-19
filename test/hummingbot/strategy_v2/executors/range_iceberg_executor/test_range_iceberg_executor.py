@@ -1729,6 +1729,9 @@ class RangeIcebergExecutorTests(IsolatedAsyncioWrapperTestCase):
         self.assertEqual(Decimal("2500"), self.buy_ids[1][1])
         self.assertLessEqual(self.buy_ids[1][2], Decimal("0.09"))
 
+    def _entry_orders(self):
+        return [row for row in self.buy_ids if row[4] == PositionAction.OPEN]
+
     def _fine_step(self):
         self.connector.trading_rules["AIOT-USDT"] = TradingRule(
             trading_pair="AIOT-USDT",
@@ -2178,7 +2181,7 @@ class RangeIcebergExecutorTests(IsolatedAsyncioWrapperTestCase):
         self.assertEqual(Decimal("25"), resumed._managed_base())
         self.assertIsNotNone(report["take_profit_trigger_price"])
         self.assertIsNotNone(report["stop_loss_trigger_price"])
-        self.assertEqual(1, len(self.buy_ids))
+        self.assertEqual(1, len(self._entry_orders()))
 
     def test_a_legacy_snapshot_does_not_buy_the_other_saved_rung_again(self):
         self._fine_step()
@@ -2239,7 +2242,7 @@ class RangeIcebergExecutorTests(IsolatedAsyncioWrapperTestCase):
         resumed.restore_from_custom_info(payload["custom_info"])
         self._run(resumed.control_task())
         report = resumed.get_custom_info()
-        self.assertEqual(2, len(self.buy_ids))
+        self.assertEqual(2, len(self._entry_orders()))
         self.assertTrue(report["entry_paused"])
         self.assertIn("legacy_snapshot_entries_halted", report["status_reason"])
         self.assertEqual(Decimal("25"), resumed._managed_base())
@@ -2247,8 +2250,118 @@ class RangeIcebergExecutorTests(IsolatedAsyncioWrapperTestCase):
         held["amount"] = Decimal("50")
         self.now += 4
         self._run(resumed.control_task())
-        self.assertEqual(2, len(self.buy_ids))
-        self.assertEqual(Decimal("50"), resumed._managed_base())
+        self.assertEqual(2, len(self._entry_orders()))
+        self.assertEqual(Decimal("25"), resumed._managed_base())
+
+    def _legacy_saved_rung(self, live_amount):
+        self._fine_step()
+        self._book(Decimal("0.08000"), Decimal("0.08010"))
+        exits = dict(
+            take_profit=RangeIcebergExitConfig(percent=Decimal("0.02")),
+            stop_loss=RangeIcebergExitConfig(percent=Decimal("0.02")),
+        )
+        kwargs = dict(
+            size_unit=SizeUnit.BASE,
+            total_amount=Decimal("100"),
+            levels=4,
+            iceberg=False,
+            visible_count=4,
+            schedule_interval=25,
+            schedule_slices=2,
+            duration=None,
+            schedule_start=ScheduleStart.SUBMIT,
+            **exits,
+        )
+        executor = self._executor(**kwargs)
+        self._run(executor.control_task())
+        self._run(executor.control_task())
+        self._fill("buy-2", Decimal("25"))
+        payload = json.loads(executor.executor_info.model_dump_json())
+        for level in payload["custom_info"]["levels"]:
+            level.pop("executed_base", None)
+            level.pop("executed_quote", None)
+        self.orders.pop("buy-2")
+        held = {"amount": live_amount}
+
+        async def resolve(trading_pair, client_order_id, exchange_order_id=None):
+            return "confirmed_absent"
+
+        async def update():
+            self.connector.account_positions = {
+                "long": SimpleNamespace(
+                    trading_pair="AIOT-USDT",
+                    position_side=PositionSide.LONG,
+                    amount=held["amount"],
+                ),
+            }
+
+        self.connector.resolve_unknown_order = resolve
+        self.connector._update_positions = update
+        resumed = self._executor(**kwargs)
+        resumed.restore_from_custom_info(payload["custom_info"])
+        return resumed, held
+
+    def test_a_legacy_halt_does_not_close_a_sibling_long(self):
+        resumed, held = self._legacy_saved_rung(Decimal("75"))
+        self._run(resumed.control_task())
+        self.assertEqual(Decimal("25"), resumed._managed_base())
+        resumed.set_sibling_base(Decimal("50"))
+        self.now += 4
+        self._run(resumed.control_task())
+        self.assertEqual(Decimal("25"), resumed._managed_base())
+        held["amount"] = Decimal("40")
+        resumed.set_sibling_base(Decimal("30"))
+        self.now += 4
+        self._run(resumed.control_task())
+        self.assertEqual(Decimal("10"), resumed._managed_base())
+        held["amount"] = Decimal("10")
+        resumed.set_sibling_base(None)
+        self.now += 4
+        self._run(resumed.control_task())
+        self.assertEqual(Decimal("10"), resumed._managed_base())
+        self.assertEqual(2, len(self._entry_orders()))
+
+    def test_a_legacy_halt_arms_the_stop_on_a_partial_fill(self):
+        resumed, _held = self._legacy_saved_rung(Decimal("75"))
+        self._book(Decimal("0.07"), Decimal("0.07"))
+        self._run(resumed.control_task())
+        closes = [row for row in self.buy_ids if row[4] == PositionAction.CLOSE]
+        self.assertEqual(1, len(closes))
+        self.assertEqual(Decimal("25"), closes[0][1])
+        self.assertEqual(2, len(self._entry_orders()))
+
+    def test_resuming_entries_does_not_clear_a_legacy_halt(self):
+        resumed, _held = self._legacy_saved_rung(Decimal("25"))
+        self._run(resumed.control_task())
+        self.orders["buy-1"].current_state = OrderState.CANCELED
+        resumed.set_entry_paused(False)
+        self._run(resumed.control_task())
+        report = resumed.get_custom_info()
+        self.assertTrue(report["legacy_entries_halted"])
+        self.assertIn("legacy_snapshot_entries_halted", report["status_reason"])
+        self.assertEqual(2, len(self._entry_orders()))
+        payload = json.loads(resumed.executor_info.model_dump_json())
+        self.assertTrue(payload["custom_info"]["legacy_entries_halted"])
+        for level in payload["custom_info"]["levels"]:
+            self.assertIn("executed_base", level)
+        again = self._executor(
+            size_unit=SizeUnit.BASE,
+            total_amount=Decimal("100"),
+            levels=4,
+            iceberg=False,
+            visible_count=4,
+            schedule_interval=25,
+            schedule_slices=2,
+            duration=None,
+            schedule_start=ScheduleStart.SUBMIT,
+            take_profit=RangeIcebergExitConfig(percent=Decimal("0.02")),
+            stop_loss=RangeIcebergExitConfig(percent=Decimal("0.02")),
+        )
+        again.restore_from_custom_info(payload["custom_info"])
+        again.set_entry_paused(False)
+        self._run(again.control_task())
+        self.assertTrue(again.get_custom_info()["legacy_entries_halted"])
+        self.assertEqual(2, len(self._entry_orders()))
 
     def test_range_rungs_release_from_the_anchor(self):
         executor = self._executor(
