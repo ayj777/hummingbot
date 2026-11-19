@@ -3659,12 +3659,22 @@ class RangeIcebergExecutor(ExecutorBase):
                 order_ids.add(slot.order_id)
         base = Decimal("0")
         quote = Decimal("0")
+        saved_base = Decimal("0")
+        saved_quote = Decimal("0")
         for order_id in order_ids:
             if self._is_exit_order(order_id):
                 continue
             part_base, part_quote = self._best_fill(order_id)
+            # A snapshot with no per-order size keeps one aggregate. The fill is
+            # the larger of that aggregate and the live sizes, never the sum.
+            if self._legacy_entry_snapshot and order_id == "restored-entry":
+                saved_base = part_base
+                saved_quote = part_quote
+                continue
             base += part_base
             quote += part_quote
+        if self._legacy_entry_snapshot and saved_base >= base:
+            return saved_base, saved_quote
         return base, quote
 
     @property
@@ -6865,10 +6875,12 @@ class RangeIcebergExecutor(ExecutorBase):
         Saved entry orders stay unresolved until their state and size are known.
 
         A snapshot that records executed size keeps max(snapshot, live) on that
-        order. An older snapshot has no per-order size, so only the live size
-        counts, and a saved order that is still open blocks new entries. A saved
-        id the tracker does not have is queried, then backed off and paused like
-        any other unknown order.
+        order. An older snapshot has no per-order size. Its fill is the larger
+        of the saved total and the live executed sizes, never the sum, and never
+        below the saved total. The position and the managed size use that fill,
+        so the take profit and the stop cover it. A saved id the tracker does
+        not have is queried, then backed off and paused like any other unknown
+        order.
         """
         if not self._resume_entries or self._schedule is None or not isinstance(info, dict):
             return
@@ -6890,12 +6902,7 @@ class RangeIcebergExecutor(ExecutorBase):
                 continue
             self._remember_snapshotted_fill(str(order_id), level)
         self._legacy_entry_snapshot = legacy
-        if legacy:
-            self._accounted_fill_by_order.pop("restored-entry", None)
-            self._accounted_quote_by_order.pop("restored-entry", None)
-            self._accounted_fill_base = sum(self._accounted_fill_by_order.values(), Decimal("0"))
-            self._accounted_fill_quote = sum(self._accounted_quote_by_order.values(), Decimal("0"))
-        else:
+        if not legacy:
             self._keep_snapshot_fills_on_their_orders()
         for index, level in enumerate(levels):
             if not isinstance(level, dict):
@@ -6911,10 +6918,9 @@ class RangeIcebergExecutor(ExecutorBase):
             if index < len(self._slices) and self._slices[index].tracked is None:
                 slot = self._slices[index]
             order = self.get_in_flight_order(self.config.connector_name, text)
-            if order is None or (legacy and not order.is_done):
+            if order is None:
                 self._unresolved_entry_ids.add(text)
                 self._pending_restored_entries[text] = (level, slot)
-            if order is None:
                 continue
             self._attach_restored_entry(text, order, level, slot)
 
@@ -7032,8 +7038,6 @@ class RangeIcebergExecutor(ExecutorBase):
                     if slot is not None and slot.tracked is not None:
                         slot = None
                     self._attach_restored_entry(order_id, order, level or {}, slot)
-                if self._legacy_entry_snapshot and not order.is_done:
-                    continue
                 self._pending_restored_entries.pop(order_id, None)
                 self._unresolved_entry_ids.discard(order_id)
                 self._clear_open_retry(order_id)

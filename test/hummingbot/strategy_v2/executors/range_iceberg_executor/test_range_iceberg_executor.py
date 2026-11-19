@@ -1,6 +1,7 @@
 import json
 from decimal import Decimal
 from test.isolated_asyncio_wrapper_test_case import IsolatedAsyncioWrapperTestCase
+from types import SimpleNamespace
 from unittest.mock import MagicMock, PropertyMock
 
 from pydantic import ValidationError
@@ -17,6 +18,7 @@ from hummingbot.strategy_v2.executors.range_iceberg_executor.data_types import (
     ExecutionMode,
     LadderDistribution,
     RangeIcebergExecutorConfig,
+    RangeIcebergExitConfig,
     ScheduleStart,
     SizeUnit,
 )
@@ -2113,6 +2115,69 @@ class RangeIcebergExecutorTests(IsolatedAsyncioWrapperTestCase):
         self._run(resumed.control_task())
         self.assertEqual(Decimal("25"), resumed.filled_base)
         self.assertEqual(2, len(self.buy_ids))
+
+    def test_a_legacy_snapshot_keeps_a_fill_when_the_order_is_gone(self):
+        self._fine_step()
+        self._book(Decimal("0.08000"), Decimal("0.08010"))
+        exits = dict(
+            take_profit=RangeIcebergExitConfig(percent=Decimal("0.02")),
+            stop_loss=RangeIcebergExitConfig(percent=Decimal("0.02")),
+        )
+        executor = self._executor(
+            size_unit=SizeUnit.BASE,
+            total_amount=Decimal("100"),
+            levels=2,
+            iceberg=False,
+            visible_count=2,
+            schedule_interval=25,
+            schedule_slices=4,
+            duration=None,
+            schedule_start=ScheduleStart.SUBMIT,
+            **exits,
+        )
+        self._run(executor.control_task())
+        self._fill("buy-1", Decimal("25"))
+        payload = json.loads(executor.executor_info.model_dump_json())
+        for level in payload["custom_info"]["levels"]:
+            level.pop("executed_base", None)
+            level.pop("executed_quote", None)
+        self.orders.pop("buy-1")
+
+        async def resolve(trading_pair, client_order_id, exchange_order_id=None):
+            return "confirmed_absent"
+
+        async def update():
+            self.connector.account_positions = {
+                "long": SimpleNamespace(
+                    trading_pair="AIOT-USDT",
+                    position_side=PositionSide.LONG,
+                    amount=Decimal("25"),
+                ),
+            }
+
+        self.connector.resolve_unknown_order = resolve
+        self.connector._update_positions = update
+        resumed = self._executor(
+            size_unit=SizeUnit.BASE,
+            total_amount=Decimal("100"),
+            levels=2,
+            iceberg=False,
+            visible_count=2,
+            schedule_interval=25,
+            schedule_slices=4,
+            duration=None,
+            schedule_start=ScheduleStart.SUBMIT,
+            **exits,
+        )
+        resumed.restore_from_custom_info(payload["custom_info"])
+        self._run(resumed.control_task())
+        report = resumed.get_custom_info()
+        self.assertEqual(Decimal("25"), resumed.filled_base)
+        self.assertEqual(Decimal("25"), resumed._position_base())
+        self.assertEqual(Decimal("25"), resumed._managed_base())
+        self.assertIsNotNone(report["take_profit_trigger_price"])
+        self.assertIsNotNone(report["stop_loss_trigger_price"])
+        self.assertEqual(1, len(self.buy_ids))
 
     def test_range_rungs_release_from_the_anchor(self):
         executor = self._executor(
