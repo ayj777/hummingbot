@@ -24,6 +24,8 @@ class MexcPerpetualAPIOrderBookDataSource(PerpetualAPIOrderBookDataSource):
 
     Depth quantities are contracts. They are converted to base-asset size with the contract size
     before they enter the local order book. A quantity of 0 deletes that price level.
+    A missing contract size waits for one trading-rules update.
+    A pair that still has no size raises. The size is never guessed.
     """
 
     def __init__(
@@ -41,6 +43,7 @@ class MexcPerpetualAPIOrderBookDataSource(PerpetualAPIOrderBookDataSource):
         self._diff_output: Optional[asyncio.Queue] = None
         self._diffs_need_snapshot = False
         self._snapshot_retry_task: Optional[asyncio.Task] = None
+        self._contract_size_lock = asyncio.Lock()
 
     async def get_last_traded_prices(self, trading_pairs: List[str], domain: Optional[str] = None) -> Dict[str, float]:
         return await self._connector.get_last_traded_prices(trading_pairs=trading_pairs)
@@ -162,14 +165,26 @@ class MexcPerpetualAPIOrderBookDataSource(PerpetualAPIOrderBookDataSource):
             params={"limit": CONSTANTS.DEPTH_SNAPSHOT_LIMIT},
         )
 
+    async def _contract_size(self, trading_pair: str) -> Decimal:
+        try:
+            return self._connector.get_contract_size(trading_pair)
+        except ValueError:
+            pass
+        async with self._contract_size_lock:
+            try:
+                return self._connector.get_contract_size(trading_pair)
+            except ValueError:
+                await self._connector._update_trading_rules()
+        return self._connector.get_contract_size(trading_pair)
+
     async def _order_book_snapshot(self, trading_pair: str) -> OrderBookMessage:
         snapshot = await self._request_order_book_snapshot(trading_pair)
         data = snapshot["data"]
         symbol = await self._connector.exchange_symbol_associated_to_pair(trading_pair)
         update_id = int(data["version"])
-        self._last_depth_version[symbol] = update_id
         timestamp = int(data.get("timestamp") or 0) * 1e-3
-        contract_size = self._connector.get_contract_size(trading_pair)
+        contract_size = await self._contract_size(trading_pair)
+        self._last_depth_version[symbol] = update_id
         return OrderBookMessage(
             OrderBookMessageType.SNAPSHOT,
             {
@@ -207,11 +222,13 @@ class MexcPerpetualAPIOrderBookDataSource(PerpetualAPIOrderBookDataSource):
                 self._last_depth_version.pop(symbol, None)
                 await self._refresh_snapshot(trading_pair)
                 return
+        await self._enqueue_depth_diff(
+            trading_pair, end or 0, data, raw_message, message_queue,
+        )
         if end is not None:
             self._last_depth_version[symbol] = end
-        self._enqueue_depth_diff(trading_pair, end or 0, data, raw_message, message_queue)
 
-    def _enqueue_depth_diff(
+    async def _enqueue_depth_diff(
         self,
         trading_pair: str,
         update_id: int,
@@ -219,7 +236,7 @@ class MexcPerpetualAPIOrderBookDataSource(PerpetualAPIOrderBookDataSource):
         raw_message: Dict[str, Any],
         message_queue: asyncio.Queue,
     ):
-        contract_size = self._connector.get_contract_size(trading_pair)
+        contract_size = await self._contract_size(trading_pair)
         timestamp = int(raw_message.get("ts") or data.get("ts") or 0) * 1e-3
         message_queue.put_nowait(
             OrderBookMessage(
@@ -260,7 +277,9 @@ class MexcPerpetualAPIOrderBookDataSource(PerpetualAPIOrderBookDataSource):
                 continue
             if version > last_version + 1:
                 return False
-            self._enqueue_depth_diff(trading_pair, version, commit, commit, message_queue)
+            await self._enqueue_depth_diff(
+                trading_pair, version, commit, commit, message_queue,
+            )
             self._last_depth_version[symbol] = version
             last_version = version
             if last_version + 1 >= target_begin:
@@ -274,7 +293,7 @@ class MexcPerpetualAPIOrderBookDataSource(PerpetualAPIOrderBookDataSource):
     async def _parse_trade_message(self, raw_message: Dict[str, Any], message_queue: asyncio.Queue):
         symbol = raw_message.get("symbol")
         trading_pair = await self._connector.trading_pair_associated_to_exchange_symbol(symbol)
-        contract_size = self._connector.get_contract_size(trading_pair)
+        contract_size = await self._contract_size(trading_pair)
         trades = raw_message.get("data") or []
         if isinstance(trades, dict):
             trades = [trades]
