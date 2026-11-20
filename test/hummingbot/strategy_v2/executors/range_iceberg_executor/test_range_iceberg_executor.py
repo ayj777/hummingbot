@@ -2242,15 +2242,15 @@ class RangeIcebergExecutorTests(IsolatedAsyncioWrapperTestCase):
         report = resumed.get_custom_info()
         self.assertEqual(2, len(self._entry_orders()))
         self.assertTrue(report["entry_paused"])
-        self.assertIn("legacy_snapshot_entries_halted", report["status_reason"])
-        self.assertEqual(Decimal("25"), resumed._managed_base())
+        self.assertIn("legacy_snapshot_ambiguous_halt", report["status_reason"])
+        self.assertEqual([], [row for row in self.buy_ids if row[4] == PositionAction.CLOSE])
         self._fill("buy-1", Decimal("25"))
         held["amount"] = Decimal("50")
         self.now += 4
         self._run(resumed.control_task())
         self.assertEqual(2, len(self._entry_orders()))
-        self.assertEqual(Decimal("50"), resumed.filled_base)
-        self.assertEqual(Decimal("50"), resumed._managed_base())
+        self.assertEqual([], [row for row in self.buy_ids if row[4] == PositionAction.CLOSE])
+        self.assertIn("legacy_snapshot_ambiguous_halt", resumed.get_custom_info()["status_reason"])
 
     def _legacy_saved_rung(self, live_amount):
         self._fine_step()
@@ -2279,11 +2279,7 @@ class RangeIcebergExecutorTests(IsolatedAsyncioWrapperTestCase):
         for level in payload["custom_info"]["levels"]:
             level.pop("executed_base", None)
             level.pop("executed_quote", None)
-        self.orders.pop("buy-2")
         held = {"amount": live_amount}
-
-        async def resolve(trading_pair, client_order_id, exchange_order_id=None):
-            return "confirmed_absent"
 
         async def update():
             self.connector.account_positions = {
@@ -2294,7 +2290,6 @@ class RangeIcebergExecutorTests(IsolatedAsyncioWrapperTestCase):
                 ),
             }
 
-        self.connector.resolve_unknown_order = resolve
         self.connector._update_positions = update
         resumed = self._executor(**kwargs)
         resumed.restore_from_custom_info(payload["custom_info"])
@@ -2558,7 +2553,7 @@ class RangeIcebergExecutorTests(IsolatedAsyncioWrapperTestCase):
         self._run(resumed.control_task())
         self.assertEqual(Decimal("50"), resumed.filled_base)
 
-    def _legacy_fill_on_a_missing_order(self, other_fill, live):
+    def _restore_legacy_pair(self, live, gone_id, tracked_fill=None, zero_ids=()):
         self._fine_step()
         self._book(Decimal("0.08000"), Decimal("0.08010"))
         exits = dict(
@@ -2585,8 +2580,13 @@ class RangeIcebergExecutorTests(IsolatedAsyncioWrapperTestCase):
         for level in payload["custom_info"]["levels"]:
             level.pop("executed_base", None)
             level.pop("executed_quote", None)
-        self.orders.pop("buy-2")
-        self._fill("buy-1", other_fill)
+        self.orders.pop(gone_id)
+        for order_id in zero_ids:
+            self.orders[order_id].executed_amount_base = Decimal("0")
+            self.orders[order_id].executed_amount_quote = Decimal("0")
+            self.orders[order_id].current_state = OrderState.OPEN
+        if tracked_fill is not None:
+            self._fill(tracked_fill[0], tracked_fill[1])
         held = {"amount": live}
 
         async def resolve(trading_pair, client_order_id, exchange_order_id=None):
@@ -2605,26 +2605,101 @@ class RangeIcebergExecutorTests(IsolatedAsyncioWrapperTestCase):
         self.connector._update_positions = update
         resumed = self._executor(**kwargs)
         resumed.restore_from_custom_info(payload["custom_info"])
+        return resumed, kwargs
+
+    def _close_rows(self):
+        return [row for row in self.buy_ids if row[4] == PositionAction.CLOSE]
+
+    def _watch_exchange_stop(self, resumed):
+        resumed._remember_exchange_stop(
+            "stop-1", Decimal("25"), Decimal("0.05"), replace=True,
+        )
+        calls = []
+
+        async def cancel(order_ids):
+            calls.append(("cancel", list(order_ids)))
+            return {"success": True}
+
+        async def place(*_args, **_kwargs):
+            calls.append("place")
+            return "stop-2"
+
+        self.connector.cancel_stop_orders = cancel
+        self.connector.place_position_stop_order = place
+        return calls
+
+    def test_a_saved_fill_on_a_gone_order_halts_instead_of_guessing(self):
+        resumed, kwargs = self._restore_legacy_pair(
+            Decimal("50"), "buy-2", tracked_fill=("buy-1", Decimal("25")),
+        )
+        calls = self._watch_exchange_stop(resumed)
         self._book(Decimal("0.07"), Decimal("0.07"))
+        with self.assertLogs(resumed.logger(), level="ERROR") as caught:
+            self._run(resumed.control_task())
+        text = "\n".join(caught.output)
+        self.assertIn("saved total 25, orders buy-1, buy-2, live long 50.", text)
+        self.assertEqual([], self._close_rows())
+        self.assertEqual([], calls)
+        self.assertEqual("stop-1", resumed._exchange_stop_order_id)
+        self.assertEqual(2, len(self._entry_orders()))
+        report = resumed.get_custom_info()
+        self.assertTrue(report["legacy_ambiguous_halt"])
+        self.assertIn("legacy_snapshot_ambiguous_halt", report["status_reason"])
+        info = json.loads(resumed.executor_info.model_dump_json())["custom_info"]
+        before = len(self.buy_ids)
+        again = self._executor(**kwargs)
+        again.restore_from_custom_info(info)
+        again.set_entry_paused(False)
+        self._book(Decimal("0.07"), Decimal("0.07"))
+        self._run(again.control_task())
+        self.assertEqual(before, len(self.buy_ids))
+        self.assertEqual("stop-1", again._exchange_stop_order_id)
+        self.assertTrue(again.get_custom_info()["legacy_ambiguous_halt"])
+
+    def test_a_smaller_fill_on_the_other_order_also_halts(self):
+        resumed, _kwargs = self._restore_legacy_pair(
+            Decimal("35"), "buy-2", tracked_fill=("buy-1", Decimal("10")),
+        )
+        self._book(Decimal("0.07"), Decimal("0.07"))
+        with self.assertLogs(resumed.logger(), level="ERROR") as caught:
+            self._run(resumed.control_task())
+        text = "\n".join(caught.output)
+        self.assertIn("saved total 25, orders buy-1, buy-2, live long 35.", text)
+        self.assertEqual([], self._close_rows())
+        self.assertEqual(2, len(self._entry_orders()))
+        self.assertIn(
+            "legacy_snapshot_ambiguous_halt",
+            resumed.get_custom_info()["status_reason"],
+        )
+
+    def test_an_unfilled_gone_order_does_not_double_the_tracked_fill(self):
+        resumed, _kwargs = self._restore_legacy_pair(Decimal("75"), "buy-1")
+        calls = self._watch_exchange_stop(resumed)
+        self._book(Decimal("0.07"), Decimal("0.07"))
+        with self.assertLogs(resumed.logger(), level="ERROR") as caught:
+            self._run(resumed.control_task())
+        text = "\n".join(caught.output)
+        self.assertIn("saved total 25, orders buy-1, buy-2, live long 75.", text)
+        self.assertEqual([], self._close_rows())
+        self.assertEqual([], calls)
+        self.assertEqual("stop-1", resumed._exchange_stop_order_id)
+        self.assertEqual(2, len(self._entry_orders()))
+
+    def test_a_later_catchup_does_not_close_after_an_ambiguous_halt(self):
+        resumed, _kwargs = self._restore_legacy_pair(
+            Decimal("75"), "buy-1", zero_ids=("buy-2",),
+        )
+        self._book(Decimal("0.07"), Decimal("0.07"))
+        with self.assertLogs(resumed.logger(), level="ERROR") as caught:
+            self._run(resumed.control_task())
+        self.assertIn("live long 75.", "\n".join(caught.output))
+        self.assertEqual([], self._close_rows())
+        self._fill("buy-2", Decimal("25"))
+        self.now += 4
         self._run(resumed.control_task())
-        return resumed
-
-    def test_a_saved_fill_on_a_missing_order_is_kept_with_the_other_fill(self):
-        resumed = self._legacy_fill_on_a_missing_order(Decimal("25"), Decimal("50"))
-        closes = [row for row in self.buy_ids if row[4] == PositionAction.CLOSE]
-        self.assertEqual(Decimal("50"), resumed.filled_base)
-        self.assertEqual(Decimal("50"), resumed._managed_base())
-        self.assertEqual([Decimal("50")], [row[1] for row in closes])
+        self.assertEqual([], self._close_rows())
         self.assertEqual(2, len(self._entry_orders()))
-        self.assertIn("legacy_snapshot_entries_halted", resumed.get_custom_info()["status_reason"])
-
-    def test_a_smaller_fill_is_not_swallowed_by_a_missing_orders_saved_total(self):
-        resumed = self._legacy_fill_on_a_missing_order(Decimal("10"), Decimal("35"))
-        closes = [row for row in self.buy_ids if row[4] == PositionAction.CLOSE]
-        self.assertEqual(Decimal("35"), resumed.filled_base)
-        self.assertEqual(Decimal("35"), resumed._managed_base())
-        self.assertEqual([Decimal("35")], [row[1] for row in closes])
-        self.assertEqual(2, len(self._entry_orders()))
+        self.assertTrue(resumed.get_custom_info()["legacy_ambiguous_halt"])
 
     def test_a_legacy_halt_does_not_close_a_sibling_long(self):
         resumed, held = self._legacy_saved_rung(Decimal("75"))

@@ -288,6 +288,9 @@ class RangeIcebergExecutor(ExecutorBase):
         self._pending_restored_entries: Dict[str, tuple] = {}
         self._saved_exchange_order_ids: Dict[str, str] = {}
         self._legacy_entries_halted = False
+        self._legacy_ambiguous_halt = False
+        self._legacy_ambiguous_logged = False
+        self._legacy_ambiguous_note = ""
         self._legacy_order_ids: Set[str] = set()
         self._legacy_absent_ids: Set[str] = set()
         self._snapshot_rest_saved = False
@@ -801,6 +804,8 @@ class RangeIcebergExecutor(ExecutorBase):
         await self._release_confirmed_failures()
         self._refresh_tracked_orders()
         await self._resolve_restored_entries()
+        if await self._stop_for_ambiguous_legacy():
+            return
         self._release_cancelled_rungs()
         self._release_cancelled_exit_rungs()
         await self._service_entry_rebuild()
@@ -2560,7 +2565,7 @@ class RangeIcebergExecutor(ExecutorBase):
         return (
             self._execution_complete()
             or self._entry_clock_handled
-            or self._legacy_entries_halted
+            or (self._legacy_entries_halted and not self._legacy_ambiguous_halt)
         )
 
     def _all_slices_filled(self) -> bool:
@@ -3423,6 +3428,8 @@ class RangeIcebergExecutor(ExecutorBase):
             return self._cap_block_reason
         if self._exit_error:
             return self._exit_error
+        if self._legacy_ambiguous_halt:
+            return "legacy_snapshot_ambiguous_halt"
         if self._legacy_entries_halted:
             return "legacy_snapshot_entries_halted"
         return ""
@@ -3701,26 +3708,67 @@ class RangeIcebergExecutor(ExecutorBase):
 
     def _legacy_fill_total(self):
         """
-        Saved total plus each saved order's latest size.
+        The saved total, or each saved order's latest size when that sum is larger.
 
-        A size replaces that order's own previous size. When the saved
-        fill sits on no order, another order's size is kept as well.
-        The close is still capped at the live long.
+        A size replaces that order's own previous size. It is not added
+        to the saved total. A gone order with no size is not guessed here.
         """
         base = Decimal("0")
         quote = Decimal("0")
-        saved_sits_on_no_order = False
         for order_id in self._legacy_order_ids:
             part_base, part_quote = self._best_fill(order_id)
             base += part_base
             quote += part_quote
-            if order_id in self._legacy_absent_ids and part_base <= 0:
-                saved_sits_on_no_order = True
-        if saved_sits_on_no_order:
-            return self._snapshot_rest_base + base, self._snapshot_rest_quote + quote
         if base < self._snapshot_rest_base:
             return self._snapshot_rest_base, self._snapshot_rest_quote
         return base, quote
+
+    def _legacy_snapshot_is_ambiguous(self) -> bool:
+        """
+        True when a gone order has no size and the saved total has no single order.
+        """
+        if len(self._legacy_order_ids) <= 1 or self._snapshot_rest_base <= 0:
+            return False
+        for order_id in self._legacy_order_ids:
+            if order_id not in self._legacy_absent_ids:
+                continue
+            part_base, _part_quote = self._best_fill(order_id)
+            if part_base <= 0:
+                return True
+        return False
+
+    async def _live_long_text(self) -> str:
+        outcome, live = await self._read_live_position()
+        if outcome != "ok" or live is None:
+            return "unknown"
+        return str(live)
+
+    async def _stop_for_ambiguous_legacy(self) -> bool:
+        """
+        Stop trading when the saved total cannot be tied to specific orders.
+
+        No entry or close is placed. The exchange stop is left as it is.
+        """
+        if not self._legacy_ambiguous_halt and not self._legacy_snapshot_is_ambiguous():
+            return False
+        self._legacy_ambiguous_halt = True
+        self._legacy_entries_halted = True
+        if not self._entry_paused:
+            self.set_entry_paused(True, "legacy_snapshot_ambiguous_halt")
+        else:
+            self._entry_pause_reason = "legacy_snapshot_ambiguous_halt"
+        if self._legacy_ambiguous_logged:
+            return True
+        if not self._legacy_ambiguous_note:
+            ids = ", ".join(sorted(self._legacy_order_ids))
+            live = await self._live_long_text()
+            self._legacy_ambiguous_note = (
+                "legacy_snapshot_ambiguous_halt: saved total %s, orders %s, live long %s."
+                % (self._snapshot_rest_base, ids, live)
+            )
+        self.logger().error(self._legacy_ambiguous_note)
+        self._legacy_ambiguous_logged = True
+        return True
 
     @property
     def total_base(self) -> Decimal:
@@ -3847,6 +3895,8 @@ class RangeIcebergExecutor(ExecutorBase):
             "entry_paused": self._entry_paused,
             "pause_reason": self._entry_pause_reason,
             "legacy_entries_halted": self._legacy_entries_halted,
+            "legacy_ambiguous_halt": self._legacy_ambiguous_halt,
+            "legacy_ambiguous_note": self._legacy_ambiguous_note,
             "exit_error": self._exit_error,
             "exit_status": self._exit_phase,
             "exit_active": self._exit_active,
@@ -4197,6 +4247,8 @@ class RangeIcebergExecutor(ExecutorBase):
         await self._execute_exit()
 
     async def _control_exit(self):
+        if self._legacy_ambiguous_halt:
+            return
         if self._exit_phase == "done" or not self._exits_configured() or self.filled_base <= 0:
             return
         if self._replace_stop_before_failed:
@@ -6693,6 +6745,8 @@ class RangeIcebergExecutor(ExecutorBase):
         """
         Place or refresh the exchange-side backstop.
 
+        An ambiguous legacy snapshot returns first and leaves the live stop alone.
+
         The price is past the software stop. The vol is the closable quantity,
         the open position minus resting reduce-only close limits, so the place
         is never larger than MEXC can accept. A smaller stop is partial
@@ -6708,6 +6762,8 @@ class RangeIcebergExecutor(ExecutorBase):
         stop never cancels. The software stop, a finished exit, and every terminal
         path except keep_position cancel the order instead of refreshing it.
         """
+        if self._legacy_ambiguous_halt:
+            return
         if self._keep_exchange_stop and self._shutdown_pending:
             return
         if self._stop_loss_close_in_progress() and not self._replace_stop_before_failed:
@@ -6943,14 +6999,22 @@ class RangeIcebergExecutor(ExecutorBase):
         order. An older snapshot with a saved entry order cannot say which
         order a fill belongs to, so it places no new entries and says
         legacy_snapshot_entries_halted. That halt stays until a new executor
-        starts. The ledger keeps the saved total and each saved order's
-        latest size. A fill on a missing order is not replaced by another
-        order's size. The close never exceeds the live long.
+        starts. The ledger is the saved total, or the sum of each saved
+        order's latest size when that sum is larger. When a saved order is
+        gone with no size and that total cannot be tied to one order, it
+        halts with legacy_snapshot_ambiguous_halt, places nothing, and leaves
+        the exchange stop as it is.
         A saved id the tracker does not have is queried,
         then backed off and paused like any other unknown order.
         """
         if isinstance(info, dict) and info.get("legacy_entries_halted"):
             self._legacy_entries_halted = True
+        if isinstance(info, dict) and info.get("legacy_ambiguous_halt"):
+            self._legacy_ambiguous_halt = True
+            self._legacy_entries_halted = True
+            note = info.get("legacy_ambiguous_note")
+            if isinstance(note, str):
+                self._legacy_ambiguous_note = note
         if not self._resume_entries or self._schedule is None or not isinstance(info, dict):
             return
         levels = info.get("levels")
@@ -6997,7 +7061,9 @@ class RangeIcebergExecutor(ExecutorBase):
                 self._pending_restored_entries[text] = (level, slot)
                 continue
             self._attach_restored_entry(text, order, level, slot)
-        if self._legacy_entries_halted and not self._entry_paused:
+        if self._legacy_ambiguous_halt and not self._entry_paused:
+            self.set_entry_paused(True, "legacy_snapshot_ambiguous_halt")
+        elif self._legacy_entries_halted and not self._entry_paused:
             self.set_entry_paused(True, "legacy_snapshot_entries_halted")
 
     def _slices_from_levels(self, levels: list) -> List[_Slice]:
