@@ -1,4 +1,5 @@
 import asyncio
+import time
 from decimal import Decimal
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
@@ -24,9 +25,13 @@ class MexcPerpetualAPIOrderBookDataSource(PerpetualAPIOrderBookDataSource):
 
     Depth quantities are contracts. They are converted to base-asset size with the contract size
     before they enter the local order book. A quantity of 0 deletes that price level.
-    A missing contract size waits for one trading-rules update.
-    A pair that still has no size raises. The size is never guessed.
+    A missing contract size waits for one trading-rules update, then reads it.
+    A failed update, a timeout, or a pair that still has no positive size
+    waits out a backoff before another fetch. The size is never guessed.
     """
+
+    _RULES_BACKOFF = 15.0
+    _RULES_TIMEOUT = 15.0
 
     def __init__(
         self,
@@ -44,6 +49,7 @@ class MexcPerpetualAPIOrderBookDataSource(PerpetualAPIOrderBookDataSource):
         self._diffs_need_snapshot = False
         self._snapshot_retry_task: Optional[asyncio.Task] = None
         self._contract_size_lock = asyncio.Lock()
+        self._rules_retry_at = 0.0
 
     async def get_last_traded_prices(self, trading_pairs: List[str], domain: Optional[str] = None) -> Dict[str, float]:
         return await self._connector.get_last_traded_prices(trading_pairs=trading_pairs)
@@ -165,17 +171,39 @@ class MexcPerpetualAPIOrderBookDataSource(PerpetualAPIOrderBookDataSource):
             params={"limit": CONSTANTS.DEPTH_SNAPSHOT_LIMIT},
         )
 
+    def _rules_on_backoff(self) -> bool:
+        return time.monotonic() < self._rules_retry_at
+
+    def _start_rules_backoff(self) -> None:
+        self._rules_retry_at = time.monotonic() + self._RULES_BACKOFF
+
     async def _contract_size(self, trading_pair: str) -> Decimal:
         try:
             return self._connector.get_contract_size(trading_pair)
         except ValueError:
             pass
+        if self._rules_on_backoff():
+            raise ValueError(f"contractSize for {trading_pair} is not loaded")
         async with self._contract_size_lock:
             try:
                 return self._connector.get_contract_size(trading_pair)
             except ValueError:
-                await self._connector._update_trading_rules()
-        return self._connector.get_contract_size(trading_pair)
+                pass
+            if self._rules_on_backoff():
+                raise ValueError(f"contractSize for {trading_pair} is not loaded")
+            try:
+                await asyncio.wait_for(
+                    self._connector._update_trading_rules(),
+                    timeout=self._RULES_TIMEOUT,
+                )
+            except Exception:
+                self._start_rules_backoff()
+                raise
+            try:
+                return self._connector.get_contract_size(trading_pair)
+            except ValueError:
+                self._start_rules_backoff()
+                raise
 
     async def _order_book_snapshot(self, trading_pair: str) -> OrderBookMessage:
         snapshot = await self._request_order_book_snapshot(trading_pair)

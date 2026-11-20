@@ -1,6 +1,7 @@
 import asyncio
 import json
 import re
+import time
 from decimal import Decimal
 from test.isolated_asyncio_wrapper_test_case import IsolatedAsyncioWrapperTestCase
 from typing import Awaitable
@@ -15,7 +16,8 @@ from hummingbot.connector.derivative.mexc_perpetual.mexc_perpetual_api_order_boo
     MexcPerpetualAPIOrderBookDataSource,
 )
 from hummingbot.connector.derivative.mexc_perpetual.mexc_perpetual_derivative import MexcPerpetualDerivative
-from hummingbot.core.data_type.order_book_message import OrderBookMessageType
+from hummingbot.core.data_type.order_book_message import OrderBookMessage, OrderBookMessageType
+from hummingbot.core.data_type.order_book_tracker import OrderBookTracker
 from hummingbot.core.web_assistant.connections.data_types import WSJSONRequest
 
 
@@ -215,6 +217,139 @@ class MexcPerpetualAPIOrderBookDataSourceTests(IsolatedAsyncioWrapperTestCase):
             self.assertEqual(Decimal("10"), await first)
             self.assertEqual(Decimal("10"), await second)
             self.assertEqual(1, calls)
+
+        self.async_run_with_timeout(scenario())
+
+    def test_rules_failure_backs_off_before_another_fetch(self):
+        self.connector._contract_sizes.pop(self.trading_pair, None)
+        calls = 0
+
+        async def load():
+            nonlocal calls
+            calls += 1
+            raise IOError("contract info down")
+
+        self.connector._update_trading_rules = load
+
+        async def scenario():
+            with self.assertRaises(IOError):
+                await self.data_source._contract_size(self.trading_pair)
+            with self.assertRaises(ValueError):
+                await self.data_source._contract_size(self.trading_pair)
+            self.assertEqual(1, calls)
+            self.assertNotIn(Decimal("1"), self.connector._contract_sizes.values())
+            self.data_source._rules_retry_at = 0
+            with self.assertRaises(IOError):
+                await self.data_source._contract_size(self.trading_pair)
+            self.assertEqual(2, calls)
+
+        self.async_run_with_timeout(scenario())
+
+    def test_missing_or_non_positive_size_backs_off_before_another_fetch(self):
+        self.connector._contract_sizes.pop(self.trading_pair, None)
+        calls = 0
+
+        async def load_missing():
+            nonlocal calls
+            calls += 1
+
+        self.connector._update_trading_rules = load_missing
+
+        async def scenario():
+            message = f"contractSize for {self.trading_pair} is not loaded"
+            with self.assertRaisesRegex(ValueError, message):
+                await self.data_source._contract_size(self.trading_pair)
+            with self.assertRaisesRegex(ValueError, message):
+                await self.data_source._contract_size(self.trading_pair)
+            self.assertEqual(1, calls)
+            self.data_source._rules_retry_at = 0
+            self.connector._contract_sizes[self.trading_pair] = Decimal("0")
+
+            async def load_zero():
+                nonlocal calls
+                calls += 1
+                self.connector._contract_sizes[self.trading_pair] = Decimal("0")
+
+            self.connector._update_trading_rules = load_zero
+            with self.assertRaisesRegex(ValueError, message):
+                await self.data_source._contract_size(self.trading_pair)
+            with self.assertRaisesRegex(ValueError, message):
+                await self.data_source._contract_size(self.trading_pair)
+            self.assertEqual(2, calls)
+            self.assertEqual(Decimal("0"), self.connector._contract_sizes[self.trading_pair])
+            self.assertNotIn(Decimal("1"), self.connector._contract_sizes.values())
+
+        self.async_run_with_timeout(scenario())
+
+    def test_rules_update_timeout_releases_the_lock(self):
+        self.connector._contract_sizes.pop(self.trading_pair, None)
+        calls = 0
+
+        async def hang():
+            nonlocal calls
+            calls += 1
+            await asyncio.Event().wait()
+
+        self.connector._update_trading_rules = hang
+        self.data_source._RULES_TIMEOUT = 0.05
+
+        async def scenario():
+            started = time.monotonic()
+            with self.assertRaises(TimeoutError):
+                await self.data_source._contract_size(self.trading_pair)
+            self.assertLess(time.monotonic() - started, 1)
+            self.assertEqual(1, calls)
+            started = time.monotonic()
+            with self.assertRaises(ValueError):
+                await self.data_source._contract_size(self.trading_pair)
+            self.assertLess(time.monotonic() - started, 0.2)
+            self.assertEqual(1, calls)
+            self.assertNotIn(Decimal("1"), self.connector._contract_sizes.values())
+
+        self.async_run_with_timeout(scenario())
+
+    def test_failed_startup_snapshot_retries_until_ready(self):
+        calls = 0
+
+        async def flaky(trading_pair):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise IOError("snapshot failed")
+            return OrderBookMessage(
+                OrderBookMessageType.SNAPSHOT,
+                {
+                    "trading_pair": trading_pair,
+                    "update_id": 7,
+                    "bids": [["99", "1"]],
+                    "asks": [["100", "2"]],
+                },
+                1,
+            )
+
+        self.data_source._order_book_snapshot = flaky
+        tracker = OrderBookTracker(
+            data_source=self.data_source,
+            trading_pairs=[self.trading_pair],
+        )
+
+        async def sleep(delay):
+            return None
+
+        tracker._sleep = sleep
+
+        async def scenario():
+            await tracker._init_order_books()
+            self.assertTrue(tracker.ready)
+            self.assertIn(self.trading_pair, tracker.order_books)
+            self.assertEqual(2, calls)
+            await asyncio.sleep(0)
+            for task in list(tracker._tracking_tasks.values()):
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
 
         self.async_run_with_timeout(scenario())
 
