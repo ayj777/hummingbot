@@ -2,17 +2,19 @@
 Shared release clock for executors that spread a total across a duration.
 
 TWAPExecutor.create_order_plan uses release_timestamps(start, number_of_orders, order_interval),
-which is start + i * interval. The range iceberg schedule uses the same helper for its
-nominal release times, then closes the last window at the duration so leftovers are cancelled.
+which is start + i * interval. An exit iceberg uses those offsets as its release clock
+and closes the last window at the duration.
 
-Callers pass elapsed measured from their own anchor. Range iceberg anchors that clock at
-the first fill unless schedule_start is SUBMIT, which anchors it at executor start.
-Windows before the anchor are not passed in, so nothing is skipped or carried early.
+Range iceberg entry keeps the same offsets so each gap can include timing jitter.
+It does not open the next entry slice when that offset is reached. The next entry
+slice waits until the previous one is fully filled and one gap has passed since
+that fill. The duration clock is separate and still starts at the first fill, or
+at executor start when schedule_start is SUBMIT.
 """
 
 import re
 from decimal import Decimal
-from typing import List, Sequence, Union
+from typing import List, Optional, Sequence, Union
 
 Number = Union[int, float, Decimal]
 _DURATION = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*([smhd])?\s*$", re.IGNORECASE)
@@ -54,14 +56,14 @@ class SliceSchedule:
         self,
         amounts: Sequence[Decimal],
         offsets: Sequence[float],
-        duration: float,
+        duration: Optional[float],
         skip_unplaced: bool,
     ):
         if len(amounts) != len(offsets) or not amounts:
             raise ValueError("A schedule needs one amount for every release time")
         self.amounts = [Decimal(str(amount)) for amount in amounts]
         self.offsets = [float(offset) for offset in offsets]
-        self.duration = float(duration)
+        self.duration = None if duration is None else float(duration)
         self.skip_unplaced = skip_unplaced
         self.skipped = Decimal("0")
         self._closed = 0
@@ -90,8 +92,11 @@ class SliceSchedule:
         filled = Decimal(str(filled))
         open_amount = Decimal(str(open_amount))
         while self._closed < len(self.amounts):
-            end = self.offsets[self._closed + 1] if self._closed + 1 < len(self.offsets) else self.duration
-            if elapsed + 1e-9 < end:
+            if self._closed + 1 < len(self.offsets):
+                end = self.offsets[self._closed + 1]
+            else:
+                end = self.duration
+            if end is None or elapsed + 1e-9 < end:
                 break
             budget = self.amounts[self._closed]
             available = filled + open_amount - self._assigned

@@ -115,6 +115,19 @@ class TimeScheduleTests(TestCase):
         self.assertEqual(Decimal("100"), placeable)
         self.assertEqual(Decimal("0"), schedule.skipped)
 
+    def test_blank_duration_does_not_close_the_last_window(self):
+        schedule = SliceSchedule(
+            amounts=[Decimal("40"), Decimal("40")],
+            offsets=[0.0, 10.0],
+            duration=None,
+            skip_unplaced=True,
+        )
+        self.assertIsNone(schedule.duration)
+        self.assertEqual(Decimal("40"), schedule.opened(0))
+        schedule.advance(10_000, Decimal("0"), Decimal("0"), outside_cap=True)
+        self.assertEqual(Decimal("40"), schedule.skipped)
+        self.assertEqual(1, schedule._closed)
+
     def test_window_accounting_round_trips(self):
         schedule = SliceSchedule(
             amounts=[Decimal("100"), Decimal("100")],

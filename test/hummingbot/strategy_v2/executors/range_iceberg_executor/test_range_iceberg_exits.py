@@ -4179,7 +4179,8 @@ class RangeIcebergExitTests(IsolatedAsyncioWrapperTestCase):
         for _ in range(3):
             self._run(executor.control_task())
         self.assertEqual(before, len(self.buy_ids))
-        self.assertGreater(executor._released_amount(), released)
+        self.assertEqual(released, executor._released_amount())
+        self.assertAlmostEqual(20.0, executor.get_custom_info()["schedule_time_remaining"])
         info = executor.get_custom_info()
         self.assertTrue(info["entry_paused"])
         self.assertEqual("deeper tier", info["pause_reason"])

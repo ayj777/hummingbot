@@ -74,14 +74,17 @@ class RangeIcebergExecutor(ExecutorBase):
 
     RANGE keeps every child inside [price_low, price_high]. UP_TO prices a buy at the
     best ask, or a sell at the best bid, and never crosses limit_price. Iceberg shows
-    only a few slices and replaces each one after it fills. A duration releases the
-    total on the same offset clock as TWAP and cancels leftovers when the clock ends.
+    only a few slices and replaces each one after it fills. A duration stops new
+    entries when that clock ends, even if size is left.
 
-    By default that clock starts at the first fill. A partial fill counts. Until then
-    only the first slice is placed, except a range rung larger than that slice is
-    allowed out so it can fill and start the clock. Nothing is skipped or carried
-    before the anchor. schedule_start SUBMIT keeps the previous clock, which starts
-    when the executor starts.
+    The duration clock starts at the first fill. A partial fill starts it. SUBMIT
+    starts it when the executor is created. The first entry slice is placed at the
+    start. A range rung larger than the released slice is sent in parts, one slice
+    at a time. Each later slice waits until the previous slice is fully filled and
+    one jittered interval has passed since that fill. A partial fill does not
+    release the next slice.
+    CARRY and SKIP do not change this. Paused time, including an entry pause, does
+    not count toward that wait. The duration clock still counts entry-pause time.
     expiry_seconds is always measured from the executor start, so an order that never
     fills can still expire.
 
@@ -104,10 +107,9 @@ class RangeIcebergExecutor(ExecutorBase):
     kept the same way entry fees are kept.
 
     An iceberg exit schedule starts when that exit triggers. It does not wait for
-    the first exit fill. The entry rule that holds later rungs until a fill exists
-    only so that fill can start the entry clock. A close does not need it, so the
-    first exit window is open at the trigger and later windows count from then,
-    even while the first close order is still unfilled.
+    the first exit fill. Exit windows still open on the offset clock. A close does
+    not use the entry fill gate, so the first exit window is open at the trigger
+    and later windows count from then, even while the first close order is unfilled.
 
     The exit is reduce-only: closing a long is a sell with position action CLOSE
     (MEXC hedge side 4) and closing a short is a buy with position action CLOSE
@@ -277,6 +279,26 @@ class RangeIcebergExecutor(ExecutorBase):
         self._schedule_paused_seconds = 0.0
         self._started_at = self._strategy.current_timestamp
         self._schedule_started_at: Optional[float] = None
+        self._schedule_last_full_fill_at: Optional[float] = None
+        self._schedule_completed_slices = 0
+        self._fill_gate_pauses: List[tuple] = []
+        self._snapshotted_entry_base: Dict[str, Decimal] = {}
+        self._snapshotted_entry_quote: Dict[str, Decimal] = {}
+        self._unresolved_entry_ids: Set[str] = set()
+        self._pending_restored_entries: Dict[str, tuple] = {}
+        self._saved_exchange_order_ids: Dict[str, str] = {}
+        self._legacy_entries_halted = False
+        self._legacy_ambiguous_halt = False
+        self._legacy_ambiguous_logged = False
+        self._legacy_ambiguous_note = ""
+        self._legacy_order_ids: Set[str] = set()
+        self._legacy_absent_ids: Set[str] = set()
+        self._snapshot_rest_saved = False
+        self._snapshot_rest_base = Decimal("0")
+        self._snapshot_rest_quote = Decimal("0")
+        self._hint_exit_filled = Decimal("0")
+        self._live_exit_filled = Decimal("0")
+        self._entry_pause_started: Optional[float] = None
         self._last_place_timestamp = Decimal("-1")
         self._rng = random.Random(config.random_seed)
         self._schedule = self._make_schedule()
@@ -424,13 +446,27 @@ class RangeIcebergExecutor(ExecutorBase):
             return None
         count, interval = resolved
         total = self.config.total_amount
-        share = total / Decimal(count)
-        amounts = []
-        remaining = total
-        for index in range(count):
-            piece = remaining if index == count - 1 else share
-            amounts.append(piece)
-            remaining -= piece
+        if (
+            self.config.duration_seconds is None
+            and self.config.schedule_slices is None
+            and self.config.slice_amount is not None
+        ):
+            amounts = []
+            remaining = total
+            while remaining > 0:
+                piece = self.config.slice_amount
+                if remaining < piece:
+                    piece = remaining
+                amounts.append(piece)
+                remaining -= piece
+        else:
+            share = total / Decimal(count)
+            amounts = []
+            remaining = total
+            for index in range(count):
+                piece = remaining if index == count - 1 else share
+                amounts.append(piece)
+                remaining -= piece
         offsets = release_timestamps(0.0, count, interval)
         offsets = self._apply_timing_jitter(offsets, interval, self.config.duration_seconds)
         return SliceSchedule(
@@ -440,10 +476,11 @@ class RangeIcebergExecutor(ExecutorBase):
             skip_unplaced=self.config.catch_up == CatchUpPolicy.SKIP,
         )
 
-    def _apply_timing_jitter(self, offsets, interval: float, duration: float):
+    def _apply_timing_jitter(self, offsets, interval: float, duration: Optional[float]):
         """
         The same release-clock jitter the entry schedule uses. A zero jitter percent
-        returns the nominal offsets and does not draw random numbers.
+        returns the nominal offsets and does not draw random numbers. A blank
+        duration does not clamp the offsets.
         """
         if self.config.timing_jitter_pct <= 0 or interval <= 0:
             return list(offsets)
@@ -452,7 +489,10 @@ class RangeIcebergExecutor(ExecutorBase):
             swing = (self._rng.random() * 2) - 1
             delta = swing * float(self.config.timing_jitter_pct) * interval
             low = 0.0 if index == 0 else jittered[-1]
-            jittered.append(min(max(low, nominal + delta), duration))
+            value = max(low, nominal + delta)
+            if duration is not None:
+                value = min(value, float(duration))
+            jittered.append(value)
         return jittered
 
     def _build_plan(self):
@@ -541,6 +581,7 @@ class RangeIcebergExecutor(ExecutorBase):
             self._paused_seconds += now - started
             if self._schedule_started_at is not None:
                 self._schedule_paused_seconds += max(0.0, now - max(started, self._schedule_started_at))
+            self._remember_fill_gate_pause(started, now)
             if self._exit_started_at is not None:
                 self._exit_paused_seconds += max(0.0, now - max(started, self._exit_started_at))
             self._pause_started = None
@@ -660,6 +701,11 @@ class RangeIcebergExecutor(ExecutorBase):
                 "executor_paused_seconds": self._paused_seconds,
                 "paused": self._paused,
                 "pause_started": self._pause_started,
+                "last_full_fill_at": self._schedule_last_full_fill_at,
+                "fill_gate_paused_seconds": self._merged_pause_seconds(self._fill_gate_pauses),
+                "fill_gate_pauses": [[start, end] for start, end in self._fill_gate_pauses],
+                "completed_slices": self._schedule_completed_slices,
+                "entry_pause_started": self._entry_pause_started,
             }
         )
         return state
@@ -689,6 +735,15 @@ class RangeIcebergExecutor(ExecutorBase):
             self._schedule_paused_seconds = float(clock["paused_seconds"])
         if self._schedule is not None and clock.get("closed") is not None:
             self._schedule.restore_state(clock)
+        if self._schedule is not None and (
+            "schedule_last_full_fill_at" in info or "last_full_fill_at" in clock
+        ):
+            stamp = info.get("schedule_last_full_fill_at", clock.get("last_full_fill_at"))
+            self._schedule_last_full_fill_at = None if stamp is None else float(stamp)
+        if self._schedule is not None:
+            self._restore_fill_gate_pauses(clock)
+        if self._schedule is not None and clock.get("completed_slices") is not None:
+            self._schedule_completed_slices = int(clock["completed_slices"])
         if clock.get("executor_started_at") is not None:
             self._started_at = float(clock["executor_started_at"])
         if clock.get("executor_paused_seconds") is not None:
@@ -702,6 +757,7 @@ class RangeIcebergExecutor(ExecutorBase):
         self._restore_entry_pause(info)
         self._restore_shared_side_hint(info)
         self._restore_exit_state(info)
+        self._restore_open_entry_orders(info)
         self._side_guard_checked = False
 
     def _resume_entries_requested(self, info: dict) -> bool:
@@ -747,6 +803,11 @@ class RangeIcebergExecutor(ExecutorBase):
         self._halt_on_unresolved_exchange_orders()
         await self._release_confirmed_failures()
         self._refresh_tracked_orders()
+        await self._resolve_restored_entries()
+        if await self._stop_for_ambiguous_legacy():
+            return
+        if self._legacy_lookup_blocks_close():
+            return
         self._release_cancelled_rungs()
         self._release_cancelled_exit_rungs()
         await self._service_entry_rebuild()
@@ -755,6 +816,7 @@ class RangeIcebergExecutor(ExecutorBase):
         if await self._reconcile_exchange_state() == "closed":
             return
         self._capture_schedule_anchor()
+        self._note_completed_entry_slices()
         if self._exit_phase == "done":
             await self._sync_exchange_stop()
             return
@@ -762,7 +824,6 @@ class RangeIcebergExecutor(ExecutorBase):
             await self._control_exit()
             await self._sync_exchange_stop()
             return
-        self._advance_schedule()
         if await self._handle_entry_clock():
             await self._sync_exchange_stop()
             return
@@ -771,9 +832,15 @@ class RangeIcebergExecutor(ExecutorBase):
             if self._exit_phase in ("cancelling_entry", "executing", "done", "armed"):
                 await self._sync_exchange_stop()
                 return
-            if self._entry_clock_handled or self._execution_complete():
+            if self._exit_may_arm():
                 await self._sync_exchange_stop()
                 return
+        if self._legacy_entries_halted and self._needs_exit_after_entry():
+            if self._exit_phase == "idle":
+                self._exit_phase = "armed"
+            await self._control_exit()
+            await self._sync_exchange_stop()
+            return
         if self._execution_complete():
             if self._needs_exit_after_entry():
                 self._exit_phase = "armed"
@@ -788,7 +855,7 @@ class RangeIcebergExecutor(ExecutorBase):
                 await self._sync_exchange_stop()
                 return
         await self._sync_exchange_stop()
-        if self._entry_paused:
+        if self._legacy_entries_halted or self._entry_paused:
             self._cancel_entry_orders_for_exit()
             return
         if self._entries_frozen or not self._resume_entries:
@@ -1822,14 +1889,22 @@ class RangeIcebergExecutor(ExecutorBase):
 
         The API calls this so only the deepest tier the current price
         qualifies for places entries. Paused cancels working entry orders
-        and places no new ones. Fills, the schedule release, the take
-        profit, and the stop keep running. Schedule time keeps accruing, so
-        a long pause does not freeze the clock. Resume keeps the unspent
-        size and places one normal iceberg slot per tick, never more
-        working children than visible_count, and never the carried size as
-        a single order. entry_paused and pause_reason are restored from
-        custom_info. A snapshot that omits them stays unpaused.
+        and places no new ones. Fills, the take profit, and the stop keep
+        running. The duration clock keeps accruing. Time spent entry-paused
+        does not count toward the wait between a full fill and the next slice.
+        Resume keeps the unspent size and places one normal iceberg slot per
+        tick, never more working children than visible_count. entry_paused
+        and pause_reason are restored from custom_info. A snapshot that omits
+        them stays unpaused. A legacy snapshot halt is not cleared here.
         """
+        if not paused and self._legacy_entries_halted:
+            return
+        now = float(self._strategy.current_timestamp)
+        if paused and not self._entry_paused:
+            self._entry_pause_started = now
+        elif not paused and self._entry_paused:
+            self._remember_fill_gate_pause(self._entry_pause_started, now)
+            self._entry_pause_started = None
         self._entry_paused = bool(paused)
         if not self._entry_paused:
             self._entry_pause_reason = None
@@ -1842,6 +1917,13 @@ class RangeIcebergExecutor(ExecutorBase):
         if not isinstance(info, dict) or "entry_paused" not in info:
             return
         self._entry_paused = bool(info.get("entry_paused"))
+        if self._entry_paused and self._entry_pause_started is None:
+            started = info.get("entry_pause_started")
+            if started is None and isinstance(info.get("schedule_clock"), dict):
+                started = info["schedule_clock"].get("entry_pause_started")
+            if started is None:
+                started = self._strategy.current_timestamp
+            self._entry_pause_started = float(started)
         reason = info.get("pause_reason")
         if self._entry_paused and isinstance(reason, str) and reason.strip():
             self._entry_pause_reason = reason.strip()
@@ -2046,12 +2128,21 @@ class RangeIcebergExecutor(ExecutorBase):
         planned = slot.target_price
         price = self._jitter_price(planned, rules.min_price_increment)
         step = rules.min_base_amount_increment
-        amount = self._bounded_amount(slot.target_amount, price, step, rules.min_order_size)
+        original = slot.target_amount
+        amount = self._bounded_amount(original, price, step, rules.min_order_size)
         if amount < rules.min_order_size:
             slot.tracked = TrackedOrder(order_id="skipped")
             return
         amount = await self._cap_child_amount(amount, price, step, rules.min_order_size)
         if amount is None:
+            return
+        if self._schedule is not None:
+            room = quantize_down(self._unit_to_base(self._placeable(), price), step)
+            if room < rules.min_order_size:
+                return
+            if amount > room:
+                amount = room
+        if amount < rules.min_order_size:
             return
         order_id = self._submit(price, amount)
         slot.tracked = TrackedOrder(order_id=order_id)
@@ -2059,6 +2150,10 @@ class RangeIcebergExecutor(ExecutorBase):
         slot.target_price = price
         slot.pre_jitter_price = planned
         self._submitted_order_ids.append(order_id)
+        leftover = original - amount
+        if leftover >= rules.min_order_size:
+            rest = _Slice(LadderLevel(price=planned, base_amount=leftover))
+            self._slices.insert(self._slices.index(slot) + 1, rest)
         self._mark_action()
 
     async def _place_up_to_slice(self, price: Decimal, placeable_unit: Decimal):
@@ -2069,6 +2164,16 @@ class RangeIcebergExecutor(ExecutorBase):
         price = self._clamp_limit(self._jitter_up_to_price(price))
         step = rules.min_base_amount_increment
         slice_unit = min(self._slice_unit_amount(), placeable_unit)
+        last_slice = (
+            self._schedule is not None
+            and self._completed_entry_slices() + 1 >= self._schedule.count
+        )
+        dust = self._base_to_unit(self._min_order_size(), price)
+        # The last slice absorbs leftover size that is below one more child.
+        # A smaller slice_amount still places child-sized orders until that leftover.
+        if last_slice and (self.config.slice_amount is None or placeable_unit - slice_unit < dust):
+            self._rounding_remainder_base = Decimal("0")
+            slice_unit = placeable_unit
         raw_base = self._unit_to_base(slice_unit, price)
         amount = self._bounded_amount(raw_base, price, step, rules.min_order_size)
         amount = await self._cap_child_amount(amount, price, step, rules.min_order_size)
@@ -2292,7 +2397,12 @@ class RangeIcebergExecutor(ExecutorBase):
     def _range_slot_released(self, slot: _Slice) -> bool:
         if self._schedule is None:
             return True
-        return self._base_to_unit(slot.target_amount, slot.target_price) <= self._placeable()
+        placeable = self._placeable()
+        if placeable <= 0:
+            return False
+        # A rung larger than the released slice is placed up to that slice.
+        room = self._unit_to_base(placeable, slot.target_price)
+        return room >= self._min_order_size()
 
     def _reprice_one(self, desired: Decimal) -> bool:
         rules = self.get_trading_rules(self.config.connector_name, self.config.trading_pair)
@@ -2447,6 +2557,19 @@ class RangeIcebergExecutor(ExecutorBase):
             return self._filled_unit() > 0 or self._skipped_amount() >= self.config.total_amount
         return self._unit_to_base(leftover, self.config.limit_price) < Decimal(str(rules.min_order_size))
 
+    def _exit_may_arm(self) -> bool:
+        """
+        True when the filled size may be protected.
+
+        The entry is finished, its clock has ended, or entries are halted
+        and will not be placed again.
+        """
+        return (
+            self._execution_complete()
+            or self._entry_clock_handled
+            or (self._legacy_entries_halted and not self._legacy_ambiguous_halt)
+        )
+
     def _all_slices_filled(self) -> bool:
         if not self._slices:
             if self.close_type == CloseType.FAILED:
@@ -2463,46 +2586,207 @@ class RangeIcebergExecutor(ExecutorBase):
         price = self.config.price_low or self.config.limit_price or Decimal("1")
         return self._unit_to_base(leftover, price) < Decimal(str(rules.min_order_size))
 
-    def _advance_schedule(self, force_end: bool = False):
-        if self._schedule is None or self._schedule_started_at is None:
+    def _entry_release_limit(self) -> int:
+        if self._schedule is None:
+            return 0
+        return len(self._schedule.amounts)
+
+    def _entry_release_piece(self, index: int) -> Decimal:
+        """
+        Size of one schedule slice. Range rungs do not change this size.
+        """
+        if self._schedule is None or index < 0 or index >= len(self._schedule.amounts):
+            return Decimal("0")
+        return self._schedule.amounts[index]
+
+    def _tranches_covered_by_fill(self) -> int:
+        """
+        How many released slices the filled size already covers.
+
+        One schedule slice can be several child orders. Counting filled orders
+        would open the next slice early. Quantization leftover counts as covered
+        so a 410 fill of a 416.67 slice does not stall the gate.
+        """
+        if self._schedule is None:
+            return 0
+        filled = self._filled_unit()
+        if filled <= 0:
+            return 0
+        price = self.config.limit_price or self.config.price_low or Decimal("1")
+        credit = filled + self._base_to_unit(self._rounding_remainder_base, price)
+        dust = self._base_to_unit(self._min_order_size(), price)
+        budget = Decimal("0")
+        total = self.config.total_amount
+        completed = 0
+        for index in range(self._entry_release_limit()):
+            piece = self._entry_release_piece(index)
+            if piece <= 0:
+                break
+            budget += piece
+            if budget > total:
+                budget = total
+            if credit + dust <= budget:
+                break
+            completed += 1
+            if budget >= total:
+                break
+        return completed
+
+    def _completed_entry_slices(self) -> int:
+        if self._schedule is None:
+            return 0
+        covered = self._tranches_covered_by_fill()
+        # A restart keeps the saved count once the filled size is loaded.
+        # The saved count does not open a slice when that size is still missing.
+        if self._filled_unit() > 0 and self._schedule_completed_slices > covered:
+            return self._schedule_completed_slices
+        return covered
+
+    def _note_completed_entry_slices(self) -> None:
+        """
+        Record the time the newest entry slice became fully filled.
+
+        A restored count is not raised again when the same fills are loaded,
+        so the saved timestamp stays.
+        """
+        if self._schedule is None:
             return
-        elapsed = self.config.duration_seconds if force_end else self._schedule_elapsed()
-        self._schedule.advance(elapsed, self._filled_unit(), self._open_unit(), self._outside_cap())
+        completed = self._completed_entry_slices()
+        if completed <= self._schedule_completed_slices:
+            return
+        self._schedule_completed_slices = completed
+        self._schedule_last_full_fill_at = float(self._strategy.current_timestamp)
+        self._fill_gate_pauses = []
+
+    def _remember_fill_gate_pause(self, started: Optional[float], now: float) -> None:
+        origin = self._schedule_last_full_fill_at
+        if origin is None or started is None:
+            return
+        start = max(float(started), float(origin))
+        end = float(now)
+        if end > start:
+            self._fill_gate_pauses.append((start, end))
+
+    def _fill_gate_pause_spans(self, now: float) -> list:
+        origin = self._schedule_last_full_fill_at
+        spans = list(self._fill_gate_pauses)
+        if origin is None:
+            return spans
+        if self._entry_paused and self._entry_pause_started is not None:
+            start = max(float(self._entry_pause_started), float(origin))
+            if now > start:
+                spans.append((start, now))
+        if self._paused and self._pause_started is not None:
+            start = max(float(self._pause_started), float(origin))
+            if now > start:
+                spans.append((start, now))
+        return spans
+
+    def _merged_pause_seconds(self, spans) -> float:
+        """
+        Union of pause spans. An entry pause and an executor pause that overlap
+        are counted once.
+        """
+        if not spans:
+            return 0.0
+        ordered = sorted(spans)
+        total = 0.0
+        start, end = ordered[0]
+        for left, right in ordered[1:]:
+            if left <= end:
+                end = max(end, right)
+            else:
+                total += end - start
+                start, end = left, right
+        return total + (end - start)
+
+    def _fill_gate_elapsed(self) -> float:
+        """
+        Time since the last full entry fill, excluding executor pauses and entry pauses.
+        """
+        origin = self._schedule_last_full_fill_at
+        if origin is None:
+            return 0.0
+        now = float(self._strategy.current_timestamp)
+        paused = self._merged_pause_seconds(self._fill_gate_pause_spans(now))
+        return max(0.0, now - float(origin) - paused)
+
+    def _restore_fill_gate_pauses(self, clock: dict) -> None:
+        pauses = clock.get("fill_gate_pauses")
+        if isinstance(pauses, list):
+            restored = []
+            for item in pauses:
+                if isinstance(item, (list, tuple)) and len(item) >= 2:
+                    restored.append((float(item[0]), float(item[1])))
+            self._fill_gate_pauses = restored
+            return
+        seconds = clock.get("fill_gate_paused_seconds")
+        if seconds is None:
+            return
+        amount = float(seconds)
+        origin = self._schedule_last_full_fill_at or 0.0
+        self._fill_gate_pauses = [(origin, origin + amount)] if amount > 0 else []
+
+    def _next_entry_slice_unlocked(self, completed: int) -> bool:
+        if completed <= 0 or self._schedule_last_full_fill_at is None:
+            return False
+        return self._fill_gate_elapsed() + 1e-9 >= self._fill_gate_gap(completed)
+
+    def _fill_gate_gap(self, completed: int) -> float:
+        offsets = self._schedule.offsets if self._schedule is not None else []
+        if completed <= 0 or not offsets:
+            return 0.0
+        if completed < len(offsets):
+            return max(0.0, offsets[completed] - offsets[completed - 1])
+        if len(offsets) >= 2:
+            return max(0.0, offsets[-1] - offsets[-2])
+        return 0.0
 
     def _released_amount(self) -> Decimal:
         """
-        Size the schedule has released.
+        Size the entry schedule has released.
 
-        Before the anchor that is the first slice, including when timing jitter
-        pushed its offset forward. A range rung larger than that slice is released
-        too, so the first order can rest and fill, which is what starts the clock.
-        The allowance never exceeds the total. After the anchor, release offsets
-        are measured from the anchor.
+        The first slice is released immediately. Each later slice is released
+        only after the previous one is fully filled and one jittered interval
+        has passed since that fill. The slice size is the schedule amount, not
+        a range rung. The total is the cap. CARRY and SKIP do not add size and
+        do not drop size.
         """
         if self._schedule is None:
             return self.config.total_amount
-        if self._schedule_started_at is None:
-            released = self._schedule.amounts[0]
-            if self.config.mode == ExecutionMode.RANGE and self._slices:
-                first = self._slices[0]
-                rung = self._base_to_unit(first.target_amount, first.target_price)
-                if rung > released:
-                    released = rung
-            if released > self.config.total_amount:
-                released = self.config.total_amount
-            return released
-        return self._schedule.opened(self._schedule_elapsed())
+        self._note_completed_entry_slices()
+        completed = self._completed_entry_slices()
+        unlocked = 1
+        if completed > 0 and self._next_entry_slice_unlocked(completed):
+            unlocked = completed + 1
+        elif completed > 0:
+            unlocked = completed
+        limit = self._entry_release_limit()
+        if unlocked > limit:
+            unlocked = limit
+        budget = Decimal("0")
+        total = self.config.total_amount
+        for index in range(unlocked):
+            piece = self._entry_release_piece(index)
+            if piece <= 0:
+                break
+            budget += piece
+            if budget > total:
+                return total
+        return budget
 
     def _placeable(self) -> Decimal:
         if self._schedule is None:
             opened = self.config.total_amount
-            skipped = Decimal("0")
         else:
             opened = self._released_amount()
-            skipped = self._schedule.skipped
-        remaining = opened - skipped - self._filled_unit() - self._open_unit()
+        remaining = opened - self._filled_unit() - self._open_unit()
         if remaining < 0:
             return Decimal("0")
+        if self._schedule is not None and self._open_unit() <= 0:
+            completed = self._completed_entry_slices()
+            if completed > 0 and not self._next_entry_slice_unlocked(completed):
+                return Decimal("0")
         return remaining
 
     def _filled_unit(self) -> Decimal:
@@ -2519,7 +2803,11 @@ class RangeIcebergExecutor(ExecutorBase):
 
     def _slot_open_unit(self, slot: _Slice) -> Decimal:
         if slot.tracked and slot.tracked.order is not None:
-            remaining_base = slot.tracked.order.amount - slot.tracked.executed_amount_base
+            covered = slot.tracked.executed_amount_base
+            seen = self._snapshotted_entry_base.get(slot.order_id or "", Decimal("0"))
+            if seen > covered:
+                covered = seen
+            remaining_base = slot.tracked.order.amount - covered
             if remaining_base < 0:
                 remaining_base = Decimal("0")
         else:
@@ -2602,10 +2890,20 @@ class RangeIcebergExecutor(ExecutorBase):
         return slot.tracked.executed_amount_base + Decimal("0.00000001") < Decimal(str(reported))
 
     def _counts_as_open(self, slot: _Slice) -> bool:
-        return slot.is_working or self._holds_unaccounted_fill(slot)
+        if slot.is_working or self._holds_unaccounted_fill(slot):
+            return True
+        # A scheduled slice must not be bought again while its fill size is missing.
+        if self._schedule is None:
+            return False
+        return bool(slot.is_filled and slot.order_id and not self._known_fill_size(slot.order_id))
 
     def _replacement_blocked(self) -> bool:
-        return bool(self._unconfirmed_cancels) or bool(self._unknown_order_ids) or bool(self._open_lookup_count)
+        return bool(
+            self._unconfirmed_cancels
+            or self._unknown_order_ids
+            or self._open_lookup_count
+            or self._unresolved_entry_ids
+        )
 
     def _real_callable(self, owner, name):
         value = getattr(owner, name, None)
@@ -2678,7 +2976,7 @@ class RangeIcebergExecutor(ExecutorBase):
 
     def _release_cancelled_rungs(self) -> None:
         """
-        A range rung that ends cancelled still owns its unfilled remainder.
+        A range rung that is done and not filled still owns its unfilled remainder.
         Keep the fill, then clear the rung so the remainder is posted again.
         """
         if self.config.mode != ExecutionMode.RANGE or self._shutdown_pending:
@@ -2691,7 +2989,7 @@ class RangeIcebergExecutor(ExecutorBase):
             if slot.order_id in self._unknown_order_ids:
                 continue
             order = slot.tracked.order
-            if order is None or not order.is_cancelled or order.is_filled:
+            if order is None or not order.is_done or order.is_filled:
                 continue
             filled_base, _quote = self._best_fill(slot.order_id)
             remainder = slot.target_amount - filled_base
@@ -2794,26 +3092,11 @@ class RangeIcebergExecutor(ExecutorBase):
                 self._halt_for_unknown_order(order_id, "The order state is unknown.")
                 return True
             return False
-        self._open_lookup_count[order_id] = self._open_lookup_count.get(order_id, 0) + 1
-        self._open_lookup_started.setdefault(order_id, now)
-        count = self._open_lookup_count[order_id]
-        age = now - self._open_lookup_started[order_id]
-        if count >= self._open_lookup_cap or age >= self._open_lookup_max_seconds:
-            if halt:
-                self._halt_for_unknown_order(order_id, "The order is still open after repeated lookups.")
-                return True
-            delay = min(
-                self._open_lookup_backoff_seconds * (2 ** max(count - 1, 0)),
-                self._open_lookup_backoff_cap_seconds,
-            )
-            self._next_open_lookup_at[order_id] = now + delay
-            return False
-        delay = min(
-            self._open_lookup_backoff_seconds * (2 ** (count - 1)),
-            self._open_lookup_backoff_cap_seconds,
+        return self._backoff_or_halt_unknown(
+            order_id,
+            "The order is still open after repeated lookups.",
+            halt,
         )
-        self._next_open_lookup_at[order_id] = now + delay
-        return False
 
     async def _lookup_order_state(self, order_id: str):
         connector = self.connectors[self.config.connector_name]
@@ -3032,6 +3315,7 @@ class RangeIcebergExecutor(ExecutorBase):
         order_ids.update(self._unknown_order_ids)
         order_ids.update(self._unconfirmed_cancels)
         order_ids.update(self._accounted_fill_by_order)
+        order_ids.update(self._unresolved_entry_ids)
         for slot in self._slices:
             if slot.order_id and slot.order_id != "skipped":
                 order_ids.add(slot.order_id)
@@ -3113,9 +3397,9 @@ class RangeIcebergExecutor(ExecutorBase):
 
     def _exchange_order_id_for(self, order_id: str) -> Optional[str]:
         order = self._order_for(order_id)
-        if order is None or not order.exchange_order_id:
-            return None
-        return str(order.exchange_order_id)
+        if order is not None and order.exchange_order_id:
+            return str(order.exchange_order_id)
+        return self._saved_exchange_order_ids.get(order_id) or None
 
     def _halt_for_unknown_order(self, order_id: str, because: str):
         self._unknown_order_ids.add(order_id)
@@ -3146,6 +3430,10 @@ class RangeIcebergExecutor(ExecutorBase):
             return self._cap_block_reason
         if self._exit_error:
             return self._exit_error
+        if self._legacy_ambiguous_halt:
+            return "legacy_snapshot_ambiguous_halt"
+        if self._legacy_entries_halted:
+            return "legacy_snapshot_entries_halted"
         return ""
 
     def to_format_status(self):
@@ -3403,6 +3691,8 @@ class RangeIcebergExecutor(ExecutorBase):
         return self._sum_best_fills()[1]
 
     def _sum_best_fills(self):
+        if self._legacy_entries_halted and self._legacy_order_ids and self._snapshot_rest_saved:
+            return self._legacy_fill_total()
         order_ids = set(self._counted_fill_base)
         order_ids.update(self._accounted_fill_by_order)
         for slot in self._slices:
@@ -3417,6 +3707,110 @@ class RangeIcebergExecutor(ExecutorBase):
             base += part_base
             quote += part_quote
         return base, quote
+
+    def _legacy_fill_total(self):
+        """
+        The saved total, or each saved order's latest size when that sum is larger.
+
+        A size replaces that order's own previous size. It is not added
+        to the saved total. A gone order with no size is not guessed here.
+        """
+        base = Decimal("0")
+        quote = Decimal("0")
+        for order_id in self._legacy_order_ids:
+            part_base, part_quote = self._best_fill(order_id)
+            base += part_base
+            quote += part_quote
+        if base < self._snapshot_rest_base:
+            return self._snapshot_rest_base, self._snapshot_rest_quote
+        return base, quote
+
+    def _legacy_snapshot_is_ambiguous(self) -> bool:
+        """
+        True when a gone order has no size and the saved total has no single order.
+        """
+        if len(self._legacy_order_ids) <= 1 or self._snapshot_rest_base <= 0:
+            return False
+        for order_id in self._legacy_order_ids:
+            if order_id not in self._legacy_absent_ids:
+                continue
+            part_base, _part_quote = self._best_fill(order_id)
+            if part_base <= 0:
+                return True
+        return False
+
+    def _legacy_lookup_blocks_close(self) -> bool:
+        """
+        More than one saved order, and one of them is still being looked up.
+
+        No sized close or entry goes out until that answer arrives. The
+        exchange stop is left to cover the long.
+        """
+        if len(self._legacy_order_ids) <= 1:
+            return False
+        return any(order_id in self._unresolved_entry_ids for order_id in self._legacy_order_ids)
+
+    def _cancel_ambiguous_closes(self) -> None:
+        """
+        Cancel a close this executor already sent. The exchange stop stays.
+        """
+        ids = [
+            slot.order_id
+            for slot in self._exit_slices
+            if (
+                slot.is_working
+                and not slot.cancel_requested
+                and slot.order_id
+                and slot.order_id != "skipped"
+            )
+        ]
+        if not ids:
+            return
+        label = ", ".join(ids)
+        try:
+            self._cancel_exit_orders()
+        except Exception as exc:
+            self.logger().info(
+                "legacy_snapshot_ambiguous_halt: could not cancel close %s: %s."
+                % (label, exc)
+            )
+            return
+        self.logger().info("legacy_snapshot_ambiguous_halt: cancelling close %s." % label)
+
+    async def _live_long_text(self) -> str:
+        outcome, live = await self._read_live_position()
+        if outcome != "ok" or live is None:
+            return "unknown"
+        return str(live)
+
+    async def _stop_for_ambiguous_legacy(self) -> bool:
+        """
+        Stop trading when the saved total cannot be tied to specific orders.
+
+        No entry or close is placed. A close already sent is cancelled.
+        The exchange stop is left as it is.
+        """
+        if not self._legacy_ambiguous_halt and not self._legacy_snapshot_is_ambiguous():
+            return False
+        self._legacy_ambiguous_halt = True
+        self._legacy_entries_halted = True
+        if not self._entry_paused:
+            self.set_entry_paused(True, "legacy_snapshot_ambiguous_halt")
+        else:
+            self._entry_pause_reason = "legacy_snapshot_ambiguous_halt"
+        self._cancel_ambiguous_closes()
+        if self._legacy_ambiguous_logged:
+            return True
+        if not self._legacy_ambiguous_note:
+            ids = ", ".join(sorted(self._legacy_order_ids))
+            live = await self._live_long_text()
+            self._legacy_ambiguous_note = (
+                "legacy_snapshot_ambiguous_halt: saved total %s, orders %s, live long %s."
+                % (self._snapshot_rest_base, ids, live)
+            )
+        self.logger().error(self._legacy_ambiguous_note)
+        self._legacy_ambiguous_logged = True
+        return True
 
     @property
     def total_base(self) -> Decimal:
@@ -3468,12 +3862,31 @@ class RangeIcebergExecutor(ExecutorBase):
             return Decimal("0")
         return remainder
 
+    def _level_view(self, slot: _Slice) -> dict:
+        executed_base = Decimal("0")
+        executed_quote = Decimal("0")
+        if slot.order_id and slot.order_id != "skipped":
+            executed_base, executed_quote = self._best_fill(slot.order_id)
+        view = {
+            "price": str(slot.target_price),
+            "amount": str(slot.target_amount),
+            "order_id": slot.order_id,
+            "filled": slot.is_filled,
+            "executed_base": str(executed_base),
+            "executed_quote": str(executed_quote),
+        }
+        exchange_id = self._exchange_order_id_for(slot.order_id or "")
+        if exchange_id:
+            view["exchange_order_id"] = exchange_id
+        return view
+
     def get_custom_info(self) -> dict:
         return {
             "side": self.config.side.name,
             "mode": self.config.mode.value,
             "paused": self._paused,
             "schedule_started_at": self._schedule_started_at,
+            "schedule_last_full_fill_at": self._schedule_last_full_fill_at,
             "schedule_time_remaining": self._schedule_time_remaining(),
             "schedule_clock": self._schedule_clock_state(),
             "unknown_order_halt": bool(self._unknown_order_ids),
@@ -3523,6 +3936,9 @@ class RangeIcebergExecutor(ExecutorBase):
             "sibling_base": None if self._sibling_base is None else str(self._sibling_base),
             "entry_paused": self._entry_paused,
             "pause_reason": self._entry_pause_reason,
+            "legacy_entries_halted": self._legacy_entries_halted,
+            "legacy_ambiguous_halt": self._legacy_ambiguous_halt,
+            "legacy_ambiguous_note": self._legacy_ambiguous_note,
             "exit_error": self._exit_error,
             "exit_status": self._exit_phase,
             "exit_active": self._exit_active,
@@ -3530,15 +3946,7 @@ class RangeIcebergExecutor(ExecutorBase):
             "exit_average_price": str(self._exit_average_price()),
             "realized_pnl_quote": str(self._realized_pnl_quote()),
             "exit": self._exit_snapshot(),
-            "levels": [
-                {
-                    "price": str(slot.target_price),
-                    "amount": str(slot.target_amount),
-                    "order_id": slot.order_id,
-                    "filled": slot.is_filled,
-                }
-                for slot in self._slices
-            ],
+            "levels": [self._level_view(slot) for slot in self._slices],
         }
 
     def _exits_configured(self) -> bool:
@@ -3651,8 +4059,6 @@ class RangeIcebergExecutor(ExecutorBase):
         close_type = self._entry_clock_close_type()
         if close_type is None:
             return False
-        if close_type == CloseType.TIME_LIMIT:
-            self._advance_schedule(force_end=True)
         if self.filled_base > 0 and self._exits_configured():
             self._entry_clock_handled = True
             self._cancel_entry_orders_for_exit()
@@ -3691,7 +4097,7 @@ class RangeIcebergExecutor(ExecutorBase):
         if self._take_profit_price_is_adverse():
             return False
         if self.config.exit_arming == ExitArming.ON_FULL_FILL:
-            return self._execution_complete() or self._entry_clock_handled or self._exit_phase in (
+            return self._exit_may_arm() or self._exit_phase in (
                 "armed",
                 "resting",
                 "executing",
@@ -3883,6 +4289,8 @@ class RangeIcebergExecutor(ExecutorBase):
         await self._execute_exit()
 
     async def _control_exit(self):
+        if self._legacy_ambiguous_halt:
+            return
         if self._exit_phase == "done" or not self._exits_configured() or self.filled_base <= 0:
             return
         if self._replace_stop_before_failed:
@@ -3931,7 +4339,7 @@ class RangeIcebergExecutor(ExecutorBase):
             await self._execute_exit()
             return
         if kind is None:
-            if (self._execution_complete() or self._entry_clock_handled) and self._exit_phase == "idle":
+            if self._exit_may_arm() and self._exit_phase == "idle":
                 self._exit_phase = "armed"
             return
 
@@ -3945,9 +4353,13 @@ class RangeIcebergExecutor(ExecutorBase):
         full-size close reduces the closable quantity the stop is checked
         against. When a percent trigger moves with the average, the whole
         resting limit is cancelled and replaced once, then left alone until
-        the reprice interval has passed.
+        the reprice interval has passed. A resting close larger than the
+        managed size is cancelled and replaced at that size.
         """
         self._refresh_exit_orders()
+        if self._resting_reduce_only_close_base() > self._managed_base():
+            self._cancel_exit_orders()
+            return
         self._exit_active = "take_profit"
         self._exit_trigger_price = self._trigger_price_for("take_profit")
         if self._exit_done_closing():
@@ -4944,11 +5356,13 @@ class RangeIcebergExecutor(ExecutorBase):
         A sibling_base hint caps it at live minus the size the other
         icebergs still claim. That cap sticks until the next hint, so a
         later drop is not taken from this iceberg. Without a successful
-        read, the own net fill is used.
+        read, the own net fill is used. A hint or a smaller live read is
+        the room at that read. Fills since then come off it, so the next
+        close is the room still left.
         """
         own = self._position_base()
         if self._hinted_close_base is not None:
-            room = self._hinted_close_base
+            room = self._hinted_close_base - self._exit_filled_since(self._hint_exit_filled)
             if room <= 0:
                 return Decimal("0")
             if room < own:
@@ -4957,11 +5371,20 @@ class RangeIcebergExecutor(ExecutorBase):
         if not self._position_sync_ok or self._live_position_base is None:
             return own
         live = self._live_position_base
+        if live < 0:
+            return own
+        live -= self._exit_filled_since(self._live_exit_filled)
         if live >= own:
             return own
         if live < 0:
-            return own
+            return Decimal("0")
         return live
+
+    def _exit_filled_since(self, baseline: Decimal) -> Decimal:
+        filled = self._exit_filled_base() - baseline
+        if filled < 0:
+            return Decimal("0")
+        return filled
 
     async def _reconcile_exchange_state(self) -> str:
         """
@@ -5061,12 +5484,14 @@ class RangeIcebergExecutor(ExecutorBase):
             if self._flat_position_reads < 2:
                 return "ok"
             self._live_position_base = Decimal("0")
+            self._live_exit_filled = self._exit_filled_base()
             self._position_sync_ok = True
             self._begin_external_close()
             return "closed"
         self._capture_sibling_hint(live)
         self._flat_position_reads = 0
         self._live_position_base = live
+        self._live_exit_filled = self._exit_filled_base()
         self._position_sync_ok = True
         return "ok"
 
@@ -5081,6 +5506,7 @@ class RangeIcebergExecutor(ExecutorBase):
         if room < 0:
             room = Decimal("0")
         self._hinted_close_base = room
+        self._hint_exit_filled = self._exit_filled_base()
         self._sibling_base_fresh = False
 
     def _exit_fill_grace_active(self) -> bool:
@@ -5257,7 +5683,7 @@ class RangeIcebergExecutor(ExecutorBase):
             return ExitState.ARMED
         if not self._exits_configured() or self.filled_base <= 0:
             return ExitState.NONE
-        if self.config.exit_arming == ExitArming.ON_ANY_FILL or self._execution_complete() or self._entry_clock_handled:
+        if self.config.exit_arming == ExitArming.ON_ANY_FILL or self._exit_may_arm():
             return ExitState.ARMED
         return ExitState.NONE
 
@@ -5288,10 +5714,11 @@ class RangeIcebergExecutor(ExecutorBase):
             return False
         if self.config.exit_arming == ExitArming.ON_ANY_FILL:
             return True
-        return (
-            self._execution_complete()
-            or self._entry_clock_handled
-            or self._exit_phase in ("armed", "resting", "cancelling_entry", "executing")
+        return self._exit_may_arm() or self._exit_phase in (
+            "armed",
+            "resting",
+            "cancelling_entry",
+            "executing",
         )
 
     def _exchange_position_id(self):
@@ -6360,6 +6787,8 @@ class RangeIcebergExecutor(ExecutorBase):
         """
         Place or refresh the exchange-side backstop.
 
+        An ambiguous legacy snapshot returns first and leaves the live stop alone.
+
         The price is past the software stop. The vol is the closable quantity,
         the open position minus resting reduce-only close limits, so the place
         is never larger than MEXC can accept. A smaller stop is partial
@@ -6375,6 +6804,8 @@ class RangeIcebergExecutor(ExecutorBase):
         stop never cancels. The software stop, a finished exit, and every terminal
         path except keep_position cancel the order instead of refreshing it.
         """
+        if self._legacy_ambiguous_halt:
+            return
         if self._keep_exchange_stop and self._shutdown_pending:
             return
         if self._stop_loss_close_in_progress() and not self._replace_stop_before_failed:
@@ -6602,6 +7033,331 @@ class RangeIcebergExecutor(ExecutorBase):
         self._exit_accounted_quote.clear()
         self._last_fill_timestamp = float(self._strategy.current_timestamp)
 
+    def _restore_open_entry_orders(self, info: dict) -> None:
+        """
+        Saved entry orders stay unresolved until their state and size are known.
+
+        A snapshot that records executed size keeps max(snapshot, live) on that
+        order. An older snapshot with a saved entry order cannot say which
+        order a fill belongs to, so it places no new entries and says
+        legacy_snapshot_entries_halted. That halt stays until a new executor
+        starts. The ledger is the saved total, or the sum of each saved
+        order's latest size when that sum is larger. When a saved order is
+        gone with no size and that total cannot be tied to one order, it
+        halts with legacy_snapshot_ambiguous_halt, places nothing, and leaves
+        the exchange stop as it is.
+        A saved id the tracker does not have is queried,
+        then backed off and paused like any other unknown order.
+        """
+        if isinstance(info, dict) and info.get("legacy_entries_halted"):
+            self._legacy_entries_halted = True
+        if isinstance(info, dict) and info.get("legacy_ambiguous_halt"):
+            self._legacy_ambiguous_halt = True
+            self._legacy_entries_halted = True
+            note = info.get("legacy_ambiguous_note")
+            if isinstance(note, str):
+                self._legacy_ambiguous_note = note
+        if not self._resume_entries or self._schedule is None or not isinstance(info, dict):
+            return
+        levels = info.get("levels")
+        if not isinstance(levels, list):
+            return
+        saved = self._slices_from_levels(levels)
+        if self.config.mode == ExecutionMode.RANGE and saved:
+            self._slices = saved
+        legacy = False
+        has_saved_order = False
+        for level in levels:
+            if not isinstance(level, dict):
+                continue
+            order_id = level.get("order_id")
+            if order_id in (None, "", "skipped"):
+                continue
+            has_saved_order = True
+            if "executed_base" not in level:
+                legacy = True
+                self._legacy_order_ids.add(str(order_id))
+                self._snapshot_tracked_legacy_fill(str(order_id))
+                continue
+            self._remember_snapshotted_fill(str(order_id), level)
+        if legacy and has_saved_order:
+            self._legacy_entries_halted = True
+            self._remember_snapshot_rest()
+        self._keep_snapshot_fills_on_their_orders()
+        for index, level in enumerate(levels):
+            if not isinstance(level, dict):
+                continue
+            order_id = level.get("order_id")
+            if order_id in (None, "", "skipped"):
+                continue
+            text = str(order_id)
+            self._remember_exchange_order_id(text, level)
+            if self._is_exit_order(text) or any(slot.order_id == text for slot in self._slices):
+                continue
+            slot = None
+            if index < len(self._slices) and self._slices[index].tracked is None:
+                slot = self._slices[index]
+            order = self.get_in_flight_order(self.config.connector_name, text)
+            if order is None:
+                self._unresolved_entry_ids.add(text)
+                self._pending_restored_entries[text] = (level, slot)
+                continue
+            self._attach_restored_entry(text, order, level, slot)
+        if self._legacy_ambiguous_halt and not self._entry_paused:
+            self.set_entry_paused(True, "legacy_snapshot_ambiguous_halt")
+        elif self._legacy_entries_halted and not self._entry_paused:
+            self.set_entry_paused(True, "legacy_snapshot_entries_halted")
+
+    def _slices_from_levels(self, levels: list) -> List[_Slice]:
+        rebuilt = []
+        for level in levels:
+            if not isinstance(level, dict):
+                continue
+            price = Decimal(str(level.get("price") or "0"))
+            amount = Decimal(str(level.get("amount") or "0"))
+            if price <= 0 or amount <= 0:
+                continue
+            slot = _Slice(LadderLevel(price=price, base_amount=amount))
+            if level.get("order_id") == "skipped":
+                slot.tracked = TrackedOrder(order_id="skipped")
+            rebuilt.append(slot)
+        return rebuilt
+
+    def _snapshot_tracked_legacy_fill(self, order_id: str) -> None:
+        """
+        A legacy level has no executed size. The tracker is that size.
+        """
+        order = self.get_in_flight_order(self.config.connector_name, order_id)
+        if order is None:
+            return
+        base = Decimal(str(order.executed_amount_base or 0))
+        if base <= 0:
+            return
+        self._snapshotted_entry_base[order_id] = base
+        self._snapshotted_entry_quote[order_id] = Decimal(str(order.executed_amount_quote or 0))
+
+    def _remember_snapshotted_fill(self, order_id: str, level: dict) -> None:
+        if "executed_base" not in level:
+            return
+        base = Decimal(str(level.get("executed_base") or "0"))
+        if base <= 0:
+            return
+        self._snapshotted_entry_base[order_id] = base
+        self._snapshotted_entry_quote[order_id] = Decimal(str(level.get("executed_quote") or "0"))
+
+    def _keep_snapshot_fills_on_their_orders(self) -> None:
+        """
+        Keep each snapshot fill on its order and take that size out of the aggregate.
+        """
+        if not self._snapshotted_entry_base:
+            return
+        for order_id, base in self._snapshotted_entry_base.items():
+            if base <= self._accounted_fill_by_order.get(order_id, Decimal("0")):
+                continue
+            self._accounted_fill_by_order[order_id] = base
+            quote = self._snapshotted_entry_quote.get(order_id, Decimal("0"))
+            self._accounted_quote_by_order[order_id] = quote
+        self._remember_snapshot_rest()
+        covered = sum(self._snapshotted_entry_base.values(), Decimal("0"))
+        covered_quote = sum(self._snapshotted_entry_quote.values(), Decimal("0"))
+        kept = self._snapshot_rest_base - min(self._snapshot_rest_base, covered)
+        kept_quote = self._snapshot_rest_quote - min(self._snapshot_rest_quote, covered_quote)
+        if kept <= 0:
+            self._accounted_fill_by_order.pop("restored-entry", None)
+            self._accounted_quote_by_order.pop("restored-entry", None)
+        else:
+            self._accounted_fill_by_order["restored-entry"] = kept
+            self._accounted_quote_by_order["restored-entry"] = kept_quote
+        self._accounted_fill_base = sum(self._accounted_fill_by_order.values(), Decimal("0"))
+        self._accounted_fill_quote = sum(self._accounted_quote_by_order.values(), Decimal("0"))
+
+    def _remember_snapshot_rest(self) -> None:
+        if self._snapshot_rest_saved:
+            return
+        rest = self._accounted_fill_by_order.get("restored-entry", Decimal("0"))
+        rest_quote = self._accounted_quote_by_order.get("restored-entry", Decimal("0"))
+        self._snapshot_rest_base = rest
+        self._snapshot_rest_quote = rest_quote
+        self._snapshot_rest_saved = True
+
+    def _remember_exchange_order_id(self, order_id: str, level: dict) -> None:
+        raw = level.get("exchange_order_id")
+        if raw in (None, ""):
+            return
+        self._saved_exchange_order_ids[order_id] = str(raw)
+
+    def _backoff_or_halt_unknown(self, order_id: str, because: str, halt: bool = True) -> bool:
+        """
+        Look the order up again after 10s, then 20s, then 40s. Then pause.
+        """
+        now = float(self._strategy.current_timestamp)
+        self._open_lookup_count[order_id] = self._open_lookup_count.get(order_id, 0) + 1
+        self._open_lookup_started.setdefault(order_id, now)
+        count = self._open_lookup_count[order_id]
+        age = now - self._open_lookup_started[order_id]
+        capped = count >= self._open_lookup_cap or age >= self._open_lookup_max_seconds
+        if capped and halt:
+            self._halt_for_unknown_order(order_id, because)
+            return True
+        power = count - 1
+        if capped:
+            power = max(power, 0)
+        delay = min(
+            self._open_lookup_backoff_seconds * (2 ** power),
+            self._open_lookup_backoff_cap_seconds,
+        )
+        self._next_open_lookup_at[order_id] = now + delay
+        return False
+
+    def _unknown_restore_reason(self, state) -> str:
+        if state == OrderState.FILLED:
+            return "The exchange says the order is filled but no size was recorded."
+        return "The order state is unknown."
+
+    async def _resolve_restored_entries(self) -> None:
+        """
+        Look up each saved entry id before any new entry is placed.
+
+        The tracker is enough when it still has the order. Otherwise the connector
+        is queried by client id and by exchange id. An inconclusive answer backs
+        off and then pauses with unknown_order_halt. New entries stay blocked.
+        """
+        if not self._unresolved_entry_ids:
+            return
+        now = float(self._strategy.current_timestamp)
+        for order_id in list(self._unresolved_entry_ids):
+            if order_id in self._unknown_order_ids:
+                continue
+            order = self.get_in_flight_order(self.config.connector_name, order_id)
+            state = None
+            if order is None:
+                if now < self._next_open_lookup_at.get(order_id, now):
+                    continue
+                state = await self._lookup_order_state(order_id)
+                self._refresh_tracked_orders()
+                order = self.get_in_flight_order(self.config.connector_name, order_id)
+            if order is not None:
+                if self._slot_for(order_id) is None:
+                    level, slot = self._pending_restored_entries.get(order_id, ({}, None))
+                    if slot is not None and slot.tracked is not None:
+                        slot = None
+                    self._attach_restored_entry(order_id, order, level or {}, slot)
+                self._pending_restored_entries.pop(order_id, None)
+                self._unresolved_entry_ids.discard(order_id)
+                self._clear_open_retry(order_id)
+                self._adopt_resolved_entry_size(order_id)
+                continue
+            if self._restored_entry_size_is_known(order_id, state):
+                if self._is_confirmed_absent(state) or state == OrderState.CANCELED:
+                    self._legacy_absent_ids.add(order_id)
+                self._adopt_resolved_entry_size(order_id)
+                self._close_unresolved_entry(order_id)
+                self._unresolved_entry_ids.discard(order_id)
+                self._clear_open_retry(order_id)
+                continue
+            self._backoff_or_halt_unknown(order_id, self._unknown_restore_reason(state))
+
+    def _adopt_resolved_entry_size(self, order_id: str) -> None:
+        """
+        A resolved legacy order keeps its executed size, like executed_base.
+        """
+        if order_id in self._snapshotted_entry_base:
+            return
+        base, quote = self._best_fill(order_id)
+        if base <= 0:
+            return
+        self._snapshotted_entry_base[order_id] = base
+        self._snapshotted_entry_quote[order_id] = quote
+        self._keep_snapshot_fills_on_their_orders()
+
+    def _restored_entry_size_is_known(self, order_id: str, state) -> bool:
+        if self._is_confirmed_absent(state) or state == OrderState.CANCELED:
+            return True
+        if state != OrderState.FILLED:
+            return False
+        base, _quote = self._best_fill(order_id)
+        return base > 0
+
+    def _close_unresolved_entry(self, order_id: str) -> None:
+        """
+        The order is gone. Keep its known fill and leave only the unfilled remainder.
+        """
+        _level, slot = self._pending_restored_entries.pop(order_id, ({}, None))
+        filled, _quote = self._best_fill(order_id)
+        if slot is None or slot.tracked is not None:
+            return
+        remainder = slot.target_amount - filled
+        if remainder < 0:
+            remainder = Decimal("0")
+        if remainder < self._min_order_size():
+            slot.tracked = TrackedOrder(order_id="skipped")
+            slot.retired = True
+            return
+        slot.target_amount = remainder
+
+    def _attach_restored_entry(
+        self,
+        order_id: str,
+        order,
+        level: dict,
+        slot: Optional[_Slice] = None,
+    ) -> None:
+        if order.price in (None, 0):
+            price = Decimal(str(level.get("price") or "0"))
+        else:
+            price = order.price
+        amount = Decimal(str(order.amount or level.get("amount") or "0"))
+        if amount <= 0 or price <= 0:
+            return
+        keep_target = slot is not None
+        if slot is None and self.config.mode == ExecutionMode.RANGE:
+            slot = next(
+                (
+                    item for item in self._slices
+                    if item.tracked is None and not item.retired and item.target_price == price
+                ),
+                None,
+            )
+            if slot is None:
+                slot = next(
+                    (item for item in self._slices if item.tracked is None and not item.retired),
+                    None,
+                )
+        if slot is None:
+            slot = _Slice(LadderLevel(price=price, base_amount=amount))
+            self._slices.append(slot)
+        if not keep_target:
+            slot.target_amount = amount
+        slot.target_price = price
+        slot.pre_jitter_price = price
+        slot.tracked = TrackedOrder(order_id=order_id)
+        slot.tracked.order = order
+        if order_id not in self._submitted_order_ids:
+            self._submitted_order_ids.append(order_id)
+
+    def _restore_scheduled_entry_fill(self, blob: dict) -> None:
+        """
+        Put a scheduled entry's filled size back when the exit is still idle.
+
+        Entry slices are rebuilt empty, so the fill gate would place the first
+        slice again unless this size is loaded. A snapshot with no schedule
+        keeps the previous idle restore.
+        """
+        if not self._resume_entries or self._schedule is None:
+            return
+        if "restored-entry" in self._accounted_fill_by_order:
+            return
+        if not isinstance(blob, dict):
+            return
+        entry_base = Decimal(str(blob.get("entry_filled_base") or "0"))
+        entry_quote = Decimal(str(blob.get("entry_filled_quote") or "0"))
+        if entry_base <= 0:
+            return
+        self._accounted_fill_by_order["restored-entry"] = entry_base
+        self._accounted_quote_by_order["restored-entry"] = entry_quote
+        self._accounted_fill_base = sum(self._accounted_fill_by_order.values(), Decimal("0"))
+        self._accounted_fill_quote = sum(self._accounted_quote_by_order.values(), Decimal("0"))
+
     def _restore_idle_exchange_stop(self, custom_info: dict, blob: dict) -> None:
         """
         Keep a stop that was placed before any exit was chosen.
@@ -6692,6 +7448,7 @@ class RangeIcebergExecutor(ExecutorBase):
             active = None
         if status == "idle" and active is None and not blob.get("filled_by_order"):
             self._restore_idle_exchange_stop(custom_info, blob)
+            self._restore_scheduled_entry_fill(blob)
             return
         if status not in ("idle", "armed", "resting", "cancelling_entry", "executing", "done"):
             status = "idle"
