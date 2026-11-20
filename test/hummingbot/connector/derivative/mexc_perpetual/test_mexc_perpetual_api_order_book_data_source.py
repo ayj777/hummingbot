@@ -1,6 +1,7 @@
 import asyncio
 import json
 import re
+import time
 from decimal import Decimal
 from test.isolated_asyncio_wrapper_test_case import IsolatedAsyncioWrapperTestCase
 from typing import Awaitable
@@ -15,7 +16,8 @@ from hummingbot.connector.derivative.mexc_perpetual.mexc_perpetual_api_order_boo
     MexcPerpetualAPIOrderBookDataSource,
 )
 from hummingbot.connector.derivative.mexc_perpetual.mexc_perpetual_derivative import MexcPerpetualDerivative
-from hummingbot.core.data_type.order_book_message import OrderBookMessageType
+from hummingbot.core.data_type.order_book_message import OrderBookMessage, OrderBookMessageType
+from hummingbot.core.data_type.order_book_tracker import OrderBookTracker
 from hummingbot.core.web_assistant.connections.data_types import WSJSONRequest
 
 
@@ -81,6 +83,275 @@ class MexcPerpetualAPIOrderBookDataSourceTests(IsolatedAsyncioWrapperTestCase):
         self.assertEqual(["99", "0"], snapshot.content["bids"][0])
         self.assertEqual(["98", "30"], snapshot.content["bids"][1])
         self.assertEqual(25, self.data_source._last_depth_version[self.exchange_symbol])
+
+    def _mock_contract_info(self, mock_api, contracts):
+        ping = web_utils.public_rest_url(CONSTANTS.PING_PATH)
+        rules = web_utils.public_rest_url(CONSTANTS.CONTRACT_INFO_PATH)
+        mock_api.get(
+            re.compile(f"^{re.escape(ping)}.*"),
+            body=json.dumps({"success": True, "code": 0, "data": 1761879567135}),
+            repeat=True,
+        )
+        mock_api.get(
+            re.compile(f"^{re.escape(rules)}.*"),
+            body=json.dumps({"success": True, "code": 0, "data": contracts}),
+            repeat=True,
+        )
+
+    def _contract(self, contract_size: str):
+        return {
+            "symbol": self.exchange_symbol,
+            "baseCoin": self.base_asset,
+            "quoteCoin": self.quote_asset,
+            "settleCoin": self.quote_asset,
+            "futureType": 1,
+            "state": 0,
+            "apiAllowed": True,
+            "contractSize": contract_size,
+            "priceUnit": "0.1",
+            "volUnit": "1",
+            "minVol": "1",
+            "maxVol": "100000",
+        }
+
+    def _depth_body(self):
+        return json.dumps({
+            "success": True,
+            "code": 0,
+            "data": {
+                "asks": [[100, 2, 1]],
+                "bids": [[99, 0, 1], [98, 3, 1]],
+                "version": 25,
+                "timestamp": 1761879567135,
+            },
+        })
+
+    @aioresponses()
+    def test_startup_snapshot_loads_contract_size_before_trading_rules(self, mock_api):
+        # _init_order_books snapshots before the trading-rules poll fills _contract_sizes.
+        self.connector._contract_sizes.pop(self.trading_pair, None)
+        self._mock_contract_info(mock_api, [self._contract("10")])
+        url = web_utils.public_rest_url(CONSTANTS.DEPTH_PATH.format(symbol=self.exchange_symbol))
+        mock_api.get(re.compile(f"^{re.escape(url)}.*"), body=self._depth_body())
+        snapshot = self.async_run_with_timeout(
+            self.data_source._order_book_snapshot(self.trading_pair)
+        )
+        self.assertEqual(Decimal("10"), self.connector.get_contract_size(self.trading_pair))
+        self.assertEqual(["100", "20"], snapshot.content["asks"][0])
+        self.assertEqual(["98", "30"], snapshot.content["bids"][1])
+        self.assertNotIn(Decimal("1"), self.connector._contract_sizes.values())
+
+    @aioresponses()
+    def test_startup_snapshot_raises_when_the_pair_has_no_contract_size(self, mock_api):
+        self.connector._contract_sizes.pop(self.trading_pair, None)
+        self._mock_contract_info(mock_api, [])
+        url = web_utils.public_rest_url(CONSTANTS.DEPTH_PATH.format(symbol=self.exchange_symbol))
+        mock_api.get(re.compile(f"^{re.escape(url)}.*"), body=self._depth_body())
+        message = f"contractSize for {self.trading_pair} is not loaded"
+        with self.assertRaisesRegex(ValueError, message):
+            self.async_run_with_timeout(
+                self.data_source._order_book_snapshot(self.trading_pair)
+            )
+        self.assertNotIn(self.trading_pair, self.connector._contract_sizes)
+        self.assertNotIn(Decimal("1"), self.connector._contract_sizes.values())
+
+    @aioresponses()
+    def test_depth_diff_loads_contract_size_before_trading_rules(self, mock_api):
+        self.connector._contract_sizes.pop(self.trading_pair, None)
+        self._mock_contract_info(mock_api, [self._contract("10")])
+        queue = asyncio.Queue()
+        message = {
+            "channel": CONSTANTS.WS_DEPTH_CHANNEL,
+            "symbol": self.exchange_symbol,
+            "data": {"asks": [[100, 1, 1]], "bids": [[99, 0, 0]], "begin": 26, "end": 27},
+            "ts": 1761879567135,
+        }
+        self.async_run_with_timeout(
+            self.data_source._parse_order_book_diff_message(message, queue)
+        )
+        diff = queue.get_nowait()
+        self.assertEqual(["100", "10"], diff.content["asks"][0])
+        self.assertEqual(["99", "0"], diff.content["bids"][0])
+        self.assertEqual(Decimal("10"), self.connector.get_contract_size(self.trading_pair))
+        self.assertNotIn(Decimal("1"), self.connector._contract_sizes.values())
+
+    @aioresponses()
+    def test_trade_message_loads_contract_size_before_trading_rules(self, mock_api):
+        self.connector._contract_sizes.pop(self.trading_pair, None)
+        self._mock_contract_info(mock_api, [self._contract("10")])
+        queue = asyncio.Queue()
+        message = {
+            "channel": CONSTANTS.WS_DEAL_CHANNEL,
+            "symbol": self.exchange_symbol,
+            "data": [{"p": "100", "v": "4", "T": 1, "t": 1761883066648, "i": "150"}],
+            "ts": 1761883066648,
+        }
+        self.async_run_with_timeout(
+            self.data_source._parse_trade_message(message, queue)
+        )
+        trade = queue.get_nowait()
+        self.assertEqual("40", trade.content["amount"])
+        self.assertEqual(Decimal("10"), self.connector.get_contract_size(self.trading_pair))
+
+    def test_concurrent_readers_share_one_trading_rules_update(self):
+        self.connector._contract_sizes.pop(self.trading_pair, None)
+        calls = 0
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def load():
+            nonlocal calls
+            calls += 1
+            started.set()
+            await release.wait()
+            self.connector._contract_sizes[self.trading_pair] = Decimal("10")
+
+        self.connector._update_trading_rules = load
+
+        async def scenario():
+            first = asyncio.create_task(self.data_source._contract_size(self.trading_pair))
+            await started.wait()
+            second = asyncio.create_task(self.data_source._contract_size(self.trading_pair))
+            await asyncio.sleep(0)
+            release.set()
+            self.assertEqual(Decimal("10"), await first)
+            self.assertEqual(Decimal("10"), await second)
+            self.assertEqual(1, calls)
+
+        self.async_run_with_timeout(scenario())
+
+    def test_rules_failure_backs_off_before_another_fetch(self):
+        self.connector._contract_sizes.pop(self.trading_pair, None)
+        calls = 0
+
+        async def load():
+            nonlocal calls
+            calls += 1
+            raise IOError("contract info down")
+
+        self.connector._update_trading_rules = load
+
+        async def scenario():
+            with self.assertRaises(IOError):
+                await self.data_source._contract_size(self.trading_pair)
+            with self.assertRaises(ValueError):
+                await self.data_source._contract_size(self.trading_pair)
+            self.assertEqual(1, calls)
+            self.assertNotIn(Decimal("1"), self.connector._contract_sizes.values())
+            self.data_source._rules_retry_at = 0
+            with self.assertRaises(IOError):
+                await self.data_source._contract_size(self.trading_pair)
+            self.assertEqual(2, calls)
+
+        self.async_run_with_timeout(scenario())
+
+    def test_missing_or_non_positive_size_backs_off_before_another_fetch(self):
+        self.connector._contract_sizes.pop(self.trading_pair, None)
+        calls = 0
+
+        async def load_missing():
+            nonlocal calls
+            calls += 1
+
+        self.connector._update_trading_rules = load_missing
+
+        async def scenario():
+            message = f"contractSize for {self.trading_pair} is not loaded"
+            with self.assertRaisesRegex(ValueError, message):
+                await self.data_source._contract_size(self.trading_pair)
+            with self.assertRaisesRegex(ValueError, message):
+                await self.data_source._contract_size(self.trading_pair)
+            self.assertEqual(1, calls)
+            self.data_source._rules_retry_at = 0
+            self.connector._contract_sizes[self.trading_pair] = Decimal("0")
+
+            async def load_zero():
+                nonlocal calls
+                calls += 1
+                self.connector._contract_sizes[self.trading_pair] = Decimal("0")
+
+            self.connector._update_trading_rules = load_zero
+            with self.assertRaisesRegex(ValueError, message):
+                await self.data_source._contract_size(self.trading_pair)
+            with self.assertRaisesRegex(ValueError, message):
+                await self.data_source._contract_size(self.trading_pair)
+            self.assertEqual(2, calls)
+            self.assertEqual(Decimal("0"), self.connector._contract_sizes[self.trading_pair])
+            self.assertNotIn(Decimal("1"), self.connector._contract_sizes.values())
+
+        self.async_run_with_timeout(scenario())
+
+    def test_rules_update_timeout_releases_the_lock(self):
+        self.connector._contract_sizes.pop(self.trading_pair, None)
+        calls = 0
+
+        async def hang():
+            nonlocal calls
+            calls += 1
+            await asyncio.Event().wait()
+
+        self.connector._update_trading_rules = hang
+        self.data_source._RULES_TIMEOUT = 0.05
+
+        async def scenario():
+            started = time.monotonic()
+            with self.assertRaises(TimeoutError):
+                await self.data_source._contract_size(self.trading_pair)
+            self.assertLess(time.monotonic() - started, 1)
+            self.assertEqual(1, calls)
+            started = time.monotonic()
+            with self.assertRaises(ValueError):
+                await self.data_source._contract_size(self.trading_pair)
+            self.assertLess(time.monotonic() - started, 0.2)
+            self.assertEqual(1, calls)
+            self.assertNotIn(Decimal("1"), self.connector._contract_sizes.values())
+
+        self.async_run_with_timeout(scenario())
+
+    def test_failed_startup_snapshot_retries_until_ready(self):
+        calls = 0
+
+        async def flaky(trading_pair):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise IOError("snapshot failed")
+            return OrderBookMessage(
+                OrderBookMessageType.SNAPSHOT,
+                {
+                    "trading_pair": trading_pair,
+                    "update_id": 7,
+                    "bids": [["99", "1"]],
+                    "asks": [["100", "2"]],
+                },
+                1,
+            )
+
+        self.data_source._order_book_snapshot = flaky
+        tracker = OrderBookTracker(
+            data_source=self.data_source,
+            trading_pairs=[self.trading_pair],
+        )
+
+        async def sleep(delay):
+            return None
+
+        tracker._sleep = sleep
+
+        async def scenario():
+            await tracker._init_order_books()
+            self.assertTrue(tracker.ready)
+            self.assertIn(self.trading_pair, tracker.order_books)
+            self.assertEqual(2, calls)
+            await asyncio.sleep(0)
+            for task in list(tracker._tracking_tasks.values()):
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+
+        self.async_run_with_timeout(scenario())
 
     def test_depth_diff_applies_absolute_contract_quantities(self):
         queue = asyncio.Queue()

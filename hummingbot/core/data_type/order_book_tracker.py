@@ -230,6 +230,7 @@ class OrderBookTrackerMetrics:
 
 class OrderBookTracker:
     PAST_DIFF_WINDOW_SIZE: int = 32
+    INIT_RETRY_INTERVAL = 15.0
     _obt_logger: Optional[HummingbotLogger] = None
 
     @classmethod
@@ -390,10 +391,22 @@ class OrderBookTracker:
 
     async def _init_order_books(self):
         """
-        Initialize order books
+        Initialize order books. Retry a failed snapshot so one blip does not
+        leave the connector not ready.
         """
         for index, trading_pair in enumerate(self._trading_pairs):
-            self._order_books[trading_pair] = await self._initial_order_book_for_trading_pair(trading_pair)
+            while True:
+                try:
+                    book = await self._initial_order_book_for_trading_pair(trading_pair)
+                    break
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    self.logger().exception(
+                        f"Could not initialize the order book for {trading_pair}. Retrying."
+                    )
+                    await self._sleep(delay=self.INIT_RETRY_INTERVAL)
+            self._order_books[trading_pair] = book
             self._tracking_message_queues[trading_pair] = asyncio.Queue()
             self._tracking_tasks[trading_pair] = safe_ensure_future(self._track_single_book(trading_pair))
             self.logger().info(f"Initialized order book for {trading_pair}. "
