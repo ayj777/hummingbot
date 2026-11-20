@@ -806,6 +806,8 @@ class RangeIcebergExecutor(ExecutorBase):
         await self._resolve_restored_entries()
         if await self._stop_for_ambiguous_legacy():
             return
+        if self._legacy_lookup_blocks_close():
+            return
         self._release_cancelled_rungs()
         self._release_cancelled_exit_rungs()
         await self._service_entry_rebuild()
@@ -3737,6 +3739,44 @@ class RangeIcebergExecutor(ExecutorBase):
                 return True
         return False
 
+    def _legacy_lookup_blocks_close(self) -> bool:
+        """
+        More than one saved order, and one of them is still being looked up.
+
+        No sized close or entry goes out until that answer arrives. The
+        exchange stop is left to cover the long.
+        """
+        if len(self._legacy_order_ids) <= 1:
+            return False
+        return any(order_id in self._unresolved_entry_ids for order_id in self._legacy_order_ids)
+
+    def _cancel_ambiguous_closes(self) -> None:
+        """
+        Cancel a close this executor already sent. The exchange stop stays.
+        """
+        ids = [
+            slot.order_id
+            for slot in self._exit_slices
+            if (
+                slot.is_working
+                and not slot.cancel_requested
+                and slot.order_id
+                and slot.order_id != "skipped"
+            )
+        ]
+        if not ids:
+            return
+        label = ", ".join(ids)
+        try:
+            self._cancel_exit_orders()
+        except Exception as exc:
+            self.logger().info(
+                "legacy_snapshot_ambiguous_halt: could not cancel close %s: %s."
+                % (label, exc)
+            )
+            return
+        self.logger().info("legacy_snapshot_ambiguous_halt: cancelling close %s." % label)
+
     async def _live_long_text(self) -> str:
         outcome, live = await self._read_live_position()
         if outcome != "ok" or live is None:
@@ -3747,7 +3787,8 @@ class RangeIcebergExecutor(ExecutorBase):
         """
         Stop trading when the saved total cannot be tied to specific orders.
 
-        No entry or close is placed. The exchange stop is left as it is.
+        No entry or close is placed. A close already sent is cancelled.
+        The exchange stop is left as it is.
         """
         if not self._legacy_ambiguous_halt and not self._legacy_snapshot_is_ambiguous():
             return False
@@ -3757,6 +3798,7 @@ class RangeIcebergExecutor(ExecutorBase):
             self.set_entry_paused(True, "legacy_snapshot_ambiguous_halt")
         else:
             self._entry_pause_reason = "legacy_snapshot_ambiguous_halt"
+        self._cancel_ambiguous_closes()
         if self._legacy_ambiguous_logged:
             return True
         if not self._legacy_ambiguous_note:

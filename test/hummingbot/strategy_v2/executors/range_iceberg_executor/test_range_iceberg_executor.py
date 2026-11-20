@@ -2506,7 +2506,7 @@ class RangeIcebergExecutorTests(IsolatedAsyncioWrapperTestCase):
         self._run(resumed.control_task())
         closes = [row for row in self.buy_ids if row[4] == PositionAction.CLOSE]
         self.assertEqual(Decimal("25"), resumed._managed_base())
-        self.assertEqual([Decimal("25")], [row[1] for row in closes])
+        self.assertEqual([], closes)
 
     def test_a_lookup_size_replaces_that_order_and_can_raise_the_total(self):
         self._fine_step()
@@ -2684,6 +2684,33 @@ class RangeIcebergExecutorTests(IsolatedAsyncioWrapperTestCase):
         self.assertEqual([], calls)
         self.assertEqual("stop-1", resumed._exchange_stop_order_id)
         self.assertEqual(2, len(self._entry_orders()))
+
+    def test_a_pending_lookup_does_not_close_before_the_ambiguous_halt(self):
+        resumed, _kwargs = self._restore_legacy_pair(Decimal("75"), "buy-1")
+        answers = iter([None, "confirmed_absent"])
+
+        async def resolve(trading_pair, client_order_id, exchange_order_id=None):
+            return next(answers)
+
+        self.connector.resolve_unknown_order = resolve
+        self._book(Decimal("0.07"), Decimal("0.07"))
+        self._run(resumed.control_task())
+        self.assertEqual([], self._close_rows())
+        self.assertFalse(resumed.get_custom_info()["legacy_ambiguous_halt"])
+        resumed._track_exit(Decimal("0.07"), Decimal("25"), "close-1")
+        slot = resumed._exit_slices[-1]
+        self.assertTrue(slot.is_working)
+        self.assertFalse(slot.cancel_requested)
+        self.now += 10
+        self.strategy.cancel.reset_mock()
+        with self.assertLogs(resumed.logger(), level="INFO") as caught:
+            self._run(resumed.control_task())
+        text = "\n".join(caught.output)
+        self.assertIn("cancelling close close-1", text)
+        self.assertTrue(slot.cancel_requested)
+        self.assertTrue(resumed.get_custom_info()["legacy_ambiguous_halt"])
+        self.assertEqual([], self._close_rows())
+        self.strategy.cancel.assert_called()
 
     def test_a_later_catchup_does_not_close_after_an_ambiguous_halt(self):
         resumed, _kwargs = self._restore_legacy_pair(
