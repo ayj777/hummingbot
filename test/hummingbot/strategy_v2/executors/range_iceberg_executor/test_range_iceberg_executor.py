@@ -2249,7 +2249,8 @@ class RangeIcebergExecutorTests(IsolatedAsyncioWrapperTestCase):
         self.now += 4
         self._run(resumed.control_task())
         self.assertEqual(2, len(self._entry_orders()))
-        self.assertEqual(Decimal("25"), resumed._managed_base())
+        self.assertEqual(Decimal("50"), resumed.filled_base)
+        self.assertEqual(Decimal("50"), resumed._managed_base())
 
     def _legacy_saved_rung(self, live_amount):
         self._fine_step()
@@ -2556,6 +2557,74 @@ class RangeIcebergExecutorTests(IsolatedAsyncioWrapperTestCase):
         self.assertEqual(Decimal("25"), resumed.filled_base)
         self._run(resumed.control_task())
         self.assertEqual(Decimal("50"), resumed.filled_base)
+
+    def _legacy_fill_on_a_missing_order(self, other_fill, live):
+        self._fine_step()
+        self._book(Decimal("0.08000"), Decimal("0.08010"))
+        exits = dict(
+            take_profit=RangeIcebergExitConfig(percent=Decimal("0.02")),
+            stop_loss=RangeIcebergExitConfig(percent=Decimal("0.02")),
+        )
+        kwargs = dict(
+            size_unit=SizeUnit.BASE,
+            total_amount=Decimal("100"),
+            levels=4,
+            iceberg=False,
+            visible_count=4,
+            schedule_interval=25,
+            schedule_slices=2,
+            duration=None,
+            schedule_start=ScheduleStart.SUBMIT,
+            **exits,
+        )
+        executor = self._executor(**kwargs)
+        self._run(executor.control_task())
+        self._run(executor.control_task())
+        self._fill("buy-2", Decimal("25"))
+        payload = json.loads(executor.executor_info.model_dump_json())
+        for level in payload["custom_info"]["levels"]:
+            level.pop("executed_base", None)
+            level.pop("executed_quote", None)
+        self.orders.pop("buy-2")
+        self._fill("buy-1", other_fill)
+        held = {"amount": live}
+
+        async def resolve(trading_pair, client_order_id, exchange_order_id=None):
+            return "confirmed_absent"
+
+        async def update():
+            self.connector.account_positions = {
+                "long": SimpleNamespace(
+                    trading_pair="AIOT-USDT",
+                    position_side=PositionSide.LONG,
+                    amount=held["amount"],
+                ),
+            }
+
+        self.connector.resolve_unknown_order = resolve
+        self.connector._update_positions = update
+        resumed = self._executor(**kwargs)
+        resumed.restore_from_custom_info(payload["custom_info"])
+        self._book(Decimal("0.07"), Decimal("0.07"))
+        self._run(resumed.control_task())
+        return resumed
+
+    def test_a_saved_fill_on_a_missing_order_is_kept_with_the_other_fill(self):
+        resumed = self._legacy_fill_on_a_missing_order(Decimal("25"), Decimal("50"))
+        closes = [row for row in self.buy_ids if row[4] == PositionAction.CLOSE]
+        self.assertEqual(Decimal("50"), resumed.filled_base)
+        self.assertEqual(Decimal("50"), resumed._managed_base())
+        self.assertEqual([Decimal("50")], [row[1] for row in closes])
+        self.assertEqual(2, len(self._entry_orders()))
+        self.assertIn("legacy_snapshot_entries_halted", resumed.get_custom_info()["status_reason"])
+
+    def test_a_smaller_fill_is_not_swallowed_by_a_missing_orders_saved_total(self):
+        resumed = self._legacy_fill_on_a_missing_order(Decimal("10"), Decimal("35"))
+        closes = [row for row in self.buy_ids if row[4] == PositionAction.CLOSE]
+        self.assertEqual(Decimal("35"), resumed.filled_base)
+        self.assertEqual(Decimal("35"), resumed._managed_base())
+        self.assertEqual([Decimal("35")], [row[1] for row in closes])
+        self.assertEqual(2, len(self._entry_orders()))
 
     def test_a_legacy_halt_does_not_close_a_sibling_long(self):
         resumed, held = self._legacy_saved_rung(Decimal("75"))

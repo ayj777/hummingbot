@@ -289,6 +289,7 @@ class RangeIcebergExecutor(ExecutorBase):
         self._saved_exchange_order_ids: Dict[str, str] = {}
         self._legacy_entries_halted = False
         self._legacy_order_ids: Set[str] = set()
+        self._legacy_absent_ids: Set[str] = set()
         self._snapshot_rest_saved = False
         self._snapshot_rest_base = Decimal("0")
         self._snapshot_rest_quote = Decimal("0")
@@ -3700,17 +3701,23 @@ class RangeIcebergExecutor(ExecutorBase):
 
     def _legacy_fill_total(self):
         """
-        max(saved total, sum of the latest size of each saved order).
+        Saved total plus each saved order's latest size.
 
-        A tracker or lookup replaces that order's size. It is not added
-        to the saved total.
+        A size replaces that order's own previous size. When the saved
+        fill sits on no order, another order's size is kept as well.
+        The close is still capped at the live long.
         """
         base = Decimal("0")
         quote = Decimal("0")
+        saved_sits_on_no_order = False
         for order_id in self._legacy_order_ids:
             part_base, part_quote = self._best_fill(order_id)
             base += part_base
             quote += part_quote
+            if order_id in self._legacy_absent_ids and part_base <= 0:
+                saved_sits_on_no_order = True
+        if saved_sits_on_no_order:
+            return self._snapshot_rest_base + base, self._snapshot_rest_quote + quote
         if base < self._snapshot_rest_base:
             return self._snapshot_rest_base, self._snapshot_rest_quote
         return base, quote
@@ -6936,8 +6943,9 @@ class RangeIcebergExecutor(ExecutorBase):
         order. An older snapshot with a saved entry order cannot say which
         order a fill belongs to, so it places no new entries and says
         legacy_snapshot_entries_halted. That halt stays until a new executor
-        starts. The ledger is the max of the saved total and the sum of
-        each saved order's latest size, from the tracker or the lookup.
+        starts. The ledger keeps the saved total and each saved order's
+        latest size. A fill on a missing order is not replaced by another
+        order's size. The close never exceeds the live long.
         A saved id the tracker does not have is queried,
         then backed off and paused like any other unknown order.
         """
@@ -7132,6 +7140,8 @@ class RangeIcebergExecutor(ExecutorBase):
                 self._adopt_resolved_entry_size(order_id)
                 continue
             if self._restored_entry_size_is_known(order_id, state):
+                if self._is_confirmed_absent(state) or state == OrderState.CANCELED:
+                    self._legacy_absent_ids.add(order_id)
                 self._adopt_resolved_entry_size(order_id)
                 self._close_unresolved_entry(order_id)
                 self._unresolved_entry_ids.discard(order_id)
